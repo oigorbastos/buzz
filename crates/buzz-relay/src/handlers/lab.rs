@@ -401,54 +401,59 @@ fn build_head_projection_event(
 /// pubkey (or its owning agent, for NIP-OA delegation) removed from
 /// `relay_members` mid-session is denied on its very next Lab Board write,
 /// not just its next reconnect.
+pub async fn is_lab_board_member(
+    state: &Arc<AppState>,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<bool, String> {
+    if !state.config.require_relay_membership {
+        return Ok(true);
+    }
+
+    if state
+        .db
+        .is_relay_member(community, &hex::encode(pubkey))
+        .await
+        .map_err(|e| format!("relay membership check failed: {e}"))?
+    {
+        return Ok(true);
+    }
+
+    // Not a direct member — fall back to NIP-OA delegation via the durably
+    // persisted owner mapping. An agent's own pubkey is NEVER materialized in
+    // `relay_members`; only its owner's is. Skipping this fallback would lock
+    // every agent out of Lab Boards while looking like a correct membership
+    // check, which is precisely the population the feature exists to serve.
+    if state.config.allow_nip_oa_auth {
+        if let Some((_, Some(owner_bytes))) = state
+            .db
+            .get_agent_channel_policy(community, pubkey)
+            .await
+            .map_err(|e| format!("relay membership check failed: {e}"))?
+        {
+            return state
+                .db
+                .is_relay_member(community, &hex::encode(&owner_bytes))
+                .await
+                .map_err(|e| format!("relay membership check failed: {e}"));
+        }
+    }
+
+    Ok(false)
+}
+
 async fn check_lab_board_membership(
     state: &Arc<AppState>,
     community: CommunityId,
     author_pubkey: &[u8; 32],
 ) -> Result<(), IngestError> {
-    if !state.config.require_relay_membership {
-        return Ok(());
+    match is_lab_board_member(state, community, author_pubkey.as_slice()).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(IngestError::AuthFailed(
+            "restricted: not a relay member".to_string(),
+        )),
+        Err(e) => Err(IngestError::Internal(format!("error: {e}"))),
     }
-
-    let pubkey_hex = hex::encode(author_pubkey);
-    let is_member = state
-        .db
-        .is_relay_member(community, &pubkey_hex)
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: relay membership check failed: {e}")))?;
-    if is_member {
-        return Ok(());
-    }
-
-    // Not a direct member — fall back to NIP-OA delegation via the durably
-    // persisted owner mapping (the agent's own relay membership is never
-    // materialized; only the owner's is expected to exist in
-    // `relay_members`).
-    if state.config.allow_nip_oa_auth {
-        if let Some((_, Some(owner_bytes))) = state
-            .db
-            .get_agent_channel_policy(community, author_pubkey.as_slice())
-            .await
-            .map_err(|e| {
-                IngestError::Internal(format!("error: relay membership check failed: {e}"))
-            })?
-        {
-            let owner_is_member = state
-                .db
-                .is_relay_member(community, &hex::encode(&owner_bytes))
-                .await
-                .map_err(|e| {
-                    IngestError::Internal(format!("error: relay membership check failed: {e}"))
-                })?;
-            if owner_is_member {
-                return Ok(());
-            }
-        }
-    }
-
-    Err(IngestError::AuthFailed(
-        "restricted: not a relay member".to_string(),
-    ))
 }
 
 /// Entry point called from `ingest_event_inner` when `kind_u32 ==
@@ -462,6 +467,21 @@ pub async fn handle_lab_board_revision_event(
 ) -> Result<IngestResult, IngestError> {
     let event_id_hex = event.id.to_hex();
     let community = tenant.community();
+
+    // Lab Boards are community-global, so a token restricted to a set of
+    // channels must not be able to write one.
+    //
+    // `ingest_event_inner` enforces this for every other global kind, but that
+    // check lives *after* the branch that routes kind:40101 here (Lab has no
+    // `h` tag, so it returns before channel resolution runs at all). Repeating
+    // the rule here is what keeps the restriction from being silently skipped
+    // for this one kind — the alternative, moving the dispatch below the
+    // channel block, would drag Lab through machinery it has no channel for.
+    if auth.channel_ids().is_some() {
+        return Err(IngestError::AuthFailed(
+            "restricted: channel-scoped tokens cannot publish global events".into(),
+        ));
+    }
 
     let envelope = parse_lab_board_envelope(&event)
         .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
@@ -556,7 +576,8 @@ pub async fn handle_lab_board_revision_event(
     } else {
         handle_moderation_op(
             &mut tx,
-            community,
+            tenant,
+            state,
             &event,
             &envelope,
             current_head,
@@ -678,6 +699,39 @@ async fn handle_content_mutation(
         }
     }
 
+    // A `restore` claims provenance: "this content is revision N brought back".
+    // Verify that claim inside the transaction before recording it, otherwise
+    // `restored_from` is only an assertion by the client and the audit trail
+    // can be made to say something that never happened — an editor could
+    // publish arbitrary text labelled as a restore of a revision the community
+    // trusts.
+    if envelope.op == LabBoardOp::Restore {
+        let restored_from = envelope
+            .restored_from
+            .expect("validated present for restore in parse_lab_board_envelope");
+        if restored_from < 1 || restored_from >= new_revision {
+            return Err(IngestError::Rejected(format!(
+                "invalid: restored_from {restored_from} must name an existing earlier revision (current head is {})",
+                new_revision - 1
+            )));
+        }
+        let source =
+            buzz_db::lab::get_board_revision_tx(tx, community, envelope.board_id, restored_from)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?
+                .ok_or_else(|| {
+                    IngestError::Rejected(format!(
+                        "invalid: lab board {} has no revision {restored_from}",
+                        envelope.board_id
+                    ))
+                })?;
+        if source.content_hash.as_slice() != content_hash.as_slice() {
+            return Err(IngestError::Rejected(format!(
+                "invalid: submitted content does not match revision {restored_from}"
+            )));
+        }
+    }
+
     let title = envelope
         .title
         .clone()
@@ -793,20 +847,27 @@ async fn handle_content_mutation(
     Ok((Some(revision_stored), Some(head_stored), String::new()))
 }
 
-/// Steps 4–6 for `archive`/`unarchive`/`freeze`/`unfreeze`. No head
-/// projection is (re-)signed here — content/revision are untouched by a
-/// pure status change, so the existing kind:30623 remains valid for its
-/// revision; the current live status is queryable from `lab_board_heads`
-/// (an explicit read API is out of scope for this foundation round — see
-/// the accompanying report's open decisions).
+/// Steps 4–8 for `archive`/`unarchive`/`freeze`/`unfreeze`.
+///
+/// Content and revision are untouched, but the head projection IS re-signed:
+/// `status` is one of its tags, and clients read that tag to decide whether a
+/// board can be edited and whether it belongs in an archived filter. Leaving
+/// the old projection in place would keep announcing `active` over Nostr while
+/// the database said `archived` — the UI would offer an Edit button for a
+/// board nobody can edit, and no client could filter archived boards without
+/// a separate database read it has no access to. Database state and published
+/// state must not disagree.
+#[allow(clippy::too_many_arguments)]
 async fn handle_moderation_op(
     tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
-    community: buzz_core::tenant::CommunityId,
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
     event: &Event,
     envelope: &LabBoardEnvelope,
     current_head: Option<BoardHead>,
     author_pubkey: &[u8; 32],
 ) -> Result<MutationOutcome, IngestError> {
+    let community = tenant.community();
     let Some(head) = current_head else {
         return Err(IngestError::Rejected(format!(
             "invalid: lab board {} does not exist",
@@ -829,15 +890,53 @@ async fn handle_moderation_op(
         return Ok((None, None, "duplicate:".to_string()));
     }
 
-    buzz_db::lab::set_board_status_tx(
+    // The projection mirrors the head revision's Markdown; read it back rather
+    // than duplicating the text into `lab_board_heads`, where it could drift
+    // from the event that is the actual record.
+    let head_content =
+        buzz_db::lab::get_event_content_tx(tx, community, head.head_revision_event_id.as_slice())
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?
+            .ok_or_else(|| {
+                IngestError::Internal(
+                    "error: lab board head revision event is missing from storage".to_string(),
+                )
+            })?;
+
+    let new_status = envelope.op.target_status();
+
+    // Re-sign the projection with the new status, reusing the head revision's
+    // content and number — this is a status change, not a content change.
+    let head_event = build_head_projection_event(
+        tenant,
+        &state.relay_keypair,
+        envelope.board_id,
+        &head_content,
+        head.revision,
+        &head.title,
+        head.summary.as_deref(),
+        &hex::encode(&head.head_revision_event_id),
+        new_status,
+    )?;
+    let head_stored = buzz_db::lab::replace_head_projection_event_tx(
         tx,
         community,
-        envelope.board_id,
-        envelope.op.target_status(),
-        author_pubkey.as_slice(),
+        &head_event,
+        head.head_projection_event_id.as_deref(),
     )
     .await
     .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
 
-    Ok((Some(revision_stored), None, String::new()))
+    buzz_db::lab::set_board_status_tx(
+        tx,
+        community,
+        envelope.board_id,
+        new_status,
+        author_pubkey.as_slice(),
+        Some(head_event.id.as_bytes()),
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
+
+    Ok((Some(revision_stored), Some(head_stored), String::new()))
 }

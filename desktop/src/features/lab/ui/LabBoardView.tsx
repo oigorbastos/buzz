@@ -29,14 +29,23 @@ type LabBoardViewProps = {
 };
 
 export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
-  const boardQuery = useLabBoardQuery(boardId);
   const [showHistory, setShowHistory] = React.useState(false);
   const historyQuery = useLabBoardHistoryQuery(boardId, showHistory);
   const updateMutation = useUpdateLabBoardMutation(boardId);
   const restoreMutation = useRestoreLabBoardMutation(boardId);
 
   const [isEditing, setIsEditing] = React.useState(false);
+  // Poll only while editing — that is the only window where another writer's
+  // revision changes what this user should do next.
+  const boardQuery = useLabBoardQuery(boardId, isEditing);
   const [draft, setDraft] = React.useState("");
+  /**
+   * The head this draft was started from. Captured once when editing begins
+   * and never refreshed — it is the `prev` sent to the relay, i.e. the claim
+   * "I wrote this against revision N". Refreshing it would turn every save
+   * into an unconditional overwrite.
+   */
+  const [editBase, setEditBase] = React.useState<LabBoardHead | null>(null);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
 
   const board = boardQuery.data ?? null;
@@ -46,6 +55,9 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
 
   function handleStartEditing(head: LabBoardHead) {
     setDraft(head.content);
+    // Freeze the revision this draft is derived from. Everything below depends
+    // on this value never being refreshed — see `handleSave`.
+    setEditBase(head);
     setErrorMessage(null);
     setIsEditing(true);
   }
@@ -53,10 +65,12 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
   function handleCancelEditing() {
     setIsEditing(false);
     setDraft("");
+    setEditBase(null);
     setErrorMessage(null);
   }
 
-  async function handleSave(head: LabBoardHead) {
+  async function handleSave() {
+    if (!editBase) return;
     const validationError = validateBoardInput({ content: draft });
     if (validationError) {
       setErrorMessage(validationError);
@@ -64,14 +78,19 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
     }
     setErrorMessage(null);
     try {
-      // Re-read the head immediately before writing so a board someone else
-      // advanced while this editor was open is caught here rather than by a
-      // relay rejection the user cannot interpret.
-      const fresh = await boardQuery.refetch();
-      const latest = fresh.data ?? head;
-      await updateMutation.mutateAsync({ head: latest, content: draft });
+      // Send the head captured when editing STARTED, never a freshly read one.
+      //
+      // This is the entire point of the feature. `prev` is a claim about which
+      // revision this text was written against; re-reading the head just
+      // before saving would replace that claim with "whatever is current",
+      // which the relay then always accepts — silently destroying any revision
+      // published while the editor was open. The CAS transaction, the advisory
+      // lock and BOARD_HEAD_MISMATCH all exist to catch exactly that, and are
+      // dead weight unless this base stays frozen.
+      await updateMutation.mutateAsync({ head: editBase, content: draft });
       setIsEditing(false);
       setDraft("");
+      setEditBase(null);
     } catch (error) {
       // The draft is deliberately NOT cleared on failure — losing someone's
       // writing to a conflict would be the worst possible outcome here.
@@ -137,6 +156,13 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
 
   const isFrozen = board.status === "frozen";
   const isSaving = updateMutation.isPending;
+  // The polled head has moved past the revision this draft was started from,
+  // so saving will (correctly) be refused. Say so now rather than letting the
+  // user finish writing and only then hit a conflict.
+  const baseIsStale =
+    isEditing &&
+    editBase !== null &&
+    board.headEventId !== editBase.headEventId;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
@@ -218,6 +244,16 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
 
       {isEditing ? (
         <div className="space-y-3 p-4">
+          {baseIsStale ? (
+            <p
+              className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400"
+              data-testid="lab-board-stale-base"
+            >
+              This board moved to revision {board.revision} while you were
+              writing. Saving will be refused so their work is not lost — copy
+              your text, cancel, and reapply it on the new version.
+            </p>
+          ) : null}
           <Textarea
             aria-label="Board content"
             className="min-h-64 font-mono text-sm"
@@ -232,7 +268,7 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
               data-testid="lab-board-save"
               disabled={isSaving}
               onClick={() => {
-                void handleSave(board);
+                void handleSave();
               }}
               size="sm"
               type="button"

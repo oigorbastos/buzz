@@ -8,7 +8,8 @@ use tracing::{debug, warn};
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
     is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC,
-    KIND_DM_VISIBILITY, P_GATED_KINDS, RESULT_GATED_KINDS, SHARED_GATED_KINDS,
+    KIND_DM_VISIBILITY, KIND_LAB_BOARD_HEAD, KIND_LAB_BOARD_REVISION, P_GATED_KINDS,
+    RESULT_GATED_KINDS, SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -39,6 +40,21 @@ pub(crate) const FILTER_QUERY_CONCURRENCY: usize = 4;
 // the range fails the build.
 const _: () = assert!(FILTER_QUERY_CONCURRENCY >= 2 && FILTER_QUERY_CONCURRENCY <= 8);
 
+/// True when any filter asks for Lab Board kinds.
+///
+/// Lab Boards carry their own read scope, so a request that touches them has
+/// to satisfy it. A filter with no `kinds` at all matches everything, Lab
+/// kinds included, and therefore counts.
+fn filters_request_lab_kinds(filters: &[Filter]) -> bool {
+    filters.iter().any(|filter| match &filter.kinds {
+        Some(kinds) if !kinds.is_empty() => kinds.iter().any(|kind| {
+            let value = u32::from(kind.as_u16());
+            value == KIND_LAB_BOARD_REVISION || value == KIND_LAB_BOARD_HEAD
+        }),
+        _ => true,
+    })
+}
+
 /// Handle a REQ message: register the subscription, deliver historical events, then send EOSE.
 pub async fn handle_req(
     sub_id: String,
@@ -55,6 +71,24 @@ pub async fn handle_req(
                     conn.send(RelayMessage::closed(
                         &sub_id,
                         "restricted: insufficient scope",
+                    ));
+                    return;
+                }
+                // `boards:read` exists as a scope, so it has to actually gate
+                // something: without this, a token could read every board on
+                // the strength of `messages:read` alone and the Lab scope
+                // would be decoration. Scopeless (legacy) tokens keep their
+                // blanket access, same as the check above.
+                if !ctx.scopes.is_empty()
+                    && !ctx.scopes.contains(&Scope::BoardsRead)
+                    && filters_request_lab_kinds(&filters)
+                {
+                    conn.send(RelayMessage::notice(
+                        "restricted: insufficient scope for lab boards",
+                    ));
+                    conn.send(RelayMessage::closed(
+                        &sub_id,
+                        "restricted: insufficient scope for lab boards",
                     ));
                     return;
                 }
@@ -84,6 +118,38 @@ pub async fn handle_req(
             }
         }
     };
+
+    // Re-check community membership for Lab reads on every REQ.
+    //
+    // Membership is normally settled once, at the AUTH handshake, and never
+    // revisited for the life of the socket. That is survivable for
+    // channel-scoped kinds, where `accessible_channels` is recomputed here and
+    // narrows what a removed member can still see — but Lab Boards are
+    // community-global and pass through none of that, so a member removed
+    // mid-session would keep reading every board until they happened to
+    // reconnect. Re-deriving it here costs one indexed lookup on a path that
+    // already does several, and only for requests that touch Lab kinds.
+    if state.config.require_relay_membership && filters_request_lab_kinds(&filters) {
+        // Same resolver the write path uses, so an agent reading a board is
+        // judged by its owner's membership rather than by a pubkey that is
+        // never in `relay_members`.
+        match super::lab::is_lab_board_member(&state, conn.tenant.community(), &pubkey_bytes).await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted: not a relay member",
+                ));
+                return;
+            }
+            Err(e) => {
+                warn!(conn_id = %conn_id, "Lab membership re-check failed: {e}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    }
 
     let mut accessible_channels = if filters_are_nip43_membership_only(&filters) {
         metrics::counter!("buzz_req_global_access_resolution_skips_total", "kind" => "13534")

@@ -39,7 +39,20 @@ export function useLabBoardsQuery() {
   });
 }
 
-export function useLabBoardQuery(boardId: string | null) {
+/**
+ * Read a board's head.
+ *
+ * `pollWhileEditing` turns on a slow refetch. It exists so the editor can
+ * tell the user that someone else advanced the board *while they are still
+ * typing*, instead of letting them finish and only then be refused. Without
+ * it the staleness banner could never fire — `refetchOnWindowFocus` is off
+ * globally, so nothing else would move this query.
+ *
+ * The polled value is only ever used to warn and to render; the revision a
+ * draft is saved against is captured separately when editing begins and must
+ * not come from here (see `LabBoardView`).
+ */
+export function useLabBoardQuery(boardId: string | null, pollWhileEditing = false) {
   return useQuery({
     enabled: boardId !== null,
     queryKey: labBoardQueryKey(boardId ?? "none"),
@@ -50,6 +63,7 @@ export function useLabBoardQuery(boardId: string | null) {
     // No staleTime: the head doubles as the CAS token, so a cached one that
     // has been superseded turns the next save into a conflict.
     staleTime: 0,
+    refetchInterval: pollWhileEditing ? 15_000 : false,
   });
 }
 

@@ -383,6 +383,54 @@ pub async fn record_board_revision_tx(
     Ok(())
 }
 
+/// Read a stored event's Markdown content inside the CAS transaction.
+///
+/// Moderation re-signs the head projection, which has to carry the same
+/// content the current revision holds. `lab_board_heads` stores the pointer,
+/// not the text, so the text is read back from `events` here rather than
+/// duplicated into the CAS table where it could drift.
+pub async fn get_event_content_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    event_id: &[u8],
+) -> Result<Option<String>> {
+    let content: Option<String> =
+        sqlx::query_scalar("SELECT content FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community.as_uuid())
+            .bind(event_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(content)
+}
+
+/// Read one recorded revision inside the CAS transaction.
+///
+/// Used to validate a `restore`: the relay must confirm that the revision the
+/// client claims to be restoring exists on this board and that the content it
+/// submitted really is that revision's content. Without this read, the
+/// `restored_from` column is only the client's word, and the history would
+/// record a provenance that never happened.
+pub async fn get_board_revision_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    board_id: Uuid,
+    revision: i32,
+) -> Result<Option<BoardRevision>> {
+    let row = sqlx::query(
+        "SELECT board_id, revision, event_id, base_event_id, operation, author_pubkey, \
+                accepted_at, content_hash, restored_from \
+         FROM lab_board_revisions \
+         WHERE community_id = $1 AND board_id = $2 AND revision = $3",
+    )
+    .bind(community.as_uuid())
+    .bind(board_id)
+    .bind(revision)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    row.as_ref().map(row_to_board_revision).transpose()
+}
+
 /// Create the first `lab_board_heads` row for a board (accepted "create",
 /// `revision = 1`, `status = 'active'`).
 ///
@@ -487,12 +535,14 @@ pub async fn set_board_status_tx(
     board_id: Uuid,
     new_status: &str,
     actor_pubkey: &[u8],
+    head_projection_event_id: Option<&[u8]>,
 ) -> Result<BoardHead> {
     let row = match new_status {
         "archived" => {
             sqlx::query(concat!(
                 "UPDATE lab_board_heads \
                  SET status = 'archived', archived_at = now(), archived_by = $3, \
+                     head_projection_event_id = COALESCE($4, head_projection_event_id), \
                      updated_at = now(), updated_by = $3 \
                  WHERE community_id = $1 AND board_id = $2 \
                  RETURNING ",
@@ -501,6 +551,7 @@ pub async fn set_board_status_tx(
             .bind(community.as_uuid())
             .bind(board_id)
             .bind(actor_pubkey)
+            .bind(head_projection_event_id)
             .fetch_optional(&mut **tx)
             .await?
         }
@@ -508,6 +559,7 @@ pub async fn set_board_status_tx(
             sqlx::query(concat!(
                 "UPDATE lab_board_heads \
                  SET status = 'frozen', frozen_at = now(), frozen_by = $3, \
+                     head_projection_event_id = COALESCE($4, head_projection_event_id), \
                      updated_at = now(), updated_by = $3 \
                  WHERE community_id = $1 AND board_id = $2 \
                  RETURNING ",
@@ -516,13 +568,16 @@ pub async fn set_board_status_tx(
             .bind(community.as_uuid())
             .bind(board_id)
             .bind(actor_pubkey)
+            .bind(head_projection_event_id)
             .fetch_optional(&mut **tx)
             .await?
         }
         "active" => {
             sqlx::query(concat!(
                 "UPDATE lab_board_heads \
-                 SET status = 'active', updated_at = now(), updated_by = $3 \
+                 SET status = 'active', \
+                     head_projection_event_id = COALESCE($4, head_projection_event_id), \
+                     updated_at = now(), updated_by = $3 \
                  WHERE community_id = $1 AND board_id = $2 \
                  RETURNING ",
                 board_head_columns!()
@@ -530,6 +585,7 @@ pub async fn set_board_status_tx(
             .bind(community.as_uuid())
             .bind(board_id)
             .bind(actor_pubkey)
+            .bind(head_projection_event_id)
             .fetch_optional(&mut **tx)
             .await?
         }
