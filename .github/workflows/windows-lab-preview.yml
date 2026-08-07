@@ -21,7 +21,7 @@ jobs:
       contents: read
     env:
       TARGET: x86_64-pc-windows-msvc
-      LAB_BASE_SHA: 3c09c87fc04606ad1f3b2186b33da9e3542b774a
+      LAB_BASE_SHA: 3d66baf4e65f840d7168076f64ebba7e3b35fdd3
       SOURCE_SHA: ${{ github.sha }}
       BUILD_WORKFLOW_SHA: ${{ github.sha }}
 
