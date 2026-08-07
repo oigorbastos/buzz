@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ env.SOURCE_SHA }}
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify immutable lab source
@@ -61,20 +61,19 @@ jobs:
             echo "::error::Checked out commit does not equal SOURCE_SHA" >&2
             exit 1
           }
-          [[ "$(git rev-parse HEAD^)" == "$LAB_BASE_SHA" ]] || {
-            echo "::error::Lab branch must be based directly on LAB_BASE_SHA" >&2
+          git merge-base --is-ancestor "$LAB_BASE_SHA" HEAD || {
+            echo "::error::Lab source must descend from LAB_BASE_SHA" >&2
             exit 1
           }
-          mapfile -t changed_files < <(git diff-tree --no-commit-id --name-only -r HEAD)
+          mapfile -t changed_files < <(git diff --name-only "$LAB_BASE_SHA" "$SOURCE_SHA")
           [[ "${#changed_files[@]}" -eq 1 && "${changed_files[0]}" == ".github/workflows/windows-lab-preview.yml" ]] || {
-            echo "::error::Canary branch must contain only the preview workflow commit" >&2
+            echo "::error::Canary branch must change only the preview workflow" >&2
             printf '%s\n' "${changed_files[@]}" >&2
             exit 1
           }
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
-          toolchain: 1.95.0
           targets: ${{ env.TARGET }}
 
       - name: Verify Rust toolchain
@@ -90,7 +89,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24.14.1
-          package-manager-cache: false
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
@@ -222,7 +220,7 @@ jobs:
           cp "target/${TARGET}/release/buzz-agent.exe" "$PORTABLE_ROOT/buzz-agent.exe"
           cp "target/${TARGET}/release/buzz-dev-mcp.exe" "$PORTABLE_ROOT/buzz-dev-mcp.exe"
           cp "target/${TARGET}/release/git-credential-nostr.exe" "$PORTABLE_ROOT/git-credential-nostr.exe"
-          cp "target/${TARGET}/release/buzz.exe" "$PORTABLE_ROOT/buzz-cli.exe"
+          cp "target/${TARGET}/release/buzz.exe" "$PORTABLE_ROOT/buzz.exe"
 
           NSIS_NAME="buzz-lab-windows-nsis-${VERSION}-${TARGET}-unsigned.exe"
           cp "$NSIS_SOURCE" "$NSIS_ROOT/$NSIS_NAME"
@@ -253,6 +251,7 @@ jobs:
           TAURI_SIGNING=disabled
           CREATE_UPDATER_ARTIFACTS=false
           ARTIFACT_RETENTION_DAYS=7
+          PORTABLE_CLI=buzz.exe
           EOF
           }
 
@@ -267,7 +266,7 @@ jobs:
               buzz-agent.exe \
               buzz-dev-mcp.exe \
               git-credential-nostr.exe \
-              buzz-cli.exe
+              buzz.exe
           ) > "$PORTABLE_ROOT/SHA256SUMS.txt"
           (
             cd "$NSIS_ROOT"
@@ -286,11 +285,21 @@ jobs:
           echo "portable_zip=$PORTABLE_ZIP" >> "$GITHUB_OUTPUT"
           echo "portable_manifest=$PORTABLE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
           echo "portable_sums=$PORTABLE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+          echo "portable_root=$PORTABLE_ROOT" >> "$GITHUB_OUTPUT"
           echo "nsis_exe=$NSIS_ROOT/$NSIS_NAME" >> "$GITHUB_OUTPUT"
           echo "nsis_manifest=$NSIS_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
           echo "nsis_sums=$NSIS_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
           echo "release_manifest=$RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
           echo "release_sums=$RELEASE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test portable CLI
+        shell: bash
+        env:
+          PORTABLE_ROOT: ${{ steps.artifacts.outputs.portable_root }}
+        run: |
+          set -euo pipefail
+          cd "$PORTABLE_ROOT"
+          ./buzz.exe lab --help
 
       - name: Print artifact names, sizes, and SHA-256
         shell: bash
@@ -314,8 +323,8 @@ jobs:
           name: buzz-lab-windows-portable-${{ github.sha }}
           path: |
             ${{ steps.artifacts.outputs.portable_zip }}
-            ${{ steps.artifacts.outputs.portable_manifest }}
-            ${{ steps.artifacts.outputs.portable_sums }}
+            ${{ steps.artifacts.outputs.release_manifest }}
+            ${{ steps.artifacts.outputs.release_sums }}
           if-no-files-found: error
           retention-days: 7
 
