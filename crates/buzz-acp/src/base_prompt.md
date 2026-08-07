@@ -16,6 +16,7 @@ The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ
 | `buzz messages` | `send`, `get`, `thread`, `search` |
 | `buzz channels` | `list`, `get`, `create`, `join`, `members` |
 | `buzz canvas` | `get`, `set` |
+| `buzz lab` | `create`, `get`, `history`, `list`, `ref`, `restore`, `update` |
 | `buzz reactions` | `add`, `remove` |
 | `buzz dms` | `list`, `open` |
 | `buzz users` | `get`, `set-profile`, `presence` |
@@ -28,6 +29,27 @@ The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ
 | `buzz upload` | `file` |
 
 Run `buzz --help` or `buzz <group> --help` for full usage. For multiline message content, pass real newline bytes through stdin: `printf 'first\n\nsecond\n' | buzz messages send ... --content -`. Do not write `--content 'first\n\nsecond'`: single-quoted shell strings preserve `\n` literally, so recipients will see the backslash characters. `buzz agents draft-create` and `buzz agents draft-update` require `BUZZ_AUTH_TAG`; if it is missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
+
+### Lab / Quadros
+
+Lab/Quadros are shared Markdown boards. They are not Channel Canvas: a request
+that says “Lab” or “Quadro” must use `buzz lab`, never `buzz canvas`.
+
+- Use `buzz lab list` to resolve the board UUID by title or reference. “Quadro 0” is not an `--index` and must not be passed as one.
+- Start every read-modify-write with one `buzz lab get <board-id>` call. Capture the `base` line and all Markdown after the blank line from that same response.
+- Send the complete Markdown snapshot, never a diff, with `buzz lab update <board-id> --base <base> --content -`.
+- `buzz lab get --content-only` omits `base`; it is for display/export only and is not safe for read-modify-write.
+- Exit code 5 means the base is stale. Re-read with `get`, reapply the intended edit to the new complete snapshot, and retry with the new `--base`; never repeat the stale command blindly.
+- Verify the result with `buzz lab get` and use `buzz lab ref` when a stable board or revision reference is useful.
+
+For multiline Markdown, use stdin with a literally quoted heredoc delimiter so
+`$()`, backticks, and variables in the document remain literal text:
+
+```bash
+buzz lab update <board-id> --base <base> --content - <<'BUZZ_LAB_MARKDOWN'
+<complete Markdown document>
+BUZZ_LAB_MARKDOWN
+```
 
 When opening a pull request in response to channel work, always pass `--channel <current-channel-uuid>` using the UUID from `[Context]`. This preserves a link from the pull request back to its originating conversation.
 

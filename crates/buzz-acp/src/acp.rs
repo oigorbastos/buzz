@@ -39,6 +39,18 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// Claude Code-specific options sent in the `session/new` `_meta` envelope.
+///
+/// This is deliberately a separate type from the generic ACP request so a
+/// permission policy cannot leak to another adapter by accident. The harness
+/// remains in `dontAsk`; this narrow allowlist is the only pre-authorization
+/// Claude receives for Lab read/modify/write commands.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ClaudeCodeSessionOptions {
+    #[serde(rename = "allowedTools")]
+    pub allowed_tools: Vec<String>,
+}
+
 /// Stop reason returned by `session/prompt` when the agent finishes a turn.
 ///
 /// Maps to the `stopReason` field in the `SessionPromptResponse`.
@@ -642,6 +654,30 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        self.session_new_full_with_claude_options(
+            cwd,
+            mcp_servers,
+            system_prompt,
+            session_title,
+            None,
+        )
+        .await
+    }
+
+    /// Send `session/new` with optional Claude-only adapter metadata.
+    ///
+    /// `_meta.systemPrompt`, `_meta.sessionTitle`, and the Claude Code
+    /// options are merged into one object. Callers must pass the typed
+    /// [`ClaudeCodeSessionOptions`] only after positively identifying the
+    /// Claude adapter; other adapters should pass `None`.
+    pub async fn session_new_full_with_claude_options(
+        &mut self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+        claude_code_options: Option<ClaudeCodeSessionOptions>,
+    ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -659,6 +695,10 @@ impl AcpClient {
         if let Some(title) = session_title {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if let Some(options) = claude_code_options {
+            // Merge — never replace systemPrompt or sessionTitle in `_meta`.
+            params["_meta"]["claudeCode"]["options"] = serde_json::to_value(options)?;
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -3576,6 +3616,57 @@ mod tests {
             received["params"]["_meta"]["sessionTitle"].as_str(),
             Some("Fizz · #buzz-dev"),
             "_meta.sessionTitle must be present alongside systemPrompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_full_merges_claude_allowed_tools_with_prompt_and_title() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_claude_lab","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let allowed_tools = vec![
+            "Bash(buzz lab list:*)".to_owned(),
+            "Bash(buzz lab get:*)".to_owned(),
+            "Bash(buzz lab history:*)".to_owned(),
+            "Bash(buzz lab ref:*)".to_owned(),
+            "Bash(buzz lab update * --base *:*)".to_owned(),
+        ];
+        let resp = client
+            .session_new_full_with_claude_options(
+                "/tmp",
+                vec![],
+                Some(SystemPromptTransport::ClaudeMeta("Lab instructions")),
+                Some("Cloclo · #lab"),
+                Some(ClaudeCodeSessionOptions { allowed_tools }),
+            )
+            .await
+            .expect("session_new_full should succeed");
+
+        let received = &resp.raw["_receivedRequest"];
+        assert_eq!(
+            received["params"]["_meta"]["systemPrompt"]["append"],
+            "Lab instructions"
+        );
+        assert_eq!(received["params"]["_meta"]["sessionTitle"], "Cloclo · #lab");
+        assert_eq!(
+            received["params"]["_meta"]["claudeCode"]["options"]["allowedTools"],
+            serde_json::json!([
+                "Bash(buzz lab list:*)",
+                "Bash(buzz lab get:*)",
+                "Bash(buzz lab history:*)",
+                "Bash(buzz lab ref:*)",
+                "Bash(buzz lab update * --base *:*)"
+            ])
         );
     }
 

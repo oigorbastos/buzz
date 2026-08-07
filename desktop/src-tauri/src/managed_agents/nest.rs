@@ -50,7 +50,7 @@ const NEST_AGENTS_VERSION: u32 = 4;
 
 /// Template content version for SKILL.md.
 /// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
-const NEST_SKILL_VERSION: u32 = 5;
+const NEST_SKILL_VERSION: u32 = 6;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";
@@ -217,6 +217,10 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
     // Refresh static content if the embedded template version is newer.
     refresh_agents_md_if_stale(root)?;
     refresh_skill_md_if_stale(root)?;
+    // Windows cannot rely on the Unix symlink fan-out. Refresh real copies
+    // after the canonical template so an upgrade reaches Claude's path too.
+    #[cfg(windows)]
+    ensure_skill_materializations(root)?;
 
     // Set owner-only permissions on root and all subdirectories.
     // Skip any path that is a symlink — chmod would affect the target.
@@ -304,8 +308,16 @@ fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn ensure_skill_symlinks(_root: &Path) -> Result<(), String> {
-    Ok(())
+fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        return ensure_skill_materializations(root);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        Ok(())
+    }
 }
 
 /// Returns the `~/.local/bin` link name for the bundled CLI.
@@ -384,6 +396,103 @@ fn read_version_file(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+/// Replace a file through a same-directory temporary file. On Windows,
+/// `MoveFileExW(REPLACE_EXISTING)` supplies the atomic replacement semantics
+/// that `std::fs::rename` does not provide for an existing destination.
+fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or("target file has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("tempfile in {}: {e}", parent.display()))?;
+    tmp.write_all(contents)
+        .map_err(|e| format!("write tempfile: {e}"))?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let temp_path = tmp.into_temp_path();
+        let source: Vec<u16> = temp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let destination: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(format!(
+                "replace {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        tmp.persist(path)
+            .map(|_| ())
+            .map_err(|e| format!("persist {}: {}", path.display(), e.error))
+    }
+}
+
+/// Materialize managed skill copies on Windows, where the Unix symlink fan-out
+/// is unavailable. Only the reserved `buzz-cli` namespace is touched; foreign
+/// files or symlinked paths are left alone. Version files make upgrades
+/// (including 5 → 6) and repeated launches deterministic.
+#[cfg(windows)]
+fn ensure_skill_materializations(root: &Path) -> Result<(), String> {
+    let canonical_dir = root.join(CANONICAL_SKILL_DIR);
+    let canonical_skill = canonical_dir.join("SKILL.md");
+    let canonical_content = fs::read(&canonical_skill)
+        .map_err(|e| format!("read {}: {e}", canonical_skill.display()))?;
+    let canonical_version = read_version_file(&canonical_dir.join(".skill-version"));
+
+    for skill_dir in known_skill_dirs() {
+        let managed_dir = root.join(skill_dir).join("buzz-cli");
+        match managed_dir.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => continue,
+            Ok(metadata) if !metadata.file_type().is_dir() => continue,
+            Ok(_) | Err(_) => {}
+        }
+        fs::create_dir_all(&managed_dir)
+            .map_err(|e| format!("create {}: {e}", managed_dir.display()))?;
+
+        let destination = managed_dir.join("SKILL.md");
+        let destination_exists = destination.symlink_metadata().is_ok();
+        let destination_version = read_version_file(&managed_dir.join(".skill-version"));
+        if destination_exists
+            && (canonical_version == 0 || destination_version >= canonical_version)
+        {
+            continue;
+        }
+
+        atomic_write_file(&destination, &canonical_content)?;
+        if canonical_version > 0 {
+            atomic_write_file(
+                &managed_dir.join(".skill-version"),
+                format!("{canonical_version}\n").as_bytes(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Refresh AGENTS.md static content if the template version has changed.
 ///
 /// Preserves everything from the `<!-- BEGIN BUZZ MANAGED` marker onward
@@ -423,17 +532,7 @@ fn refresh_agents_md_if_stale(root: &Path) -> Result<(), String> {
         }
     };
 
-    // Atomic write via temp file.
-    let parent = agents_md.parent().ok_or("AGENTS.md has no parent dir")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| format!("tempfile in {}: {e}", parent.display()))?;
-    {
-        use std::io::Write;
-        tmp.write_all(new_content.as_bytes())
-            .map_err(|e| format!("write tempfile: {e}"))?;
-    }
-    tmp.persist(&agents_md)
-        .map_err(|e| format!("persist {}: {e}", agents_md.display()))?;
+    atomic_write_file(&agents_md, new_content.as_bytes())?;
 
     fs::write(&version_path, format!("{NEST_AGENTS_VERSION}\n"))
         .map_err(|e| format!("write {}: {e}", version_path.display()))?;
@@ -460,7 +559,7 @@ fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
         .map(|m| m.file_type().is_dir())
         .unwrap_or(false);
 
-    let skill_content = if old_is_real_dir {
+    let skill_content = if old_is_real_dir && cfg!(not(windows)) {
         // Preserve user-edited content during migration.
         fs::read_to_string(old_skill_dir.join("SKILL.md"))
             .unwrap_or_else(|_| BUZZ_CLI_SKILL_MD.to_string())
@@ -472,17 +571,8 @@ fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
     fs::create_dir_all(&agents_skill_dir)
         .map_err(|e| format!("create {}: {e}", agents_skill_dir.display()))?;
 
-    // Atomic write via temp file.
     let skill_md = agents_skill_dir.join("SKILL.md");
-    let mut tmp = tempfile::NamedTempFile::new_in(&agents_skill_dir)
-        .map_err(|e| format!("tempfile in {}: {e}", agents_skill_dir.display()))?;
-    {
-        use std::io::Write;
-        tmp.write_all(skill_content.as_bytes())
-            .map_err(|e| format!("write tempfile: {e}"))?;
-    }
-    tmp.persist(&skill_md)
-        .map_err(|e| format!("persist {}: {e}", skill_md.display()))?;
+    atomic_write_file(&skill_md, skill_content.as_bytes())?;
 
     // Replace old real directory with a symlink.
     if old_is_real_dir {

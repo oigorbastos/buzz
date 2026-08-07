@@ -42,6 +42,18 @@ fn nest_skill_contains_safe_mention_workflow() {
 }
 
 #[test]
+fn nest_skill_contains_lab_cas_workflow() {
+    assert!(BUZZ_CLI_SKILL_MD.contains("Lab/Quadros are shared Markdown boards, not Channel Canvas"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("use `buzz lab`; never use `buzz canvas`"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("buzz lab list"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("not an `--index` flag"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("complete Markdown document, not a diff"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("Exit code 5 is a stale-base conflict"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("--content-only"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("<<'BUZZ_LAB_MARKDOWN'"));
+}
+
+#[test]
 fn ensure_nest_creates_all_dirs_and_agents_md() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
@@ -146,6 +158,44 @@ fn ensure_nest_creates_skill_file() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn ensure_nest_materializes_claude_skill_on_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".buzz");
+
+    ensure_nest_at(&root).unwrap();
+
+    let claude_skill = root.join(".claude/skills/buzz-cli/SKILL.md");
+    assert!(claude_skill.is_file(), "Claude must receive a real Windows skill file");
+    assert_eq!(fs::read_to_string(&claude_skill).unwrap(), BUZZ_CLI_SKILL_MD);
+
+    let first = fs::read(&claude_skill).unwrap();
+    ensure_nest_at(&root).unwrap();
+    assert_eq!(fs::read(&claude_skill).unwrap(), first, "second install is idempotent");
+}
+
+#[cfg(windows)]
+#[test]
+fn ensure_nest_upgrades_windows_claude_skill_from_five_to_six() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".buzz");
+    ensure_nest_at(&root).unwrap();
+
+    let canonical_dir = root.join(CANONICAL_SKILL_DIR);
+    let claude_dir = root.join(".claude/skills/buzz-cli");
+    fs::write(canonical_dir.join("SKILL.md"), "stale v5").unwrap();
+    fs::write(canonical_dir.join(".skill-version"), "5\n").unwrap();
+    fs::write(claude_dir.join("SKILL.md"), "stale v5").unwrap();
+    fs::write(claude_dir.join(".skill-version"), "5\n").unwrap();
+
+    ensure_nest_at(&root).unwrap();
+
+    assert_eq!(fs::read_to_string(&canonical_dir.join("SKILL.md")).unwrap(), BUZZ_CLI_SKILL_MD);
+    assert_eq!(fs::read_to_string(&claude_dir.join("SKILL.md")).unwrap(), BUZZ_CLI_SKILL_MD);
+    assert_eq!(fs::read_to_string(claude_dir.join(".skill-version")).unwrap().trim(), "6");
 }
 
 #[test]
