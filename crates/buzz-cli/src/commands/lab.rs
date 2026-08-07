@@ -19,14 +19,14 @@
 //!   (`head` tag = hex event id of the accepted revision) without the
 //!   caller having to track it across invocations.
 //!
-//! ## Verbs (this round: create/update/history/restore only)
+//! ## Verbs (create/update/history/restore/list/get/ref)
 //! - `lab create --title T [--summary S] --content -` — mints a fresh
 //!   `board_id` (UUID v4 — matches `channels create`/`workflows create`'s
 //!   convention; the workspace `uuid` crate here only has the `v4` feature
 //!   enabled, so v7 was never an option), publishes op=create/revision=1.
 //! - `lab update <board-id> [--base <event-id>] [--title T] [--summary S]
 //!   --content -` — CAS'd against the current head unless `--base`
-//!   overrides it (for deliberately testing a stale CAS). `--title`/
+//!   supplies the token captured by the caller. `--title`/
 //!   `--summary` omitted means "the relay carries the current value
 //!   forward"; there is no explicit-clear form (unlike `notes set`) because
 //!   the Lab Board wire protocol has no empty-tag-means-clear convention —
@@ -36,9 +36,12 @@
 //!   non-compliant client that never wrote a `revision` tag sort to the end
 //!   by `created_at` with a stderr warning, never a hard failure.
 //! - `lab restore <board-id> --revision N [--base <event-id>]` — fetches
-//!   revision N's content (scanning full history client-side — see the
-//!   "community-wide scan" note below) and resubmits it as a new
+//!   revision N's content from the board-scoped history and resubmits it as a new
 //!   op=restore/restored_from=N revision.
+//! - `lab list` — lists current community boards.
+//! - `lab get <board-id>` — prints the current head's metadata, CAS token, and
+//!   Markdown snapshot from one atomic read.
+//! - `lab ref <board-id> [--revision N]` — prints a stable board reference.
 //!
 //! ## `#d` is pushed into SQL for kind:40101
 //! `KIND_LAB_BOARD_REVISION` (40101) is an ordinary, non-replaceable kind — it
@@ -48,11 +51,9 @@
 //! `buzz_core::kind::has_indexed_d_tag`), so the relay narrows a `#d` query to
 //! one board in SQL, before `LIMIT`.
 //!
-//! That ordering is the whole point. When `#d` was applied only as an
-//! in-memory post-filter, a page could come back short simply because the
-//! community-wide window happened to contain no rows for this board, which is
-//! indistinguishable from "no more history" — so `history` silently omitted
-//! older revisions and `restore` could fail to find a revision that exists.
+//! That ordering is the whole point: the board filter is applied before the
+//! page limit, so `history` cannot silently omit older revisions merely
+//! because other boards are active in the community.
 //!
 //! ## Still out of scope
 //! `archive`/`unarchive`/`freeze`/`unfreeze` (moderation ops — no `--tag`/
@@ -67,14 +68,11 @@
 //!   than the restored revision's title/summary at the time it was
 //!   current. There is no flag to override this yet — add one
 //!   (`--restore-title-too`?) if a caller needs it.
-//! - `history`'s `--limit` caps the *displayed result*, not the wire query
-//!   (see the "`#d` is NOT pushed into SQL for kind:40101" section above —
-//!   the query itself is always a full, unbounded, community-wide scan so
-//!   that pagination termination stays correct). The fetched rows are
-//!   matched to this board, sorted oldest→newest, and then only the last
-//!   `--limit` of them are printed. So `--limit 10` means "the 10 most
-//!   recent revisions, shown chronologically" — not "the first 10 ever
-//!   made".
+//! - `history`'s `--limit` caps the *displayed result*. The relay pushes the
+//!   board's `#d` constraint into SQL for kind:40101, and the CLI paginates
+//!   that board-scoped history before sorting oldest→newest and printing the
+//!   last `--limit` rows. So `--limit 10` means "the 10 most recent revisions,
+//!   shown chronologically".
 //! - An empty history (`0` events for a `#d` query) is reported as
 //!   `CliError::NotFound`, matching `notes get`'s convention for "nothing
 //!   at this address" rather than printing `[]` the way `notes ls` does
@@ -149,11 +147,9 @@ fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
         .and_then(|t| t.as_slice().get(1).map(String::as_str))
 }
 
-/// Client-side `#d` match for kind:40101 queries. The wire filter
-/// deliberately never carries `#d` for this kind — see the module doc's
-/// "`#d` is NOT pushed into SQL for kind:40101" section — so every reader
-/// of the community-wide kind:40101 stream must re-check board membership
-/// itself before trusting an event belongs to `board_id`.
+/// Defensive `#d` match for kind:40101 queries. The wire filter is already
+/// board-scoped by the relay, but we still re-check the returned event before
+/// treating it as part of this board's history.
 fn event_matches_board(event: &Event, board_id: &str) -> bool {
     tag_value(event, "d") == Some(board_id)
 }
@@ -263,13 +259,9 @@ async fn fetch_head(client: &BuzzClient, board_id: Uuid) -> Result<Option<BoardH
 }
 
 /// Scan every accepted revision of a board for the one whose `revision` tag
-/// equals `target`. Full-history scan is unavoidable: there is no
-/// `revision`-tag pushdown (`revision` isn't a single-letter NIP-01 tag, so
-/// it can never be expressed as a filter constraint at all), and — per the
-/// module doc's "`#d` is NOT pushed into SQL for kind:40101" section — `#d`
-/// itself isn't pushed for this kind either, so the query is intentionally
-/// community-wide (not board-scoped) with the board match done client-side,
-/// to keep `BuzzClient::query_pages`'s pagination-exhaustion check honest.
+/// equals `target`. The relay pushes the board's `#d` filter into SQL for
+/// kind:40101; the client still scans that board-scoped history because
+/// `revision` is not a filterable single-letter tag.
 async fn fetch_revision_content(
     client: &BuzzClient,
     board_id: Uuid,
@@ -1014,6 +1006,7 @@ mod tests {
         let head = BoardHead::from_event(&event).expect("parse");
         assert_eq!(head.revision, 3);
         assert_eq!(head.title, "Title");
+        assert_eq!(head.content, "markdown");
         assert_eq!(head.head_event_id.to_hex(), head_hex);
         assert_eq!(head.status, "active");
     }

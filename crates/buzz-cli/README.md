@@ -78,6 +78,15 @@ buzz messages vote --event <event-id> --direction up
 buzz canvas get --channel <uuid>
 buzz canvas set --channel <uuid> --content "# Welcome"
 
+# Lab / Quadros (shared Markdown boards, CAS-safe)
+buzz lab list
+buzz lab get <board-uuid>                 # includes base and full snapshot
+buzz lab update <board-uuid> --base <base> --content - <<'BUZZ_LAB_MARKDOWN'
+# Complete Markdown snapshot
+BUZZ_LAB_MARKDOWN
+buzz lab history <board-uuid>
+buzz lab ref <board-uuid> --revision 3
+
 # Agent Memory (NIP-AE)
 buzz mem ls
 buzz mem get <slug>

@@ -210,7 +210,7 @@ enum Cmd {
     /// Publish and edit long-form NIP-23 notes — team knowledge base
     #[command(subcommand)]
     Notes(NotesCmd),
-    /// Create, update, and restore Lab Board revisions — a community-wide,
+    /// Create, read, update, and restore Lab Board revisions — a community-wide,
     /// multi-writer Markdown document with CAS concurrency and history
     #[command(subcommand)]
     Lab(LabCmd),
@@ -1118,10 +1118,9 @@ pub enum NotesCmd {
     },
 }
 
-/// `buzz lab` — Lab Board ("Quadro") revisions: create/update/history/restore
-/// only this round. See `commands::lab`'s module doc for the full protocol
-/// and the out-of-scope verbs (archive/unarchive/freeze/unfreeze, list, get,
-/// diff, ref).
+/// `buzz lab` — Lab Board ("Quadro") revisions and reads: create, get,
+/// history, list, ref, restore, and update. See `commands::lab`'s module doc
+/// for the full protocol and the remaining moderation verbs out of scope.
 #[derive(Subcommand)]
 pub enum LabCmd {
     /// Create a new Lab Board (kind:40101, op=create, revision=1).
@@ -1151,8 +1150,8 @@ pub enum LabCmd {
         /// Board id (UUID), as printed by `lab create`.
         board_id: String,
         /// Event id (hex) to CAS against. Defaults to the current head,
-        /// resolved automatically via a kind:30623 lookup. Pass explicitly
-        /// only to test a deliberately stale CAS.
+        /// resolved automatically via a kind:30623 lookup. Read-modify-write
+        /// callers should pass the token captured from the same `lab get`.
         #[arg(long)]
         base: Option<String>,
         /// New title. Omit to keep the current title.
@@ -1207,8 +1206,8 @@ pub enum LabCmd {
         #[arg(long)]
         revision: i32,
         /// Event id (hex) to CAS against. Defaults to the current head,
-        /// resolved automatically. Pass explicitly only to test a
-        /// deliberately stale CAS.
+        /// resolved automatically. Read-modify-write callers should pass the
+        /// token captured from the same `lab get`.
         #[arg(long)]
         base: Option<String>,
     },
@@ -2245,6 +2244,10 @@ mod tests {
         }
 
         let cmd = Cli::command();
+        assert_eq!(
+            names(&cmd, "lab"),
+            vec!["create", "get", "history", "list", "ref", "restore", "update"]
+        );
         assert_eq!(
             names(&cmd, "agents"),
             vec![

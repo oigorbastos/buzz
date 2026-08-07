@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer, ModelSwitchMethod,
-    StopReason, SystemPromptTransport,
+    resolve_model_switch_method, AcpClient, AcpError, ClaudeCodeSessionOptions, EnvVar, McpServer,
+    ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -178,6 +178,23 @@ pub struct OwnedAgent {
 /// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
 /// rename, so the new name is a reliable capability gate.
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+
+const CLAUDE_LAB_ALLOWED_TOOLS: &[&str] = &[
+    "Bash(buzz lab list:*)",
+    "Bash(buzz lab get:*)",
+    "Bash(buzz lab history:*)",
+    "Bash(buzz lab ref:*)",
+    "Bash(buzz lab update * --base *:*)",
+];
+
+fn claude_code_session_options(agent_name: &str) -> Option<ClaudeCodeSessionOptions> {
+    (agent_name == CLAUDE_AGENT_ACP_NAME).then(|| ClaudeCodeSessionOptions {
+        allowed_tools: CLAUDE_LAB_ALLOWED_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect(),
+    })
+}
 
 fn has_system_prompt_support(
     protocol_version: u32,
@@ -922,7 +939,7 @@ async fn create_session_and_apply_model(
 
     let resp = agent
         .acp
-        .session_new_full(
+        .session_new_full_with_claude_options(
             &ctx.cwd,
             mcp_servers,
             session_new_system_prompt(
@@ -932,6 +949,7 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
+            claude_code_session_options(&agent.agent_name),
         )
         .await?;
 
@@ -4135,6 +4153,46 @@ mod tests {
         // has_system_prompt_support must return true so user-message framing is suppressed.
         assert!(has_system_prompt_support(1, CLAUDE_AGENT_ACP_NAME, None));
         assert!(has_system_prompt_support(2, CLAUDE_AGENT_ACP_NAME, None));
+    }
+
+    #[test]
+    fn lab_allowlist_is_only_for_claude_and_is_narrow() {
+        let claude = claude_code_session_options(CLAUDE_AGENT_ACP_NAME)
+            .expect("Claude must receive the typed Lab policy");
+        assert_eq!(
+            claude.allowed_tools,
+            vec![
+                "Bash(buzz lab list:*)",
+                "Bash(buzz lab get:*)",
+                "Bash(buzz lab history:*)",
+                "Bash(buzz lab ref:*)",
+                "Bash(buzz lab update * --base *:*)",
+            ]
+        );
+        let serialized = serde_json::to_value(&claude).unwrap();
+        assert!(serialized["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| {
+                let value = tool.as_str().unwrap();
+                !value.contains("buzz canvas")
+                    && !value.contains(" create")
+                    && !value.contains(" restore")
+                    && value.contains("Bash(buzz lab")
+            }));
+        for adapter in [
+            "goose",
+            "codex",
+            "buzz-agent",
+            "unknown",
+            "@zed-industries/claude-code-acp",
+        ] {
+            assert!(
+                claude_code_session_options(adapter).is_none(),
+                "adapter {adapter} must not receive claudeCode.options"
+            );
+        }
     }
 
     #[test]

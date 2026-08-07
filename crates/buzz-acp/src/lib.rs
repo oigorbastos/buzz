@@ -3973,6 +3973,19 @@ mod agent_draft_prompt_tests {
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
     }
+
+    #[test]
+    fn shared_base_prompt_teaches_lab_cas_workflow() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("not Channel Canvas"));
+        assert!(prompt.contains("must use `buzz lab`, never `buzz canvas`"));
+        assert!(prompt.contains("`buzz lab list` to resolve the board UUID"));
+        assert!(prompt.contains("not an `--index`"));
+        assert!(prompt.contains("complete Markdown snapshot, never a diff"));
+        assert!(prompt.contains("Exit code 5 means the base is stale"));
+        assert!(prompt.contains("`buzz lab get --content-only` omits `base`"));
+        assert!(prompt.contains("<<'BUZZ_LAB_MARKDOWN'"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {

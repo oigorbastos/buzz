@@ -2,9 +2,9 @@
 name: buzz-cli
 description: >
   Buzz CLI for relay operations: owner-reviewed agent drafts, messaging,
-  channels, DMs, users, workflows, feed, reactions, canvas, social, repos,
+  channels, DMs, users, workflows, feed, reactions, canvas, Lab/Quadros, social, repos,
   uploads, and agent memory.
-version: 1
+version: 6
 ---
 
 # Buzz CLI Skill
@@ -18,6 +18,33 @@ version: 1
 `BUZZ_AUTH_TAG` is required for `buzz agents draft-create` and `buzz agents draft-update` because those commands send owner-reviewed Desktop drafts. If missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
 
 Run the bundled CLI with `--help` and `<command> <subcommand> --help` to discover all flags, arguments, and usage. This skill documents only what `--help` cannot tell you.
+
+## Lab / Quadros
+
+Lab/Quadros are shared Markdown boards, not Channel Canvas. When a request
+mentions “Lab” or “Quadro”, use `buzz lab`; never use `buzz canvas`.
+
+Use `buzz lab list` to resolve the board UUID. “Quadro 0” is a human label,
+not an `--index` flag. The safe edit flow is:
+
+1. Run one `buzz lab get <board-id>` and capture both its `base` and the complete Markdown from that same read.
+2. Apply the requested change to that full snapshot.
+3. Run `buzz lab update <board-id> --base <base> --content -` with the complete Markdown document, not a diff.
+4. Verify with `buzz lab get`; use `buzz lab ref` when a board or revision reference is useful.
+
+Do not use `--content-only` for read-modify-write because it omits `base`.
+Exit code 5 is a stale-base conflict: read again, reapply the intention to the
+new snapshot, and retry with its new `--base`. Never repeat the stale command
+blindly.
+
+For multiline Markdown, use stdin with a quoted heredoc delimiter. This keeps
+`$()`, backticks, and variables in the document literal:
+
+```bash
+buzz lab update <board-id> --base <base> --content - <<'BUZZ_LAB_MARKDOWN'
+<complete Markdown document>
+BUZZ_LAB_MARKDOWN
+```
 
 ## Conversational Agent Management
 

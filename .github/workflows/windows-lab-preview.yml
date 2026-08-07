@@ -21,7 +21,7 @@ jobs:
       contents: read
     env:
       TARGET: x86_64-pc-windows-msvc
-      LAB_BASE_SHA: 6b46617bde6d19636be07edd4c950d86469659dd
+      LAB_BASE_SHA: 65c404fe13221328f86b2fd2758aa01f9f2e27b2
       SOURCE_SHA: ${{ github.sha }}
       BUILD_WORKFLOW_SHA: ${{ github.sha }}
 
@@ -109,6 +109,18 @@ jobs:
       - name: Install desktop dependencies
         shell: bash
         run: pnpm install --frozen-lockfile
+
+      - name: Rust format check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Buzz ACP tests
+        shell: bash
+        run: cargo test -p buzz-acp
+
+      - name: Managed-agent Nest tests
+        shell: bash
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
 
       - name: Desktop check
         shell: bash
@@ -211,9 +223,10 @@ jobs:
 
           PORTABLE_ROOT="${RUNNER_TEMP}/buzz-lab-portable"
           NSIS_ROOT="${RUNNER_TEMP}/buzz-lab-nsis"
-          RELEASE_ROOT="${RUNNER_TEMP}/buzz-lab-release"
-          rm -rf "$PORTABLE_ROOT" "$NSIS_ROOT" "$RELEASE_ROOT"
-          mkdir -p "$PORTABLE_ROOT" "$NSIS_ROOT" "$RELEASE_ROOT"
+          PORTABLE_RELEASE_ROOT="${RUNNER_TEMP}/buzz-lab-portable-release"
+          NSIS_RELEASE_ROOT="${RUNNER_TEMP}/buzz-lab-nsis-release"
+          rm -rf "$PORTABLE_ROOT" "$NSIS_ROOT" "$PORTABLE_RELEASE_ROOT" "$NSIS_RELEASE_ROOT"
+          mkdir -p "$PORTABLE_ROOT" "$NSIS_ROOT" "$PORTABLE_RELEASE_ROOT" "$NSIS_RELEASE_ROOT"
 
           cp "$APP_EXE" "$PORTABLE_ROOT/buzz-desktop.exe"
           cp "target/${TARGET}/release/buzz-acp.exe" "$PORTABLE_ROOT/buzz-acp.exe"
@@ -246,6 +259,9 @@ jobs:
           DESKTOP_CHECK=pnpm -C desktop check
           DESKTOP_TYPECHECK=pnpm -C desktop typecheck
           DESKTOP_TEST=pnpm -C desktop test
+          CARGO_FMT=cargo fmt --all -- --check
+          ACP_TEST=cargo test -p buzz-acp
+          NEST_TEST=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
           CLI_LAB_TEST=cargo test -p buzz-cli lab --lib
           TAURI_BUNDLE=nsis
           TAURI_SIGNING=disabled
@@ -273,14 +289,20 @@ jobs:
             sha256sum "$NSIS_NAME"
           ) > "$NSIS_ROOT/SHA256SUMS.txt"
 
-          PORTABLE_ZIP="${RELEASE_ROOT}/buzz-lab-windows-portable-${VERSION}-${TARGET}.zip"
+          PORTABLE_ZIP="${PORTABLE_RELEASE_ROOT}/buzz-lab-windows-portable-${VERSION}-${TARGET}.zip"
           (cd "$PORTABLE_ROOT" && 7z a -tzip -mx=9 "$PORTABLE_ZIP" ./* >/dev/null)
-          cp "$NSIS_ROOT/$NSIS_NAME" "$RELEASE_ROOT/"
-          cp "$PORTABLE_ROOT/BUILD-MANIFEST.txt" "$RELEASE_ROOT/BUILD-MANIFEST.txt"
+          cp "$PORTABLE_ROOT/BUILD-MANIFEST.txt" "$PORTABLE_RELEASE_ROOT/BUILD-MANIFEST.txt"
           (
-            cd "$RELEASE_ROOT"
-            sha256sum "$(basename "$PORTABLE_ZIP")" "$NSIS_NAME"
-          ) > "$RELEASE_ROOT/SHA256SUMS.txt"
+            cd "$PORTABLE_RELEASE_ROOT"
+            sha256sum "$(basename "$PORTABLE_ZIP")" BUILD-MANIFEST.txt
+          ) > "$PORTABLE_RELEASE_ROOT/SHA256SUMS.txt"
+
+          cp "$NSIS_ROOT/$NSIS_NAME" "$NSIS_RELEASE_ROOT/"
+          cp "$NSIS_ROOT/BUILD-MANIFEST.txt" "$NSIS_RELEASE_ROOT/BUILD-MANIFEST.txt"
+          (
+            cd "$NSIS_RELEASE_ROOT"
+            sha256sum "$NSIS_NAME" BUILD-MANIFEST.txt
+          ) > "$NSIS_RELEASE_ROOT/SHA256SUMS.txt"
 
           echo "portable_zip=$PORTABLE_ZIP" >> "$GITHUB_OUTPUT"
           echo "portable_manifest=$PORTABLE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
@@ -289,8 +311,10 @@ jobs:
           echo "nsis_exe=$NSIS_ROOT/$NSIS_NAME" >> "$GITHUB_OUTPUT"
           echo "nsis_manifest=$NSIS_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
           echo "nsis_sums=$NSIS_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
-          echo "release_manifest=$RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
-          echo "release_sums=$RELEASE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+          echo "portable_release_manifest=$PORTABLE_RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
+          echo "portable_release_sums=$PORTABLE_RELEASE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+          echo "nsis_release_manifest=$NSIS_RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
+          echo "nsis_release_sums=$NSIS_RELEASE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test portable CLI
         shell: bash
@@ -300,22 +324,28 @@ jobs:
           set -euo pipefail
           cd "$PORTABLE_ROOT"
           ./buzz.exe lab --help
+          ./buzz.exe lab get --help
+          ./buzz.exe lab update --help
 
       - name: Print artifact names, sizes, and SHA-256
         shell: bash
         env:
           PORTABLE_ZIP: ${{ steps.artifacts.outputs.portable_zip }}
           NSIS_EXE: ${{ steps.artifacts.outputs.nsis_exe }}
-          RELEASE_MANIFEST: ${{ steps.artifacts.outputs.release_manifest }}
-          RELEASE_SUMS: ${{ steps.artifacts.outputs.release_sums }}
+          PORTABLE_RELEASE_MANIFEST: ${{ steps.artifacts.outputs.portable_release_manifest }}
+          PORTABLE_RELEASE_SUMS: ${{ steps.artifacts.outputs.portable_release_sums }}
+          NSIS_RELEASE_MANIFEST: ${{ steps.artifacts.outputs.nsis_release_manifest }}
+          NSIS_RELEASE_SUMS: ${{ steps.artifacts.outputs.nsis_release_sums }}
         run: |
           set -euo pipefail
-          for file in "$PORTABLE_ZIP" "$NSIS_EXE" "$RELEASE_MANIFEST" "$RELEASE_SUMS"; do
+          for file in "$PORTABLE_ZIP" "$NSIS_EXE" "$PORTABLE_RELEASE_MANIFEST" "$PORTABLE_RELEASE_SUMS" "$NSIS_RELEASE_MANIFEST" "$NSIS_RELEASE_SUMS"; do
             stat -c '%n %s bytes' "$file"
             sha256sum "$file"
           done
-          cat "$RELEASE_MANIFEST"
-          cat "$RELEASE_SUMS"
+          cat "$PORTABLE_RELEASE_MANIFEST"
+          cat "$PORTABLE_RELEASE_SUMS"
+          cat "$NSIS_RELEASE_MANIFEST"
+          cat "$NSIS_RELEASE_SUMS"
 
       - name: Upload portable ZIP (7 days)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -323,8 +353,8 @@ jobs:
           name: buzz-lab-windows-portable-${{ github.sha }}
           path: |
             ${{ steps.artifacts.outputs.portable_zip }}
-            ${{ steps.artifacts.outputs.release_manifest }}
-            ${{ steps.artifacts.outputs.release_sums }}
+            ${{ steps.artifacts.outputs.portable_release_manifest }}
+            ${{ steps.artifacts.outputs.portable_release_sums }}
           if-no-files-found: error
           retention-days: 7
 
@@ -334,8 +364,8 @@ jobs:
           name: buzz-lab-windows-nsis-second-stage-${{ github.sha }}
           path: |
             ${{ steps.artifacts.outputs.nsis_exe }}
-            ${{ steps.artifacts.outputs.nsis_manifest }}
-            ${{ steps.artifacts.outputs.nsis_sums }}
+            ${{ steps.artifacts.outputs.nsis_release_manifest }}
+            ${{ steps.artifacts.outputs.nsis_release_sums }}
           if-no-files-found: error
           retention-days: 7
 
