@@ -44,6 +44,13 @@ pub enum ModerationAction {
     ResolveReport,
     /// Read the moderation queue and audit log.
     ViewQueue,
+    /// Archive/unarchive/freeze/unfreeze a Lab Board (community owner/admin
+    /// only — `boards:moderate`). No channel-local equivalent exists (Lab
+    /// Boards are community-scoped, not channel-scoped), so this action is
+    /// only ever reachable via the `Some("owner") | Some("admin")` arms of
+    /// [`decide_authority`] — a plain member or channel owner/admin is always
+    /// denied, matching `ResolveReport`/`ViewQueue`.
+    ModerateBoard,
 }
 
 /// What the action is aimed at (already tenant-resolved by the caller).
@@ -186,7 +193,7 @@ mod tests {
 
     /// Every community-wide action a community owner can take. Channel-local
     /// actions (DeleteMessage/Kick) are included — the owner holds them too.
-    const ALL_ACTIONS: [ModerationAction; 8] = [
+    const ALL_ACTIONS: [ModerationAction; 9] = [
         ModerationAction::DeleteMessage,
         ModerationAction::Kick,
         ModerationAction::Ban,
@@ -195,6 +202,7 @@ mod tests {
         ModerationAction::Untimeout,
         ModerationAction::ResolveReport,
         ModerationAction::ViewQueue,
+        ModerationAction::ModerateBoard,
     ];
 
     fn ok(r: anyhow::Result<ModerationAuthority>) -> ModerationAuthority {
@@ -283,6 +291,7 @@ mod tests {
             ModerationAction::Kick,
             ModerationAction::ResolveReport,
             ModerationAction::ViewQueue,
+            ModerationAction::ModerateBoard,
         ] {
             assert_eq!(
                 ok(decide_authority(Some("admin"), Some("admin"), None, action)),
@@ -310,6 +319,7 @@ mod tests {
                 ModerationAction::Untimeout,
                 ModerationAction::ResolveReport,
                 ModerationAction::ViewQueue,
+                ModerationAction::ModerateBoard,
             ] {
                 assert!(
                     decide_authority(None, None, Some(role), action).is_err(),

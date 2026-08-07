@@ -27,6 +27,8 @@ pub mod event;
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
 pub mod git_repo;
+/// Lab Board (community-wide multi-writer Markdown "Quadro") CAS persistence.
+pub mod lab;
 /// Embedded database migrations.
 pub mod migration;
 /// Community moderation: reports, bans/timeouts, audit actions.
@@ -2205,6 +2207,37 @@ impl Db {
         canvas: Option<&str>,
     ) -> Result<()> {
         channel::set_canvas(&self.pool, community_id, channel_id, canvas).await
+    }
+
+    /// Lists a community's Lab Board heads, most recently updated first.
+    /// `status_filter` narrows to one status; `None` returns all.
+    pub async fn list_lab_board_heads(
+        &self,
+        community_id: CommunityId,
+        status_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<lab::BoardHead>> {
+        lab::list_board_heads(&self.pool, community_id, status_filter, limit).await
+    }
+
+    /// Returns one Lab Board's current head row, if it exists.
+    pub async fn get_lab_board_head(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+    ) -> Result<Option<lab::BoardHead>> {
+        lab::get_board_head(&self.pool, community_id, board_id).await
+    }
+
+    /// Lists a Lab Board's revision history, newest first.
+    pub async fn list_lab_board_revisions(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+        before_revision: Option<i32>,
+        limit: i64,
+    ) -> Result<Vec<lab::BoardRevision>> {
+        lab::list_board_revisions(&self.pool, community_id, board_id, before_revision, limit).await
     }
 
     /// Adds a member to a channel.

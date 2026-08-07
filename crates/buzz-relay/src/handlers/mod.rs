@@ -16,6 +16,9 @@ pub mod identity_archive;
 pub mod imeta;
 /// Transport-neutral event ingestion pipeline.
 pub mod ingest;
+/// Lab Board (kind:40101/30623) CAS handler — PROVISIONAL kinds, see
+/// `buzz_core::kind` doc comments.
+pub mod lab;
 /// Community moderation authorization seam (capability helper).
 pub mod moderation_authz;
 /// Community moderation command handler (kinds 9040–9044).

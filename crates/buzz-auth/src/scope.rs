@@ -54,6 +54,21 @@ pub enum Scope {
     /// enforced by git HTTP push routes (which use NIP-98 + owner check).
     /// Full enforcement deferred to v2 collaborator model.
     ReposWrite,
+    /// List and read Lab Boards (kind:40101/30623) and their revision history.
+    BoardsRead,
+    /// Create, update, and restore Lab Boards (kind:40101 `op` ∈
+    /// `create`/`update`/`restore`). Held by every member — the real
+    /// per-board gate is CAS + active community membership, not this scope
+    /// (see `required_scope_for_kind` and `handlers::lab`).
+    BoardsWrite,
+    /// Archive/unarchive/freeze/unfreeze a Lab Board (kind:40101 `op` ∈
+    /// `archive`/`unarchive`/`freeze`/`unfreeze`). Scope alone does not
+    /// restrict this to owner/admin (see `Scope` module doc — pure-Nostr mode
+    /// grants `all_known()` to every authenticated connection); the actual
+    /// owner/admin-only enforcement is
+    /// `moderation_authz::authorize_moderation_action` with
+    /// `ModerationAction::ModerateBoard`, called by the Lab Board handler.
+    BoardsModerate,
     /// A scope string not recognised by this version of the relay.
     ///
     /// Preserved as-is to allow forward-compatibility with future scope additions.
@@ -83,6 +98,9 @@ impl Scope {
             Self::FilesWrite,
             Self::ReposRead,
             Self::ReposWrite,
+            Self::BoardsRead,
+            Self::BoardsWrite,
+            Self::BoardsModerate,
         ]
     }
 
@@ -107,6 +125,8 @@ impl Scope {
             Self::FilesWrite,
             Self::ReposRead,
             Self::ReposWrite,
+            Self::BoardsRead,
+            Self::BoardsWrite,
         ]
     }
 
@@ -129,6 +149,9 @@ impl Scope {
             Self::FilesWrite => "files:write",
             Self::ReposRead => "repos:read",
             Self::ReposWrite => "repos:write",
+            Self::BoardsRead => "boards:read",
+            Self::BoardsWrite => "boards:write",
+            Self::BoardsModerate => "boards:moderate",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -161,6 +184,9 @@ impl FromStr for Scope {
             "files:write" => Self::FilesWrite,
             "repos:read" => Self::ReposRead,
             "repos:write" => Self::ReposWrite,
+            "boards:read" => Self::BoardsRead,
+            "boards:write" => Self::BoardsWrite,
+            "boards:moderate" => Self::BoardsModerate,
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -205,12 +231,12 @@ mod tests {
     #[test]
     fn all_non_admin_excludes_admin_scopes() {
         let scopes = Scope::all_non_admin();
-        assert_eq!(scopes.len(), 14, "expected 14 non-admin scope variants");
+        assert_eq!(scopes.len(), 16, "expected 16 non-admin scope variants");
         // Verify no duplicates
         let unique: std::collections::HashSet<_> = scopes.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             unique.len(),
-            14,
+            16,
             "all_non_admin() must not contain duplicates"
         );
         // Verify no Unknown variants
@@ -229,15 +255,19 @@ mod tests {
             !scopes.contains(&Scope::AdminUsers),
             "all_non_admin() must not contain AdminUsers"
         );
+        assert!(
+            !scopes.contains(&Scope::BoardsModerate),
+            "all_non_admin() must not contain BoardsModerate"
+        );
     }
 
     #[test]
     fn all_known_returns_all_known_variants() {
         let all = Scope::all_known();
-        assert_eq!(all.len(), 16, "expected 16 known scope variants");
+        assert_eq!(all.len(), 19, "expected 19 known scope variants");
         // Verify no duplicates
         let unique: std::collections::HashSet<_> = all.iter().map(|s| s.as_str()).collect();
-        assert_eq!(unique.len(), 16, "all_known() must not contain duplicates");
+        assert_eq!(unique.len(), 19, "all_known() must not contain duplicates");
         // Verify no Unknown variants
         for scope in &all {
             assert!(

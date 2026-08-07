@@ -448,6 +448,20 @@ pub const KIND_WORKFLOW_DEF: u32 = 30620;
 /// `hidden_at` per viewer; this is the only Nostr-visible projection of it.
 pub const KIND_DM_VISIBILITY: u32 = 30622;
 
+/// Lab Board head projection (parameterized replaceable, d=board_uuid).
+///
+/// **PROVISIONAL kind number, pending upstream RFC.** 30623 is the next free
+/// integer after `KIND_DM_VISIBILITY` (30622) in the NIP-33 parameterized
+/// replaceable range as of this writing (2026-08) — confirmed free via
+/// full-repo grep before use. Do not treat as final until reserved upstream.
+///
+/// Relay-signed sidecar: the relay computes and (re-)signs this event every
+/// time a `KIND_LAB_BOARD_REVISION` mutation is accepted under CAS. Content
+/// is the current Markdown snapshot; tags carry `d`=board_uuid, `community`,
+/// `revision`, `title`, `summary`, and `head`=the accepted revision event id.
+/// Never client-submitted — see `is_relay_only_kind`.
+pub const KIND_LAB_BOARD_HEAD: u32 = 30623;
+
 /// Lower bound of the NIP-33 parameterized replaceable range (30000–39999).
 pub const PARAM_REPLACEABLE_KIND_MIN: u32 = 30000;
 /// Upper bound of the NIP-33 parameterized replaceable range (30000–39999).
@@ -493,6 +507,19 @@ pub const KIND_STREAM_REMINDER: u32 = 40007;
 pub const KIND_STREAM_MESSAGE_DIFF: u32 = 40008;
 /// Canvas (shared document) for a channel.
 pub const KIND_CANVAS: u32 = 40100;
+/// Lab Board revision — a signed, CAS-guarded edit to a community-wide,
+/// multi-writer Markdown document ("Quadro"). Unlike `KIND_CANVAS` (one
+/// document per channel, blind-replace, no history), a Lab Board is
+/// community-scoped, addressed by an immutable `d`=board_uuid, and every
+/// mutation is compare-and-swap against the previous accepted revision (tag
+/// `prev`=event id) inside a single relay transaction. Append-only, ordinary
+/// (non-replaceable) event kind — the current/"head" projection lives
+/// separately as `KIND_LAB_BOARD_HEAD`.
+///
+/// **PROVISIONAL kind number, pending upstream RFC.** 40101 is the next free
+/// integer after `KIND_CANVAS` (40100) — confirmed free via full-repo grep
+/// before use. Do not treat as final until reserved upstream.
+pub const KIND_LAB_BOARD_REVISION: u32 = 40101;
 /// System message for channel state changes (join, leave, rename, etc.).
 pub const KIND_SYSTEM_MESSAGE: u32 = 40099;
 
@@ -708,10 +735,12 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_STREAM_REMINDER,
     KIND_STREAM_MESSAGE_DIFF,
     KIND_CANVAS,
+    KIND_LAB_BOARD_REVISION,
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
     KIND_PRESENCE_SNAPSHOT,
     KIND_DM_VISIBILITY,
+    KIND_LAB_BOARD_HEAD,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
     KIND_DM_HIDE,
@@ -836,6 +865,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            | KIND_LAB_BOARD_HEAD
     )
 }
 
@@ -864,6 +894,10 @@ const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 3062
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_LAB_BOARD_HEAD)); // 30623 ∈ 30000–39999 (provisional)
+const _: () = assert!(is_relay_only_kind(KIND_LAB_BOARD_HEAD));
+const _: () = assert!(!is_parameterized_replaceable(KIND_LAB_BOARD_REVISION)); // 40101 ordinary, not addressable (provisional)
+const _: () = assert!(KIND_LAB_BOARD_REVISION <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
