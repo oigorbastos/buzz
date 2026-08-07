@@ -210,6 +210,10 @@ enum Cmd {
     /// Publish and edit long-form NIP-23 notes — team knowledge base
     #[command(subcommand)]
     Notes(NotesCmd),
+    /// Create, update, and restore Lab Board revisions — a community-wide,
+    /// multi-writer Markdown document with CAS concurrency and history
+    #[command(subcommand)]
+    Lab(LabCmd),
     /// Announce and discover git repositories (NIP-34)
     #[command(subcommand)]
     Repos(ReposCmd),
@@ -1114,6 +1118,80 @@ pub enum NotesCmd {
     },
 }
 
+/// `buzz lab` — Lab Board ("Quadro") revisions: create/update/history/restore
+/// only this round. See `commands::lab`'s module doc for the full protocol
+/// and the out-of-scope verbs (archive/unarchive/freeze/unfreeze, list, get,
+/// diff, ref).
+#[derive(Subcommand)]
+pub enum LabCmd {
+    /// Create a new Lab Board (kind:40101, op=create, revision=1).
+    ///
+    /// Mints a fresh board id (UUID v4) and prints it — that id is the
+    /// stable reference for every later `update`/`history`/`restore`.
+    #[command(
+        after_help = "Examples:\n  buzz lab create --title 'Sprint Plan' --content - < plan.md\n  echo '# Notes' | buzz lab create --title Notes --summary 'quick notes' --content -"
+    )]
+    Create {
+        /// Board title, max 160 characters.
+        #[arg(long)]
+        title: String,
+        /// Short summary, max 500 characters.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Markdown body (full document, not a diff). Use '-' to read from stdin.
+        #[arg(long)]
+        content: String,
+    },
+    /// Update a Lab Board (kind:40101, op=update). CAS'd against the
+    /// current head unless `--base` overrides it.
+    #[command(
+        after_help = "Examples:\n  buzz lab update <board-id> --content - < revised.md\n  buzz lab update <board-id> --title 'New Title' --content - < revised.md"
+    )]
+    Update {
+        /// Board id (UUID), as printed by `lab create`.
+        board_id: String,
+        /// Event id (hex) to CAS against. Defaults to the current head,
+        /// resolved automatically via a kind:30623 lookup. Pass explicitly
+        /// only to test a deliberately stale CAS.
+        #[arg(long)]
+        base: Option<String>,
+        /// New title. Omit to keep the current title.
+        #[arg(long)]
+        title: Option<String>,
+        /// New summary. Omit to keep the current summary.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Markdown body (full document, not a diff). Use '-' to read from stdin.
+        #[arg(long)]
+        content: String,
+    },
+    /// List every accepted revision of a Lab Board, oldest to newest.
+    History {
+        /// Board id (UUID).
+        board_id: String,
+        /// Max revisions to return (default 100, hard cap 1000). Caps the
+        /// underlying newest-first query; the result is then re-sorted
+        /// oldest-to-newest within that window.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Restore a Lab Board to a prior revision's content (kind:40101,
+    /// op=restore). Resubmits that revision's Markdown as a brand new
+    /// revision — the relay does not copy content on restore.
+    Restore {
+        /// Board id (UUID).
+        board_id: String,
+        /// Revision number to restore.
+        #[arg(long)]
+        revision: i32,
+        /// Event id (hex) to CAS against. Defaults to the current head,
+        /// resolved automatically. Pass explicitly only to test a
+        /// deliberately stale CAS.
+        #[arg(long)]
+        base: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum ReposCmd {
     /// Announce a git repository (NIP-34)
@@ -1984,6 +2062,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
+        Cmd::Lab(sub) => commands::lab::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
         Cmd::Projects(sub) => commands::projects::dispatch(sub, &client).await,
         Cmd::Patches(sub) => commands::patches::dispatch(sub, &client).await,
@@ -2087,6 +2166,7 @@ mod tests {
             "emoji",
             "feed",
             "issues",
+            "lab",
             "media",
             "mem",
             "messages",

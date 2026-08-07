@@ -680,6 +680,23 @@ impl BuzzClient {
         unreachable!("loop exhausts all RETRY_MAX_ATTEMPTS")
     }
 
+    /// Page through `/query` until either `limit` events have been
+    /// collected or a page comes back shorter than requested.
+    ///
+    /// **Trap for callers**: that shorter-than-requested check assumes
+    /// `page.len()` reflects the relay's raw SQL page size. It does NOT
+    /// hold for filters the relay bridge only partially pushes into SQL and
+    /// then post-filters in memory (e.g. `#d` on a kind outside the
+    /// NIP-33 parameterized-replaceable range 30000–39999 — see
+    /// `filter_to_query_params` / `filter_fully_pushable` in
+    /// `buzz-relay/src/handlers/req.rs`, and `buzz-cli/src/commands/lab.rs`'s
+    /// module doc for a concrete case this bit). For such filters a page can
+    /// come back short (even empty) purely because the *pre-filter*
+    /// candidate window was consumed by non-matching rows, not because the
+    /// underlying data is exhausted — and this loop would stop early,
+    /// silently. Filters must be restricted to fields the bridge fully
+    /// pushes into SQL (or matching must happen post-fetch, client-side, the
+    /// way `lab.rs` does) for this pagination to be trustworthy.
     async fn query_pages(
         &self,
         mut filter: serde_json::Value,
