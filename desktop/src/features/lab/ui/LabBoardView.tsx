@@ -1,8 +1,17 @@
-import { ArrowLeft, History, Pencil, Save, Users, X } from "lucide-react";
+import {
+  ArrowLeft,
+  History,
+  Link2,
+  Pencil,
+  Save,
+  Users,
+  X,
+} from "lucide-react";
 import * as React from "react";
 
 import {
   BOARD_CONFLICT_MESSAGE,
+  boardReference,
   isBoardConflictError,
   type LabBoardHead,
   type LabBoardRevision,
@@ -186,6 +195,20 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
             {board.summary ? ` · ${board.summary}` : ""}
           </p>
         </div>
+        <Button
+          data-testid="lab-board-copy-reference"
+          onClick={() => {
+            void navigator.clipboard
+              .writeText(boardReference(board.boardId))
+              .catch(() => setErrorMessage("Could not copy the reference."));
+          }}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          <Link2 className="h-4 w-4" />
+          Copy link
+        </Button>
         <Button
           data-testid="lab-board-history-toggle"
           onClick={() => setShowHistory((value) => !value)}

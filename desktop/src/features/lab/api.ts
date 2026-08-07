@@ -141,6 +141,19 @@ export function sortRevisions(
   });
 }
 
+/**
+ * The canonical reference to a board, or to one exact revision.
+ *
+ * Kept identical to the CLI's `board_reference` so a link copied in the app
+ * and one printed by `buzz lab ref` are the same string — a reference that
+ * differs by client is not a reference.
+ */
+export function boardReference(boardId: string, revision?: number): string {
+  return revision === undefined
+    ? `buzz://lab?board=${boardId}`
+    : `buzz://lab?board=${boardId}&revision=${revision}`;
+}
+
 /** True when this event belongs to `boardId` (client-side `#d` match). */
 export function eventMatchesBoard(event: RelayEvent, boardId: string): boolean {
   return tagValue(event, "d") === boardId;
@@ -189,23 +202,26 @@ export async function fetchBoardHead(
 }
 
 /**
- * Read one board's full revision history, oldest first.
+ * Read one board's revision history, oldest first.
  *
- * ⚠️ The wire filter deliberately omits `#d` even though we want one board.
- * kind:40101 is intentionally NOT in the NIP-33 range (that is what lets it
- * keep history), and the relay only pushes `#d` down into SQL for NIP-33
- * kinds. For 40101 it applies `#d` in memory *after* the SQL `LIMIT` has
- * already selected the newest events community-wide — so a `#d` filter can
- * silently return a partial history once more than one board is active. We
- * fetch the community-wide stream and match here instead. Cost: this reads
- * every board's revisions to show one board's. Acceptable while boards are
- * few; a per-board read endpoint on the relay is the real fix.
+ * The `#d` filter is honoured server-side: kind:40101 is not NIP-33 (that is
+ * what lets a board keep history rather than be replaced), but its `d` tag is
+ * still materialized into the indexed `events.d_tag` column, so the relay
+ * narrows to this board in SQL before applying `LIMIT`. That distinction
+ * matters — filtering after the limit would quietly drop older revisions of
+ * this board as soon as other boards were busier, which is a wrong history
+ * rather than a slow one.
+ *
+ * `boardMatchesClientSide` is still applied as a cheap assertion: if a relay
+ * ever ignores the filter, the caller gets fewer rows rather than another
+ * board's content.
  */
 export async function fetchBoardHistory(
   boardId: string,
 ): Promise<LabBoardRevision[]> {
   const events = await relayClient.fetchEvents({
     kinds: [KIND_LAB_BOARD_REVISION],
+    "#d": [boardId],
     limit: HISTORY_FETCH_LIMIT,
   });
   const revisions = events

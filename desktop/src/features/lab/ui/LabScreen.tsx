@@ -1,3 +1,4 @@
+import { useNavigate } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
 import * as React from "react";
 
@@ -7,7 +8,6 @@ import {
 } from "@/features/lab/hooks";
 import { CreateLabBoardDialog } from "@/features/lab/ui/CreateLabBoardDialog";
 import { LabBoardList } from "@/features/lab/ui/LabBoardList";
-import { LabBoardView } from "@/features/lab/ui/LabBoardView";
 import {
   isRelayUnreachableError,
   RELAY_UNREACHABLE_SHORT,
@@ -25,14 +25,16 @@ import { Button } from "@/shared/ui/button";
 export function LabScreen() {
   const boardsQuery = useLabBoardsQuery();
   const createMutation = useCreateLabBoardMutation();
-  const [openBoardId, setOpenBoardId] = React.useState<string | null>(null);
   const [isCreateOpen, setIsCreateOpen] = React.useState(false);
+  const navigate = useNavigate();
 
-  if (openBoardId) {
-    return (
-      <LabBoardView boardId={openBoardId} onBack={() => setOpenBoardId(null)} />
-    );
-  }
+  // Opening a board is a navigation, not local state: the id belongs in the
+  // URL so the board can be linked to and survives a reload.
+  const openBoard = React.useCallback(
+    (boardId: string) =>
+      void navigate({ to: "/lab/boards/$boardId", params: { boardId } }),
+    [navigate],
+  );
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
@@ -65,14 +67,14 @@ export function LabScreen() {
           </p>
         </div>
       ) : (
-        <LabBoardList boards={boardsQuery.data ?? []} onOpen={setOpenBoardId} />
+        <LabBoardList boards={boardsQuery.data ?? []} onOpen={openBoard} />
       )}
 
       <CreateLabBoardDialog
         isCreating={createMutation.isPending}
         onCreate={async (input) => {
           const result = await createMutation.mutateAsync(input);
-          setOpenBoardId(result.boardId);
+          openBoard(result.boardId);
           return result;
         }}
         onOpenChange={setIsCreateOpen}

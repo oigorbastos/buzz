@@ -10,8 +10,8 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED, SHARED_GATED_KINDS,
+    event_kind_i32, is_ephemeral, KIND_AUTH, KIND_EVENT_REMINDER, KIND_HUDDLE_STARTED,
+    SHARED_GATED_KINDS,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -160,12 +160,17 @@ const HUDDLE_LINK_CANDIDATE_LIMIT: i64 = 32;
 
 /// Extract the `d_tag` value for storage.
 ///
-/// For NIP-33 parameterized replaceable events (kind 30000–39999): returns the first
-/// `d` tag's value, or `""` if no `d` tag is present (per NIP-33 spec).
+/// For kinds whose `d` tag is indexed (NIP-33 parameterized replaceable, plus
+/// Lab Board revisions — see `buzz_core::kind::has_indexed_d_tag`): returns the
+/// first `d` tag's value, or `""` if no `d` tag is present (per NIP-33 spec).
 /// For all other events: returns `None` (column stays NULL).
+///
+/// The predicate is shared with the query builder on purpose: populating here
+/// without pushing there is merely slow, but pushing there without populating
+/// here silently drops matching rows.
 pub fn extract_d_tag(event: &Event) -> Option<String> {
     let kind_u32 = event.kind.as_u16() as u32;
-    if !is_parameterized_replaceable(kind_u32) {
+    if !buzz_core::kind::has_indexed_d_tag(kind_u32) {
         return None;
     }
     let val = event

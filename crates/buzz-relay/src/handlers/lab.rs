@@ -456,6 +456,41 @@ async fn check_lab_board_membership(
     }
 }
 
+/// Writes per author per minute before the relay starts refusing.
+///
+/// Sized for humans and for an agent doing real work (a board edit is a
+/// deliberate act, not telemetry), while still bounding a runaway loop to
+/// something an operator can notice and stop.
+const MAX_BOARD_WRITES_PER_MINUTE: u32 = 30;
+
+/// Check + bump the per-author Lab write budget.
+///
+/// Scoped by community so a key active in one tenant cannot spend another
+/// tenant's budget, mirroring `observer_frame_rate_limited`. Enforced BEFORE
+/// the CAS transaction opens: the advisory lock this write would take is the
+/// one resource every other writer on that board waits behind, so a loop must
+/// be stopped before it acquires it, not after.
+fn lab_write_rate_limited(
+    state: &AppState,
+    community: CommunityId,
+    author_pubkey: [u8; 32],
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut entry = state
+        .lab_board_rate_limiter
+        .entry((community, author_pubkey))
+        .or_insert((0, now));
+    let (count, window_start) = entry.value_mut();
+    if now.duration_since(*window_start).as_secs() >= 60 {
+        *count = 1;
+        *window_start = now;
+        false
+    } else {
+        *count += 1;
+        *count > MAX_BOARD_WRITES_PER_MINUTE
+    }
+}
+
 /// Entry point called from `ingest_event_inner` when `kind_u32 ==
 /// KIND_LAB_BOARD_REVISION`. See the module doc for the full 9-step
 /// algorithm this implements.
@@ -505,6 +540,13 @@ pub async fn handle_lab_board_revision_event(
     // denied "not a relay member" rather than the more specific-sounding
     // "moderator access required".
     check_lab_board_membership(state, community, &author_pubkey).await?;
+
+    // Budget check before the transaction, for the reason in the doc above.
+    if lab_write_rate_limited(state, community, author_pubkey) {
+        return Err(IngestError::Rejected(format!(
+            "rate-limited: too many lab board writes; retry in 60s (limit {MAX_BOARD_WRITES_PER_MINUTE}/min)"
+        )));
+    }
 
     // Moderation ops (archive/unarchive/freeze/unfreeze) require community
     // owner/admin. `Scope::BoardsModerate` alone cannot enforce this — pure

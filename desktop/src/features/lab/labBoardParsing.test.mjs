@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  boardReference,
   eventMatchesBoard,
   isBoardConflictError,
   MAX_MARKDOWN_BYTES,
@@ -261,5 +262,24 @@ describe("isBoardConflictError", () => {
     assert.equal(isBoardConflictError(new Error("relay unreachable")), false);
     assert.equal(isBoardConflictError("BOARD_HEAD_MISMATCH"), false);
     assert.equal(isBoardConflictError(null), false);
+  });
+});
+
+describe("boardReference", () => {
+  it("addresses the live board when no revision is given", () => {
+    assert.equal(boardReference(BOARD), `buzz://lab?board=${BOARD}`);
+  });
+
+  it("pins to an exact revision when one is given", () => {
+    // The pinned form is what makes a quoted link safe: it keeps meaning the
+    // same text after someone else edits the board.
+    assert.equal(
+      boardReference(BOARD, 7),
+      `buzz://lab?board=${BOARD}&revision=7`,
+    );
+  });
+
+  it("treats revision 0 as a real revision, not as absent", () => {
+    assert.match(boardReference(BOARD, 0), /revision=0$/);
   });
 });

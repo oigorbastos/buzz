@@ -40,53 +40,26 @@
 //!   "community-wide scan" note below) and resubmits it as a new
 //!   op=restore/restored_from=N revision.
 //!
-//! ## `#d` is NOT pushed into SQL for kind:40101 — community-wide client-side scan
-//! `KIND_LAB_BOARD_REVISION` (40101) is an ordinary, non-replaceable kind —
-//! it is *not* in the NIP-33 parameterized-replaceable range (30000–39999).
-//! `filter_to_query_params` in `buzz-relay/src/handlers/req.rs` only pushes
-//! a `#d` filter down into the SQL `WHERE` clause when a filter's `kinds`
-//! are *exclusively* NIP-33 kinds, because the `d_tag` column is only
-//! populated (`extract_d_tag`, `buzz-db/src/event.rs`) for those kinds. For
-//! a `{"kinds":[40101],"#d":[board_id]}` filter the SQL layer ignores `#d`
-//! entirely and runs `... WHERE community_id = $1 AND kind = 40101 ...
-//! ORDER BY created_at DESC LIMIT <page_limit>` across *every* Lab Board in
-//! the community; `#d` is then applied only as an in-memory post-filter
-//! (`buzz_core::filter::filters_match`, `buzz-relay/src/api/bridge.rs`)
-//! *after* that SQL `LIMIT` has already truncated the candidate window.
+//! ## `#d` is pushed into SQL for kind:40101
+//! `KIND_LAB_BOARD_REVISION` (40101) is an ordinary, non-replaceable kind — it
+//! is deliberately *not* NIP-33, which is what lets a board keep its full
+//! history instead of being replaced. Its `d` tag is nonetheless materialized
+//! into the indexed `events.d_tag` column (see
+//! `buzz_core::kind::has_indexed_d_tag`), so the relay narrows a `#d` query to
+//! one board in SQL, before `LIMIT`.
 //!
-//! That ordering matters because `BuzzClient::query_pages` (`client.rs`)
-//! decides whether it has reached the end of a paginated query by checking
-//! whether the page it got back is shorter than the page size it asked for.
-//! If `#d` were included in the wire filter, that check would be comparing
-//! the *post-filtered* (board-specific) count against a page size that
-//! bounds the *pre-filtered* (community-wide) SQL scan — a page with zero
-//! or few matches for this board looks exactly like "no more history" even
-//! when older matching revisions exist further back, so the loop would stop
-//! early and `history`/`restore` could silently return incomplete results
-//! or a false "not found" in any community with more than one active Lab
-//! Board. (fetch_head's kind:30623 query below does not have this problem —
-//! 30623 *is* a NIP-33 kind, so `#d` pushdown genuinely narrows the SQL.)
+//! That ordering is the whole point. When `#d` was applied only as an
+//! in-memory post-filter, a page could come back short simply because the
+//! community-wide window happened to contain no rows for this board, which is
+//! indistinguishable from "no more history" — so `history` silently omitted
+//! older revisions and `restore` could fail to find a revision that exists.
 //!
-//! So `fetch_revision_content` and `cmd_history` deliberately omit `#d` from
-//! the wire filter and match it client-side instead: the relay never
-//! post-filters a `#d`-less query, so the page size the server returns is
-//! the *real* SQL page size, and `query_pages`'s exhaustion check is
-//! trustworthy again. The cost is that both commands read every kind:40101
-//! event ever accepted in the community (via `query_all`, unbounded) rather
-//! than only this board's — there is no dedicated per-board read endpoint
-//! yet (`buzz_db::lab::list_board_revisions` is not wired up over HTTP/WS).
-//! `history`'s `--limit` therefore no longer bounds the wire query; it only
-//! caps how many of the (already fully-fetched, already board-matched) most
-//! recent revisions are printed — see that command's doc below.
-//!
-//! ## Explicitly out of scope this round
+//! ## Still out of scope
 //! `archive`/`unarchive`/`freeze`/`unfreeze` (moderation ops — no `--tag`/
 //! topic-tag support either: `parse_lab_board_envelope` in
 //! `buzz-relay/src/handlers/lab.rs` does not recognize a `t` tag at all, so
 //! the CLI does not offer one — a flag that silently no-ops on the wire
-//! would be worse than no flag), `list` (enumerate boards in a community),
-//! `get`/`show` (current content without touching history), `diff`, `ref`
-//! (a `buzz://lab?...` URI formatter, following `crate::links`' pattern).
+//! would be worse than no flag) and `diff`.
 //!
 //! ## Open design decisions (not dictated by the relay's wire contract)
 //! - `restore` always carries the *current head's* title/summary forward
@@ -213,12 +186,17 @@ fn parse_accept(raw: &str) -> Result<(bool, String), CliError> {
 /// Parsed view of the current live kind:30623 head projection for a board.
 #[derive(Debug)]
 struct BoardHead {
+    /// The `d` tag: the board's stable identifier.
+    board_id: Uuid,
     revision: i32,
     title: String,
+    summary: Option<String>,
+    /// The projection carries the board's current Markdown, so reading a board
+    /// is one query — no separate fetch of the revision event.
+    content: String,
     /// The `head` tag: hex event id of the kind:40101 revision this
     /// projection reflects — the CAS token for the next `prev` tag.
     head_event_id: EventId,
-    #[allow(dead_code)] // not surfaced yet — no `lab get`/`show` this round.
     status: String,
 }
 
@@ -245,9 +223,17 @@ impl BoardHead {
             ))
         })?;
         let status = tag_value(event, "status").unwrap_or("active").to_string();
+        let board_id_raw = tag_value(event, "d")
+            .ok_or_else(|| CliError::Other("lab board head event is missing the `d` tag".into()))?;
+        let board_id = Uuid::parse_str(board_id_raw).map_err(|e| {
+            CliError::Other(format!("lab board head `d` tag is not a valid UUID: {e}"))
+        })?;
         Ok(Self {
+            board_id,
             revision,
             title,
+            summary: tag_value(event, "summary").map(str::to_owned),
+            content: event.content.clone(),
             head_event_id,
             status,
         })
@@ -292,6 +278,7 @@ async fn fetch_revision_content(
     let board_id = board_id.to_string();
     let filter = serde_json::json!({
         "kinds": [KIND_LAB_BOARD_REVISION],
+        "#d": [board_id],
     });
     let raw_events = client.query_all(filter).await?;
     for v in raw_events {
@@ -622,14 +609,14 @@ pub async fn cmd_history(
         .unwrap_or(HISTORY_DEFAULT_LIMIT)
         .min(HISTORY_MAX_LIMIT) as usize;
 
-    // Deliberately no `#d` on the wire filter and no wire-level `limit` tied
-    // to `--limit` — see the module doc's "`#d` is NOT pushed into SQL for
-    // kind:40101" section. `query_all` scans the full community kind:40101
-    // stream (server never post-filters it, so pagination termination is
-    // honest); the board match and the `--limit` cap are both applied here,
-    // client-side, after the fetch.
+    // `#d` is honoured server-side for this kind, so the relay returns only
+    // this board's revisions and pagination terminates on real exhaustion.
+    // The `--limit` cap is still applied client-side, after sorting, so it
+    // means "the N most recent revisions" rather than "whatever the last page
+    // happened to hold".
     let filter = serde_json::json!({
         "kinds": [KIND_LAB_BOARD_REVISION],
+        "#d": [board_id_str],
     });
     let raw_events = client.query_all(filter).await?;
     let mut rows: Vec<RevisionOutput> = raw_events
@@ -731,6 +718,105 @@ pub async fn cmd_restore(
     Ok(())
 }
 
+/// One row of `lab list` output.
+#[derive(Debug, Clone, serde::Serialize)]
+struct BoardSummary {
+    board_id: String,
+    title: String,
+    summary: Option<String>,
+    revision: i32,
+    status: String,
+    updated_at: u64,
+    reference: String,
+}
+
+const LIST_DEFAULT_LIMIT: u32 = 200;
+const LIST_MAX_LIMIT: u32 = 500;
+
+/// Build the canonical reference to a board, or to one exact revision.
+///
+/// Mirrors `crate::links`' `buzz://` scheme. The board form always resolves to
+/// whatever the board says now; the revision form is immutable, which is what
+/// makes it safe to quote in a message or a commit trailer.
+pub fn board_reference(board_id: Uuid, revision: Option<i32>) -> String {
+    match revision {
+        Some(n) => format!("buzz://lab?board={board_id}&revision={n}"),
+        None => format!("buzz://lab?board={board_id}"),
+    }
+}
+
+pub async fn cmd_list(client: &BuzzClient, limit: Option<u32>) -> Result<(), CliError> {
+    let limit = limit.unwrap_or(LIST_DEFAULT_LIMIT).min(LIST_MAX_LIMIT);
+    // 30623 is NIP-33 and we want every `d`, so a kind-only filter is exact.
+    let filter = serde_json::json!({
+        "kinds": [KIND_LAB_BOARD_HEAD],
+        "limit": limit,
+    });
+    let raw = client.query(&filter).await?;
+    let mut heads: Vec<BoardSummary> = parse_events(&raw)?
+        .iter()
+        // A single malformed projection drops that board from the listing
+        // rather than failing the whole command.
+        .filter_map(|event| BoardHead::from_event(event).ok().map(|head| (event, head)))
+        .map(|(event, head)| BoardSummary {
+            reference: board_reference(head.board_id, None),
+            board_id: head.board_id.to_string(),
+            title: head.title.clone(),
+            summary: head.summary.clone(),
+            revision: head.revision,
+            status: head.status.clone(),
+            updated_at: event.created_at.as_secs(),
+        })
+        .collect();
+    heads.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&heads)
+            .map_err(|e| CliError::Other(format!("failed to serialize boards: {e}")))?
+    );
+    Ok(())
+}
+
+pub async fn cmd_get(
+    client: &BuzzClient,
+    board_id_raw: &str,
+    content_only: bool,
+) -> Result<(), CliError> {
+    let board_id = parse_uuid(board_id_raw)?;
+    let head = fetch_head(client, board_id)
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("lab board {board_id} not found")))?;
+
+    if content_only {
+        // Raw Markdown on stdout so an agent can pipe it straight into a file
+        // or a prompt without stripping a wrapper.
+        print!("{}", head.content);
+        return Ok(());
+    }
+
+    println!("board_id   {board_id}");
+    println!("title      {}", head.title);
+    println!("revision   {}", head.revision);
+    println!("status     {}", head.status);
+    println!("base       {}", head.head_event_id.to_hex());
+    println!("reference  {}", board_reference(board_id, None));
+    println!();
+    print!("{}", head.content);
+    Ok(())
+}
+
+pub fn cmd_ref(board_id_raw: &str, revision: Option<i32>) -> Result<(), CliError> {
+    let board_id = parse_uuid(board_id_raw)?;
+    if let Some(n) = revision {
+        if n < 1 {
+            return Err(CliError::Usage("--revision must be >= 1".into()));
+        }
+    }
+    println!("{}", board_reference(board_id, revision));
+    Ok(())
+}
+
 pub async fn dispatch(cmd: crate::LabCmd, client: &BuzzClient) -> Result<(), CliError> {
     use crate::LabCmd;
     match cmd {
@@ -756,6 +842,12 @@ pub async fn dispatch(cmd: crate::LabCmd, client: &BuzzClient) -> Result<(), Cli
             )
             .await
         }
+        LabCmd::List { limit } => cmd_list(client, limit).await,
+        LabCmd::Get {
+            board_id,
+            content_only,
+        } => cmd_get(client, &board_id, content_only).await,
+        LabCmd::Ref { board_id, revision } => cmd_ref(&board_id, revision),
         LabCmd::History { board_id, limit } => cmd_history(client, &board_id, limit).await,
         LabCmd::Restore {
             board_id,

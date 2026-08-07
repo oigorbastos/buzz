@@ -806,6 +806,27 @@ pub const fn is_replaceable(kind: u32) -> bool {
     matches!(kind, 0 | 3 | KIND_CHANNEL_METADATA | 10000..=19999)
 }
 
+/// Returns `true` if this kind's `d` tag is materialized into the
+/// `events.d_tag` column, and therefore whether a `#d` filter can be pushed
+/// down into SQL for it.
+///
+/// ⚠️ This is the single source of truth for BOTH sides of that contract:
+/// `buzz_db::event::extract_d_tag` (which writes the column) and the query
+/// builder (which reads it). They must never disagree. If a filter pushes
+/// `AND d_tag = $n` for a kind whose column was never populated, matching rows
+/// are silently dropped from the result — a wrong answer, not a slow one.
+///
+/// `KIND_LAB_BOARD_REVISION` is here despite not being NIP-33: it is
+/// deliberately an ordinary kind so a board keeps its full history, but its
+/// `d` tag is the board id and history queries are always
+/// "this board, paginated". Without the column those queries degrade to
+/// scanning the community's whole revision stream and filtering in memory
+/// after the SQL `LIMIT`, which silently truncates history as soon as a second
+/// board exists.
+pub const fn has_indexed_d_tag(kind: u32) -> bool {
+    is_parameterized_replaceable(kind) || kind == KIND_LAB_BOARD_REVISION
+}
+
 /// Returns `true` if `kind` is in the NIP-33 parameterized replaceable range (30000–39999).
 ///
 /// These events are keyed by `(pubkey, kind, d_tag)` — the latest `created_at` wins.

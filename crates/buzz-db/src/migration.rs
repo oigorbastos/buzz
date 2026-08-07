@@ -561,10 +561,11 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        // Bumped 28 -> 29 by migration 0029_lab_boards.sql (Lab Boards CAS
-        // gate). This count is a deliberate tripwire: adding a migration must
-        // be a conscious act, so update it in the same commit that adds one.
-        assert_eq!(migrations.len(), 29);
+        // Bumped to 30 by 0029_lab_boards.sql (CAS gate) and
+        // 0030_lab_board_d_tag_backfill.sql (d_tag pushdown for kind:40101).
+        // This count is a deliberate tripwire: adding a migration must be a
+        // conscious act, so update it in the same commit that adds one.
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]

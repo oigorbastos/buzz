@@ -52,7 +52,10 @@ export function useLabBoardsQuery() {
  * draft is saved against is captured separately when editing begins and must
  * not come from here (see `LabBoardView`).
  */
-export function useLabBoardQuery(boardId: string | null, pollWhileEditing = false) {
+export function useLabBoardQuery(
+  boardId: string | null,
+  pollWhileEditing = false,
+) {
   return useQuery({
     enabled: boardId !== null,
     queryKey: labBoardQueryKey(boardId ?? "none"),

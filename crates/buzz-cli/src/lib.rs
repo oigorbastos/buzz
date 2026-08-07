@@ -1165,6 +1165,28 @@ pub enum LabCmd {
         #[arg(long)]
         content: String,
     },
+    /// List the community's Lab Boards.
+    List {
+        /// Max boards to return (default 200, hard cap 500).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show a Lab Board's current content and metadata.
+    Get {
+        /// Board id (UUID).
+        board_id: String,
+        /// Print only the Markdown, for piping into a file or a prompt.
+        #[arg(long)]
+        content_only: bool,
+    },
+    /// Print the stable reference to a board, or to one exact revision.
+    Ref {
+        /// Board id (UUID).
+        board_id: String,
+        /// Pin the reference to this revision instead of "current".
+        #[arg(long)]
+        revision: Option<i32>,
+    },
     /// List every accepted revision of a Lab Board, oldest to newest.
     History {
         /// Board id (UUID).

@@ -1023,15 +1023,15 @@ fn filter_to_query_params(
     // Critical for parameterized replaceable lookups (authors + kinds + #d)
     // where many events from the same author would push the target past LIMIT.
     //
-    // Only push when the filter exclusively targets NIP-33 kinds (30000–39999),
-    // because `d_tag` is only populated for those kinds. Non-NIP-33 events have
-    // `d_tag = NULL`, so pushing `AND d_tag = $N` for a mixed-kind or kindless
-    // filter would silently exclude non-NIP-33 rows that match via their tags.
+    // Only push when every requested kind actually has the column populated
+    // (`has_indexed_d_tag`). For a kind without it, `d_tag` is NULL, so
+    // `AND d_tag = $N` would silently exclude rows that do match via their
+    // tags — a wrong result rather than a slow one.
     let filter_is_nip33_only = kinds.as_ref().is_some_and(|ks| {
         !ks.is_empty()
             && ks
                 .iter()
-                .all(|&k| buzz_core::kind::is_parameterized_replaceable(k as u32))
+                .all(|&k| buzz_core::kind::has_indexed_d_tag(k as u32))
     });
     let d_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::D);
     let (d_tag, d_tags) = if filter_is_nip33_only {

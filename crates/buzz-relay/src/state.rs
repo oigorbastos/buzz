@@ -679,6 +679,16 @@ pub struct AppState {
     /// Key: (community_id, agent pubkey bytes). Value: (count, window_start).
     /// 100 events/sec per agent — prevents relay/DB pressure from bursty telemetry.
     pub observer_rate_limiter: Arc<ScopedRateLimiter>,
+    /// Per-writer sliding-window rate limiter for Lab Board mutations.
+    /// Key: (community_id, author pubkey bytes). Value: (count, window_start).
+    ///
+    /// Every accepted board write persists a full Markdown snapshot, a
+    /// revision row, a re-signed projection, an FTS update and a fanout — and
+    /// agents can write, so a looping agent would grow the database forever
+    /// while holding the per-board advisory lock that every other writer needs.
+    /// Transport-level limits do not help: they are per-connection, and this
+    /// cost is per-accepted-event.
+    pub lab_board_rate_limiter: Arc<ScopedRateLimiter>,
     /// Per-uploader sliding-window rate limiter for media upload starts.
     /// Key: (community_id, uploader pubkey bytes). Value: (count, window_start).
     pub media_upload_rate_limiter: Arc<ScopedRateLimiter>,
@@ -864,6 +874,7 @@ impl AppState {
             nip98_replay,
             admission_rate_limiter,
             observer_rate_limiter: Arc::new(DashMap::new()),
+            lab_board_rate_limiter: Arc::new(DashMap::new()),
             media_upload_rate_limiter: Arc::new(DashMap::new()),
             invite_claim_rate_limiter: Arc::new(
                 moka::sync::Cache::builder()
