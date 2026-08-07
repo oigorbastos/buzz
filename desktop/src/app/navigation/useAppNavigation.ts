@@ -91,6 +91,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goLab = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/lab",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProjects = React.useCallback(
     (behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -318,6 +329,7 @@ export function useAppNavigation() {
     goChannel,
     goForumPost,
     goHome,
+    goLab,
     goNewMessage,
     goProject,
     goProjects,

@@ -72,6 +72,19 @@ export const KIND_GIT_STATUS_DRAFT = 1633;
 // NIP-DV: relay-signed per-viewer DM visibility snapshot (d=viewer pubkey,
 // h-tags = currently-hidden DM channel ids).
 export const KIND_DM_VISIBILITY = 30622;
+// Lab Boards ("Quadros") — community-wide, multi-writer Markdown documents
+// with compare-and-swap concurrency. Both kinds are PROVISIONAL, pending an
+// upstream RFC; see `buzz_core::kind` for the authoritative definitions.
+//
+// 40101 is client-signed and ORDINARY (not replaceable, never soft-deleted),
+// so every accepted revision stays queryable forever — that is what makes
+// history possible. 30623 is the relay-signed NIP-33 head projection
+// (d=board_id): the relay re-signs it on every accepted mutation and
+// soft-deletes the previous one, so a `#d` query always returns exactly the
+// live head, carrying the current Markdown, revision number, and the `head`
+// tag used as the CAS token for the next write.
+export const KIND_LAB_BOARD_REVISION = 40101;
+export const KIND_LAB_BOARD_HEAD = 30623;
 
 // Human-visible "new content" message kinds. Used as the unread trigger set
 // (sidebar badges, catch-up queries) and as the Home-feed mention query.

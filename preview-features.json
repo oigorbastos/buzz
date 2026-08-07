@@ -20,6 +20,12 @@
       "platforms": ["desktop"]
     },
     {
+      "id": "lab",
+      "name": "Lab",
+      "description": "Shared Markdown boards everyone in the community can read and edit",
+      "platforms": ["desktop"]
+    },
+    {
       "id": "forum",
       "name": "Forum Channels",
       "description": "Forum-style threaded channels for long-form discussions",

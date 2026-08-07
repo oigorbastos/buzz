@@ -8,6 +8,7 @@ type ViewLoadingFallbackKind =
   | "agents"
   | "channel"
   | "forum"
+  | "lab"
   | "projects"
   | "pulse"
   | "workflows";
@@ -403,6 +404,7 @@ export function ViewLoadingFallback({
       {kind === "agents" ? <AgentsLoadingBody /> : null}
       {kind === "workflows" ? <CardListLoadingBody /> : null}
       {kind === "projects" ? <CardListLoadingBody /> : null}
+      {kind === "lab" ? <CardListLoadingBody /> : null}
       {kind === "channel" ? (
         <ChannelLoadingBody hasHeader={shouldShowChannelHeader} />
       ) : null}

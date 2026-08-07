@@ -1,0 +1,334 @@
+/**
+ * Lab Boards ("Quadros") — relay access layer.
+ *
+ * A Lab Board is a community-wide, multi-writer Markdown document. Every
+ * member can edit any board, so concurrency is settled by the relay with
+ * compare-and-swap rather than by last-write-wins: each mutation names the
+ * revision it was based on (`prev`), and the relay rejects it with
+ * `BOARD_HEAD_MISMATCH` if that is no longer the head.
+ *
+ * Two kinds (see `@/shared/constants/kinds` for the full contract):
+ * - 40101 `KIND_LAB_BOARD_REVISION` — client-signed, ordinary event. Every
+ *   accepted create/update/restore is one, kept forever; this is the history.
+ * - 30623 `KIND_LAB_BOARD_HEAD` — relay-signed NIP-33 projection keyed by
+ *   `d=board_id`, re-signed on every accepted mutation. It carries the current
+ *   Markdown in `content`, so opening a board costs exactly one query, and its
+ *   `head` tag is the CAS token for the next write.
+ */
+
+import { getRelaySelf } from "@/features/moderation/lib/relaySelf";
+import { relayClient } from "@/shared/api/relayClient";
+import { signRelayEvent } from "@/shared/api/tauri";
+import type { RelayEvent } from "@/shared/api/types";
+import {
+  KIND_LAB_BOARD_HEAD,
+  KIND_LAB_BOARD_REVISION,
+} from "@/shared/constants/kinds";
+
+/** Relay-enforced caps, mirrored so the UI can fail before a round trip. */
+export const MAX_TITLE_CHARS = 160;
+export const MAX_SUMMARY_CHARS = 500;
+export const MAX_MARKDOWN_BYTES = 64 * 1024;
+
+const BOARD_LIST_LIMIT = 500;
+const HISTORY_FETCH_LIMIT = 1000;
+
+export type LabBoardStatus = "active" | "archived" | "frozen";
+
+/** The live head projection of one board (parsed from a kind:30623 event). */
+export type LabBoardHead = {
+  boardId: string;
+  title: string;
+  summary: string | null;
+  content: string;
+  revision: number;
+  status: LabBoardStatus;
+  /** Event id of the kind:40101 revision this projection reflects — the CAS token. */
+  headEventId: string;
+  updatedAt: number;
+};
+
+/** One entry of a board's revision history (parsed from a kind:40101 event). */
+export type LabBoardRevision = {
+  eventId: string;
+  boardId: string;
+  /** Absent only for events from a client that did not follow the convention. */
+  revision: number | null;
+  op: string;
+  author: string;
+  createdAt: number;
+  restoredFrom: number | null;
+  content: string;
+};
+
+function tagValue(event: RelayEvent, name: string): string | null {
+  const tag = event.tags.find((entry) => entry[0] === name);
+  return tag?.[1] ?? null;
+}
+
+function parseIntTag(event: RelayEvent, name: string): number | null {
+  const raw = tagValue(event, name);
+  if (raw === null) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parseStatus(raw: string | null): LabBoardStatus {
+  return raw === "archived" || raw === "frozen" ? raw : "active";
+}
+
+/**
+ * Parse a kind:30623 event into a board head.
+ *
+ * Returns `null` rather than throwing when the event is missing the fields the
+ * UI cannot work without (`d`, `revision`, `head`): a single malformed
+ * projection should drop that one board from the list, not blank the screen.
+ */
+export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
+  if (event.kind !== KIND_LAB_BOARD_HEAD) return null;
+  const boardId = tagValue(event, "d");
+  const headEventId = tagValue(event, "head");
+  const revision = parseIntTag(event, "revision");
+  if (!boardId || !headEventId || revision === null) return null;
+
+  return {
+    boardId,
+    title: tagValue(event, "title") ?? "Untitled board",
+    summary: tagValue(event, "summary"),
+    content: event.content,
+    revision,
+    status: parseStatus(tagValue(event, "status")),
+    headEventId,
+    updatedAt: event.created_at,
+  };
+}
+
+/** Parse a kind:40101 event into a history entry. */
+export function parseBoardRevision(event: RelayEvent): LabBoardRevision | null {
+  if (event.kind !== KIND_LAB_BOARD_REVISION) return null;
+  const boardId = tagValue(event, "d");
+  if (!boardId) return null;
+
+  return {
+    eventId: event.id,
+    boardId,
+    revision: parseIntTag(event, "revision"),
+    op: tagValue(event, "op") ?? "unknown",
+    author: event.pubkey,
+    createdAt: event.created_at,
+    restoredFrom: parseIntTag(event, "restored_from"),
+    content: event.content,
+  };
+}
+
+/**
+ * Order history oldest-first by `revision`.
+ *
+ * Events with no `revision` tag can only come from a client that ignored the
+ * convention; they sort to the end by timestamp instead of being dropped, so
+ * the history stays honest about what the relay actually holds.
+ */
+export function sortRevisions(
+  revisions: LabBoardRevision[],
+): LabBoardRevision[] {
+  return [...revisions].sort((a, b) => {
+    if (a.revision !== null && b.revision !== null) {
+      return a.revision - b.revision;
+    }
+    if (a.revision !== null) return -1;
+    if (b.revision !== null) return 1;
+    return a.createdAt - b.createdAt;
+  });
+}
+
+/** True when this event belongs to `boardId` (client-side `#d` match). */
+export function eventMatchesBoard(event: RelayEvent, boardId: string): boolean {
+  return tagValue(event, "d") === boardId;
+}
+
+/**
+ * List every board in the community, most recently updated first.
+ *
+ * Safe to filter server-side by kind alone: 30623 is NIP-33, and we want all
+ * `d` values, so no `#d` constraint is involved.
+ */
+export async function fetchBoardHeads(): Promise<LabBoardHead[]> {
+  const events = await relayClient.fetchEvents({
+    kinds: [KIND_LAB_BOARD_HEAD],
+    limit: BOARD_LIST_LIMIT,
+  });
+  return events
+    .map(parseBoardHead)
+    .filter((head): head is LabBoardHead => head !== null)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * Read one board's live head — the read half of every compare-and-swap.
+ *
+ * Narrowed to the relay's own pubkey when it is known, since kind:30623 is
+ * relay-signed. This is defence in depth, not the only barrier: 30623 is
+ * registered relay-only, so the relay's own ingest gate refuses a
+ * client-submitted projection outright and a forgery never reaches storage.
+ * That is why a `null` self pubkey (relay advertises none, or NIP-11 is
+ * unreadable) degrades to an unfiltered read rather than failing the screen —
+ * the guard that matters is server-side.
+ */
+export async function fetchBoardHead(
+  boardId: string,
+): Promise<LabBoardHead | null> {
+  const relaySelf = await getRelaySelf().catch(() => null);
+  const events = await relayClient.fetchEvents({
+    kinds: [KIND_LAB_BOARD_HEAD],
+    ...(relaySelf ? { authors: [relaySelf] } : {}),
+    "#d": [boardId],
+    limit: 1,
+  });
+  const newest = [...events].sort((a, b) => b.created_at - a.created_at)[0];
+  return newest ? parseBoardHead(newest) : null;
+}
+
+/**
+ * Read one board's full revision history, oldest first.
+ *
+ * ⚠️ The wire filter deliberately omits `#d` even though we want one board.
+ * kind:40101 is intentionally NOT in the NIP-33 range (that is what lets it
+ * keep history), and the relay only pushes `#d` down into SQL for NIP-33
+ * kinds. For 40101 it applies `#d` in memory *after* the SQL `LIMIT` has
+ * already selected the newest events community-wide — so a `#d` filter can
+ * silently return a partial history once more than one board is active. We
+ * fetch the community-wide stream and match here instead. Cost: this reads
+ * every board's revisions to show one board's. Acceptable while boards are
+ * few; a per-board read endpoint on the relay is the real fix.
+ */
+export async function fetchBoardHistory(
+  boardId: string,
+): Promise<LabBoardRevision[]> {
+  const events = await relayClient.fetchEvents({
+    kinds: [KIND_LAB_BOARD_REVISION],
+    limit: HISTORY_FETCH_LIMIT,
+  });
+  const revisions = events
+    .filter((event) => eventMatchesBoard(event, boardId))
+    .map(parseBoardRevision)
+    .filter((entry): entry is LabBoardRevision => entry !== null);
+  return sortRevisions(revisions);
+}
+
+export function validateBoardInput(input: {
+  title?: string;
+  summary?: string;
+  content: string;
+}): string | null {
+  if (input.title !== undefined && input.title.trim().length === 0) {
+    return "Title cannot be empty.";
+  }
+  if (input.title !== undefined && [...input.title].length > MAX_TITLE_CHARS) {
+    return `Title is limited to ${MAX_TITLE_CHARS} characters.`;
+  }
+  if (
+    input.summary !== undefined &&
+    [...input.summary].length > MAX_SUMMARY_CHARS
+  ) {
+    return `Summary is limited to ${MAX_SUMMARY_CHARS} characters.`;
+  }
+  if (new TextEncoder().encode(input.content).length > MAX_MARKDOWN_BYTES) {
+    return `Content is limited to ${MAX_MARKDOWN_BYTES / 1024} KB.`;
+  }
+  return null;
+}
+
+/** True when this error is the relay refusing a write whose base is stale. */
+export function isBoardConflictError(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message.includes("BOARD_HEAD_MISMATCH")
+  );
+}
+
+export const BOARD_CONFLICT_MESSAGE =
+  "Someone else edited this board while you were writing. Your text is kept — reopen the board to see their version before saving again.";
+
+async function publishRevision(
+  content: string,
+  tags: string[][],
+): Promise<string> {
+  const event = await signRelayEvent({
+    kind: KIND_LAB_BOARD_REVISION,
+    content,
+    tags,
+  });
+  await relayClient.publishEvent(
+    event,
+    "Timed out publishing to this board.",
+    "Failed to publish to this board.",
+  );
+  return event.id;
+}
+
+export async function createBoard(input: {
+  title: string;
+  summary?: string;
+  content: string;
+}): Promise<{ boardId: string; eventId: string }> {
+  const boardId = crypto.randomUUID();
+  const tags: string[][] = [
+    ["d", boardId],
+    ["op", "create"],
+    ["revision", "1"],
+    ["title", input.title.trim()],
+  ];
+  const summary = input.summary?.trim();
+  if (summary) tags.push(["summary", summary]);
+
+  const eventId = await publishRevision(input.content, tags);
+  return { boardId, eventId };
+}
+
+/**
+ * Save an edit, compare-and-swapping against `head`.
+ *
+ * `title`/`summary` are omitted when unchanged: on the wire, an absent tag
+ * means "keep the current value", and there is no empty-means-clear form.
+ */
+export async function updateBoard(input: {
+  head: LabBoardHead;
+  content: string;
+  title?: string;
+  summary?: string;
+}): Promise<string> {
+  const tags: string[][] = [
+    ["d", input.head.boardId],
+    ["op", "update"],
+    ["prev", input.head.headEventId],
+    ["revision", String(input.head.revision + 1)],
+  ];
+  if (input.title !== undefined) tags.push(["title", input.title.trim()]);
+  if (input.summary !== undefined) tags.push(["summary", input.summary.trim()]);
+
+  return publishRevision(input.content, tags);
+}
+
+/**
+ * Restore an earlier revision by republishing its content as a new one.
+ *
+ * The relay never copies content on restore — the client resubmits it — and
+ * the result is a new revision on top of history, never a rewrite of it.
+ */
+export async function restoreBoardRevision(input: {
+  head: LabBoardHead;
+  revision: LabBoardRevision;
+}): Promise<string> {
+  if (input.revision.revision === null) {
+    throw new Error(
+      "That revision has no revision number and cannot be restored.",
+    );
+  }
+  const tags: string[][] = [
+    ["d", input.head.boardId],
+    ["op", "restore"],
+    ["prev", input.head.headEventId],
+    ["revision", String(input.head.revision + 1)],
+    ["restored_from", String(input.revision.revision)],
+  ];
+  return publishRevision(input.revision.content, tags);
+}

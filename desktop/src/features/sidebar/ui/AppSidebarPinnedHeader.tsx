@@ -1,5 +1,13 @@
-import { Activity, Bot, FolderGit2, Inbox, Zap } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  FlaskConical,
+  FolderGit2,
+  Inbox,
+  Zap,
+} from "lucide-react";
 
+import type { AppView } from "@/app/AppShell.helpers";
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { FeatureGate } from "@/shared/features";
 import type { Channel, SearchHit } from "@/shared/api/types";
@@ -12,14 +20,7 @@ import {
 } from "@/shared/ui/sidebar";
 import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
 
-type SidebarSelectedView =
-  | "home"
-  | "channel"
-  | "messages"
-  | "agents"
-  | "workflows"
-  | "pulse"
-  | "projects";
+type SidebarSelectedView = AppView;
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -39,6 +40,7 @@ type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectHome: () => void;
+  onSelectLab: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;
@@ -84,6 +86,7 @@ export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
   onSelectHome,
+  onSelectLab,
   onSelectProjects,
   onSelectPulse,
   onSelectWorkflows,
@@ -149,6 +152,20 @@ export function AppSidebarPrimaryMenu({
             >
               <FolderGit2 className="h-4 w-4" />
               <SidebarMenuLabel>Projects</SidebarMenuLabel>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </FeatureGate>
+        <FeatureGate feature="lab">
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              data-testid="open-lab-view"
+              isActive={selectedView === "lab"}
+              onClick={onSelectLab}
+              tooltip="Lab"
+              type="button"
+            >
+              <FlaskConical className="h-4 w-4" />
+              <SidebarMenuLabel>Lab</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </FeatureGate>

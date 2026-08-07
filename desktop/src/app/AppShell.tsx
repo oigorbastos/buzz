@@ -97,6 +97,7 @@ import { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarR
 import { AppShellTrayMenu } from "@/app/useAppShellTrayMenu";
 import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
 import { LazySettingsScreen } from "@/app/LazySettingsScreen";
+import { useSidebarNavHandlers } from "@/app/navigation/useSidebarNavHandlers";
 const EMPTY_CHANNELS: Channel[] = [];
 export function AppShell() {
   useWebviewZoomShortcuts();
@@ -134,17 +135,14 @@ export function AppShell() {
   const queryClient = useQueryClient();
   useManagedAgentRuntimeReconciliation(communitiesHook.communities); // sync storage snapshot
   const {
-    goAgents,
     goChannel,
     goHome,
     goNewMessage,
-    goProjects,
-    goPulse,
     goSettings,
-    goWorkflows,
     closeSettings,
     openSearchHit,
   } = useAppNavigation();
+  const sidebarNavHandlers = useSidebarNavHandlers();
   const { canGoBack, canGoForward, goBack, goForward } =
     useBackForwardControls();
   const { selectedChannelId, selectedView } = React.useMemo(
@@ -893,16 +891,12 @@ export function AppShell() {
                             });
                           await goChannel(directMessage.id);
                         }}
-                        onSelectAgents={() => void goAgents()}
+                        {...sidebarNavHandlers}
                         onSelectChannel={handleSidebarChannelSelect}
                         onOpenSearchResult={handleOpenSearchResult}
                         searchChannels={channels}
                         searchFocusRequest={searchFocusRequest}
-                        onSelectHome={() => void goHome()}
-                        onSelectProjects={() => void goProjects()}
-                        onSelectPulse={() => void goPulse()}
                         onSelectSettings={handleOpenSettings}
-                        onSelectWorkflows={() => void goWorkflows()}
                         onSetPresenceStatus={(status) =>
                           presenceSession.setStatus(status)
                         }
