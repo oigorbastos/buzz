@@ -4025,13 +4025,28 @@ mod tests {
         capture_path: &std::path::Path,
         response: &str,
     ) -> AcpClient {
+        let capture_path = shell_quote(&test_shell_path(capture_path));
         let script = format!(
             "read -r line; printf '%s' \"$line\" > {capture}; \
              printf '%s\\n' '{response}'; sleep 10",
-            capture = capture_path.display(),
+            capture = capture_path,
             response = response,
         );
         spawn_script(&script).await
+    }
+
+    fn test_shell_path(path: &std::path::Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        #[cfg(windows)]
+        if path.as_bytes().get(1) == Some(&b':') {
+            let drive = path[..1].to_ascii_lowercase();
+            return format!("/{drive}{}", &path[2..]);
+        }
+        path
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     /// Drive one steer through the read loop and return
