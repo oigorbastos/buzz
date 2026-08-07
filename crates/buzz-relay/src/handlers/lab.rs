@@ -14,7 +14,7 @@
 //! (`events` storage here is driven explicitly, inside the CAS transaction,
 //! by `buzz_db::lab`).
 //!
-//! ## The 9-step CAS algorithm (spec §3)
+//! ## The CAS algorithm (spec §3)
 //! 1. Generic gates already ran (signature, size, timestamp, pubkey/auth
 //!    match, `boards:write`/`boards:moderate` scope, ban/timeout) —
 //!    see `ingest_event_inner` before the call site of this module. Pure
@@ -35,15 +35,20 @@
 //!    an illegal state transition is rejected via [`board_head_mismatch`]
 //!    *before* any write.
 //! 5. Insert the signed revision event ([`buzz_db::lab::insert_revision_event_tx`]).
-//! 6. Update `lab_board_heads` ([`buzz_db::lab::create_board_head_tx`] /
-//!    [`buzz_db::lab::update_board_content_head_tx`] /
-//!    [`buzz_db::lab::set_board_status_tx`]).
-//! 7. Build and sign the new kind:30623 head projection with
+//! 6. Build and sign the new kind:30623 head projection with
 //!    `state.relay_keypair` (content mutations only — see the module doc on
 //!    moderation ops below for why status-only transitions skip this step).
-//! 8. Persist the head projection
+//! 7. Persist the head projection
 //!    ([`buzz_db::lab::replace_head_projection_event_tx`]) — same transaction.
-//! 9. `tx.commit()`, THEN publish to subscribers via
+//! 8. Upsert `lab_board_heads` ([`buzz_db::lab::create_board_head_tx`] /
+//!    [`buzz_db::lab::update_board_content_head_tx`] /
+//!    [`buzz_db::lab::set_board_status_tx`]).
+//! 9. Append the `lab_board_revisions` row
+//!    ([`buzz_db::lab::record_board_revision_tx`]) — **after** step 8, never
+//!    before: that table has a foreign key into `lab_board_heads`, so on an
+//!    `op=create` the head row must exist first (see the comment at that call
+//!    site).
+//! 10. `tx.commit()`, THEN publish to subscribers via
 //!    `dispatch_persistent_event` — never before commit.
 //!
 //! ## Known gaps (foundation round — schema + kinds + CAS transaction only)
@@ -334,6 +339,10 @@ fn board_head_mismatch(detail: &str) -> IngestError {
 /// revision, not new data). Tags: `d`=board_id (addressable coordinate),
 /// `community`, `revision`, `title`, `summary` (if any), `head`=hex id of the
 /// revision event this projection reflects, `status`.
+// Each argument is one tag/field of the projection; bundling them into a
+// params struct would only move the same list one indirection away. Matches
+// the `#[allow]` already carried by the sibling writers in `buzz_db::lab`.
+#[allow(clippy::too_many_arguments)]
 fn build_head_projection_event(
     tenant: &TenantContext,
     relay_keys: &nostr::Keys,
@@ -690,26 +699,6 @@ async fn handle_content_mutation(
         return Ok((None, None, "duplicate:".to_string()));
     }
 
-    // Step 6a: append the revisions-table row (content ops only).
-    buzz_db::lab::record_board_revision_tx(
-        tx,
-        community,
-        envelope.board_id,
-        new_revision,
-        event.id.as_bytes(),
-        envelope.prev.as_ref().map(|p| p.as_slice()),
-        envelope.op.revision_operation_label(),
-        author_pubkey.as_slice(),
-        content_hash.as_slice(),
-        if envelope.op == LabBoardOp::Restore {
-            envelope.restored_from
-        } else {
-            None
-        },
-    )
-    .await
-    .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
-
     // Step 7: build + sign the new head projection.
     let status = current_head
         .as_ref()
@@ -769,6 +758,37 @@ async fn handle_content_mutation(
         .await
         .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
     }
+
+    // Step 9: append the revisions-table row.
+    //
+    // ⚠️ ORDERING IS LOAD-BEARING: this MUST run after the `lab_board_heads`
+    // upsert above, never before. `lab_board_revisions` carries
+    // `FOREIGN KEY (community_id, board_id) REFERENCES lab_board_heads` (see
+    // migration 0029), so on an `op=create` — where the head row does not
+    // exist until `create_board_head_tx` runs — inserting the revision first
+    // violates that constraint and fails the whole transaction with a 500.
+    // Only `create` is affected (an `update`/`restore` finds the head row
+    // already there), which is exactly why unit tests and static review both
+    // missed it: it only reproduces against a real PostgreSQL, on the very
+    // first write to a board.
+    buzz_db::lab::record_board_revision_tx(
+        tx,
+        community,
+        envelope.board_id,
+        new_revision,
+        event.id.as_bytes(),
+        envelope.prev.as_ref().map(|p| p.as_slice()),
+        envelope.op.revision_operation_label(),
+        author_pubkey.as_slice(),
+        content_hash.as_slice(),
+        if envelope.op == LabBoardOp::Restore {
+            envelope.restored_from
+        } else {
+            None
+        },
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
 
     Ok((Some(revision_stored), Some(head_stored), String::new()))
 }
