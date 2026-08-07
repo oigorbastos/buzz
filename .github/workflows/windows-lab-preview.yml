@@ -310,6 +310,7 @@ jobs:
           echo "portable_sums=$PORTABLE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
           echo "portable_root=$PORTABLE_ROOT" >> "$GITHUB_OUTPUT"
           echo "nsis_exe=$NSIS_ROOT/$NSIS_NAME" >> "$GITHUB_OUTPUT"
+          echo "nsis_release_exe=$NSIS_RELEASE_ROOT/$NSIS_NAME" >> "$GITHUB_OUTPUT"
           echo "nsis_manifest=$NSIS_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
           echo "nsis_sums=$NSIS_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
           echo "portable_release_manifest=$PORTABLE_RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
@@ -332,7 +333,7 @@ jobs:
         shell: bash
         env:
           PORTABLE_ZIP: ${{ steps.artifacts.outputs.portable_zip }}
-          NSIS_EXE: ${{ steps.artifacts.outputs.nsis_exe }}
+          NSIS_EXE: ${{ steps.artifacts.outputs.nsis_release_exe }}
           PORTABLE_RELEASE_MANIFEST: ${{ steps.artifacts.outputs.portable_release_manifest }}
           PORTABLE_RELEASE_SUMS: ${{ steps.artifacts.outputs.portable_release_sums }}
           NSIS_RELEASE_MANIFEST: ${{ steps.artifacts.outputs.nsis_release_manifest }}
@@ -364,7 +365,7 @@ jobs:
         with:
           name: buzz-lab-windows-nsis-second-stage-${{ github.sha }}
           path: |
-            ${{ steps.artifacts.outputs.nsis_exe }}
+            ${{ steps.artifacts.outputs.nsis_release_exe }}
             ${{ steps.artifacts.outputs.nsis_release_manifest }}
             ${{ steps.artifacts.outputs.nsis_release_sums }}
           if-no-files-found: error
