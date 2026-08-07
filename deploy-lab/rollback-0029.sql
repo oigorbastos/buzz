@@ -40,10 +40,17 @@ BEGIN;
 DROP TABLE IF EXISTS lab_board_revisions;
 DROP TABLE IF EXISTS lab_board_heads;
 
--- Remove the applied-migration marker so sqlx's validate_applied_migrations
--- stops seeing a version the older binary cannot resolve. Without this line
--- the DROPs above are pointless — the marker alone is what blocks boot.
-DELETE FROM _sqlx_migrations WHERE version = 29;
+-- Undo 0030's backfill. The column itself is pre-existing and shared, so only
+-- the rows this feature populated are cleared — the older binary's
+-- `extract_d_tag` never writes `d_tag` for kind:40101, and its query builder
+-- never reads it for that kind, so leaving values behind would be dead data
+-- that a later re-upgrade could silently disagree with.
+UPDATE events SET d_tag = NULL WHERE kind = 40101;
+
+-- Remove the applied-migration markers so sqlx's validate_applied_migrations
+-- stops seeing versions the older binary cannot resolve. Without these lines
+-- the DROPs above are pointless — the markers alone are what block boot.
+DELETE FROM _sqlx_migrations WHERE version IN (29, 30);
 
 COMMIT;
 
