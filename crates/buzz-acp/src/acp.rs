@@ -2956,8 +2956,32 @@ mod tests {
         );
     }
 
+    fn test_shell_command() -> String {
+        #[cfg(windows)]
+        {
+            // `bash` may resolve to the WSL launcher on Windows, which exits
+            // immediately when spawned by a native test process. GitHub's
+            // Windows runner already provides Git for Windows, and its bash
+            // supports the POSIX scripts used by these ACP subprocess tests.
+            for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+                if let Some(root) = std::env::var_os(variable) {
+                    let path = std::path::PathBuf::from(root)
+                        .join("Git")
+                        .join("bin")
+                        .join("bash.exe");
+                    if path.is_file() {
+                        return path.to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+
+        "bash".to_owned()
+    }
+
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+        let shell = test_shell_command();
+        AcpClient::spawn(&shell, &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
     }
