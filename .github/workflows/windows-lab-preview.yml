@@ -119,10 +119,6 @@ jobs:
         shell: bash
         run: cargo test -p buzz-acp
 
-      - name: Managed-agent Nest tests
-        shell: bash
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
-
       - name: Desktop check
         shell: bash
         run: pnpm -C desktop check
@@ -187,6 +183,10 @@ jobs:
             -p git-credential-nostr \
             -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Managed-agent Nest tests
+        shell: bash
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
 
       - name: Build unsigned Windows NSIS
         shell: bash
