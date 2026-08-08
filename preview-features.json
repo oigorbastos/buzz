@@ -22,7 +22,7 @@
     {
       "id": "lab",
       "name": "Lab",
-      "description": "Shared Markdown boards everyone in the community can read and edit",
+      "description": "Markdown boards with community or owner-and-agents editing",
       "platforms": ["desktop"]
     },
     {

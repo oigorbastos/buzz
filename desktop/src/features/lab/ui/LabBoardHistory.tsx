@@ -23,6 +23,7 @@ function formatTimestamp(seconds: number): string {
 }
 
 type LabBoardHistoryProps = {
+  canRestore?: boolean;
   currentRevision: number;
   isRestoring: boolean;
   onRestore: (revision: LabBoardRevision) => void;
@@ -30,6 +31,7 @@ type LabBoardHistoryProps = {
 };
 
 export function LabBoardHistory({
+  canRestore = true,
   currentRevision,
   isRestoring,
   onRestore,
@@ -74,7 +76,8 @@ export function LabBoardHistory({
             </p>
           </div>
           {revision.revision !== null &&
-          revision.revision !== currentRevision ? (
+          revision.revision !== currentRevision &&
+          canRestore ? (
             <RestoreButton
               disabled={isRestoring}
               onRestore={() => onRestore(revision)}

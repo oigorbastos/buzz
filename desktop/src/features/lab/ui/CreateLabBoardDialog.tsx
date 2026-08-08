@@ -1,3 +1,4 @@
+import { Check, UserRound, Users } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -5,6 +6,8 @@ import {
   MAX_TITLE_CHARS,
   validateBoardInput,
 } from "@/features/lab/api";
+import type { LabBoardEditPolicy } from "@/features/lab/model";
+import { LabTagInput } from "@/features/lab/ui/LabTagInput";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
@@ -23,6 +26,8 @@ type CreateLabBoardDialogProps = {
     title: string;
     summary?: string;
     content: string;
+    editPolicy: LabBoardEditPolicy;
+    tags: string[];
   }) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
@@ -37,6 +42,9 @@ export function CreateLabBoardDialog({
   const [title, setTitle] = React.useState("");
   const [summary, setSummary] = React.useState("");
   const [content, setContent] = React.useState("");
+  const [editPolicy, setEditPolicy] =
+    React.useState<LabBoardEditPolicy>("community");
+  const [tags, setTags] = React.useState<string[]>([]);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const titleInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -45,6 +53,8 @@ export function CreateLabBoardDialog({
     setTitle("");
     setSummary("");
     setContent("");
+    setEditPolicy("community");
+    setTags([]);
     setErrorMessage(null);
     const timerId = globalThis.setTimeout(() => {
       titleInputRef.current?.focus();
@@ -61,6 +71,7 @@ export function CreateLabBoardDialog({
       title: trimmedTitle,
       summary: summary.trim() || undefined,
       content,
+      tags,
     });
     if (validationError) {
       setErrorMessage(validationError);
@@ -73,6 +84,8 @@ export function CreateLabBoardDialog({
         title: trimmedTitle,
         summary: summary.trim() || undefined,
         content,
+        editPolicy,
+        tags,
       });
       onOpenChange(false);
     } catch (error) {
@@ -91,10 +104,10 @@ export function CreateLabBoardDialog({
       open={open}
     >
       <ChooserDialogContent
-        className="max-w-lg"
+        className="max-w-xl"
         contentClassName="pt-3"
         data-testid="create-lab-board-dialog"
-        description="Boards are shared: everyone in this community can read and edit them."
+        description="Choose who can edit. Every board remains readable by the whole community."
         footer={
           <div className="flex w-full items-center justify-end gap-3">
             <Button
@@ -145,6 +158,45 @@ export function CreateLabBoardDialog({
                 value={title}
               />
             </div>
+          </div>
+
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-medium text-foreground">
+              Editing access
+            </legend>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <EditPolicyOption
+                checked={editPolicy === "community"}
+                description="Everyone in the community can read and edit."
+                icon={<Users className="h-4 w-4" />}
+                label="Community"
+                onSelect={() => setEditPolicy("community")}
+              />
+              <EditPolicyOption
+                checked={editPolicy === "owner_agents"}
+                description="Everyone reads. Only you and your agents edit."
+                icon={<UserRound className="h-4 w-4" />}
+                label="Personal editing"
+                onSelect={() => setEditPolicy("owner_agents")}
+              />
+            </div>
+          </fieldset>
+
+          <div className="space-y-1.5">
+            <label
+              className="text-sm font-medium text-foreground"
+              htmlFor="create-lab-board-tags"
+            >
+              Tags
+              <span className="ml-1 text-xs font-normal text-muted-foreground/50">
+                optional
+              </span>
+            </label>
+            <LabTagInput
+              id="create-lab-board-tags"
+              onChange={setTags}
+              tags={tags}
+            />
           </div>
 
           <div className="space-y-1.5">
@@ -203,5 +255,49 @@ export function CreateLabBoardDialog({
         </form>
       </ChooserDialogContent>
     </Dialog>
+  );
+}
+
+function EditPolicyOption({
+  checked,
+  description,
+  icon,
+  label,
+  onSelect,
+}: {
+  checked: boolean;
+  description: string;
+  icon: React.ReactNode;
+  label: string;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      aria-pressed={checked}
+      className={cn(
+        "relative rounded-xl border p-3 text-left transition-colors",
+        checked
+          ? "border-primary/45 bg-primary/8"
+          : "border-border/70 bg-muted/20 hover:bg-muted/40",
+      )}
+      data-testid={`create-lab-board-policy-${checked ? "selected" : "option"}-${label.toLowerCase().replaceAll(" ", "-")}`}
+      onClick={onSelect}
+      type="button"
+    >
+      <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+        <span
+          className={cn("text-muted-foreground", checked && "text-primary")}
+        >
+          {icon}
+        </span>
+        {label}
+      </span>
+      <span className="mt-1 block pr-5 text-xs leading-relaxed text-muted-foreground">
+        {description}
+      </span>
+      {checked ? (
+        <Check className="absolute right-3 top-3 h-4 w-4 text-primary" />
+      ) : null}
+    </button>
   );
 }

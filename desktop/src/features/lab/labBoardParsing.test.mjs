@@ -58,6 +58,28 @@ describe("parseBoardHead", () => {
     assert.equal(head.headEventId, EVENT_ID);
     assert.equal(head.status, "active");
     assert.equal(head.content, "# hello");
+    assert.equal(head.editPolicy, "community");
+    assert.equal(head.ownerPubkey, null);
+    assert.deepEqual(head.tags, []);
+  });
+
+  it("reads personal editing metadata and canonical tags", () => {
+    const head = parseBoardHead(
+      headEvent([
+        ["d", BOARD],
+        ["revision", "2"],
+        ["head", EVENT_ID],
+        ["edit_policy", "owner_agents"],
+        ["owner", PUBKEY],
+        ["t", "Prompts"],
+        ["t", "operação"],
+        ["t", "prompts"],
+      ]),
+    );
+
+    assert.equal(head.editPolicy, "owner_agents");
+    assert.equal(head.ownerPubkey, PUBKEY);
+    assert.deepEqual(head.tags, ["prompts", "operação"]);
   });
 
   it("rejects an event of the wrong kind", () => {

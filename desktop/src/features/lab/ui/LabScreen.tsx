@@ -1,35 +1,65 @@
 import { useNavigate } from "@tanstack/react-router";
-import { Plus } from "lucide-react";
+import { Plus, Tag } from "lucide-react";
 import * as React from "react";
 
 import {
   useCreateLabBoardMutation,
   useLabBoardsQuery,
 } from "@/features/lab/hooks";
+import {
+  availableBoardTags,
+  filterLabBoards,
+  type LabBoardListFilter,
+} from "@/features/lab/model";
 import { CreateLabBoardDialog } from "@/features/lab/ui/CreateLabBoardDialog";
 import { LabBoardList } from "@/features/lab/ui/LabBoardList";
+import { isLabV2Preview } from "@/features/lab/previewMode";
+import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { cn } from "@/shared/lib/cn";
 import {
   isRelayUnreachableError,
   RELAY_UNREACHABLE_SHORT,
 } from "@/shared/lib/relayError";
+import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 
-/**
- * The Lab surface: a list of shared boards, or one open board.
- *
- * Which board is open is local state rather than a route param — V1 has no
- * deep links into a board, so keeping it here avoids adding a route whose URL
- * shape we would have to keep stable before knowing what a board link should
- * look like.
- */
+const FILTERS: Array<{ label: string; value: LabBoardListFilter }> = [
+  { label: "All", value: "all" },
+  { label: "Community", value: "community" },
+  { label: "Mine", value: "mine" },
+];
+
 export function LabScreen() {
   const boardsQuery = useLabBoardsQuery();
   const createMutation = useCreateLabBoardMutation();
+  const identityQuery = useIdentityQuery();
   const [isCreateOpen, setIsCreateOpen] = React.useState(false);
+  const [listFilter, setListFilter] = React.useState<LabBoardListFilter>("all");
+  const [tagFilter, setTagFilter] = React.useState<string | null>(null);
   const navigate = useNavigate();
+  const preview = isLabV2Preview();
 
-  // Opening a board is a navigation, not local state: the id belongs in the
-  // URL so the board can be linked to and survives a reload.
+  const boards = boardsQuery.data ?? [];
+  const availableTags = React.useMemo(
+    () => availableBoardTags(boards),
+    [boards],
+  );
+  const filteredBoards = React.useMemo(
+    () =>
+      filterLabBoards({
+        boards,
+        currentPubkey: identityQuery.data?.pubkey,
+        filter: listFilter,
+        tag: tagFilter,
+      }),
+    [boards, identityQuery.data?.pubkey, listFilter, tagFilter],
+  );
+
+  React.useEffect(() => {
+    if (tagFilter && !availableTags.includes(tagFilter)) setTagFilter(null);
+  }, [availableTags, tagFilter]);
+
   const openBoard = React.useCallback(
     (boardId: string) =>
       void navigate({ to: "/lab/boards/$boardId", params: { boardId } }),
@@ -40,9 +70,12 @@ export function LabScreen() {
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
       <div className="flex items-center justify-between gap-3 border-b border-border/60 px-4 py-3">
         <div className="min-w-0">
-          <h1 className="text-sm font-semibold text-foreground">Lab</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-sm font-semibold text-foreground">Lab</h1>
+            {preview ? <Badge variant="warning">UX preview</Badge> : null}
+          </div>
           <p className="truncate text-xs text-muted-foreground">
-            Shared boards everyone here can read and edit
+            Markdown boards for people and agents
           </p>
         </div>
         <Button
@@ -56,6 +89,54 @@ export function LabScreen() {
         </Button>
       </div>
 
+      <LabPreviewBanner />
+
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/10 px-4 py-2.5">
+        <fieldset className="flex rounded-lg border border-border/60 bg-background p-0.5">
+          <legend className="sr-only">Filter boards by editing access</legend>
+          {FILTERS.map((filter) => (
+            <button
+              aria-pressed={listFilter === filter.value}
+              className={cn(
+                "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                listFilter === filter.value
+                  ? "bg-muted text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              data-testid={`lab-filter-${filter.value}`}
+              key={filter.value}
+              onClick={() => setListFilter(filter.value)}
+              type="button"
+            >
+              {filter.label}
+            </button>
+          ))}
+        </fieldset>
+
+        <label className="relative flex items-center" htmlFor="lab-tag-filter">
+          <Tag className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground" />
+          <select
+            className="h-8 min-w-40 appearance-none rounded-lg border border-border/60 bg-background py-1 pl-8 pr-7 text-xs text-foreground outline-none transition-colors focus:border-ring"
+            data-testid="lab-tag-filter"
+            id="lab-tag-filter"
+            onChange={(event) => setTagFilter(event.target.value || null)}
+            value={tagFilter ?? ""}
+          >
+            <option value="">All tags</option>
+            {availableTags.map((tag) => (
+              <option key={tag} value={tag}>
+                #{tag}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <span className="ml-auto text-xs text-muted-foreground">
+          {filteredBoards.length}{" "}
+          {filteredBoards.length === 1 ? "board" : "boards"}
+        </span>
+      </div>
+
       {boardsQuery.isLoading ? (
         <p className="p-4 text-sm text-muted-foreground">Loading boards...</p>
       ) : boardsQuery.error instanceof Error ? (
@@ -67,7 +148,13 @@ export function LabScreen() {
           </p>
         </div>
       ) : (
-        <LabBoardList boards={boardsQuery.data ?? []} onOpen={openBoard} />
+        <LabBoardList
+          activeTag={tagFilter}
+          boards={filteredBoards}
+          isFiltered={listFilter !== "all" || tagFilter !== null}
+          onOpen={openBoard}
+          onTagSelect={setTagFilter}
+        />
       )}
 
       <CreateLabBoardDialog
