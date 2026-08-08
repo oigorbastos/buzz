@@ -234,7 +234,9 @@ export async function fetchBoardHeads(): Promise<LabBoardHead[]> {
   return events
     .map(parseBoardHead)
     .filter((head): head is LabBoardHead => head !== null)
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+    .sort(
+      (a, b) => b.updatedAt - a.updatedAt || a.boardId.localeCompare(b.boardId),
+    );
 }
 
 /**

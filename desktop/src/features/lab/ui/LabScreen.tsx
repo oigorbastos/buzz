@@ -13,8 +13,14 @@ import {
 } from "@/features/lab/model";
 import { CreateLabBoardDialog } from "@/features/lab/ui/CreateLabBoardDialog";
 import { LabBoardList } from "@/features/lab/ui/LabBoardList";
+import { LabBoardViewModeToggle } from "@/features/lab/ui/LabBoardViewModeToggle";
 import { isLabV2Preview } from "@/features/lab/previewMode";
 import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
+import {
+  readStoredLabBoardViewMode,
+  type LabBoardViewMode,
+  writeStoredLabBoardViewMode,
+} from "@/features/lab/viewPreference";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { cn } from "@/shared/lib/cn";
 import {
@@ -38,6 +44,9 @@ export function LabScreen() {
   const [isCreateOpen, setIsCreateOpen] = React.useState(false);
   const [listFilter, setListFilter] = React.useState<LabBoardListFilter>("all");
   const [tagFilter, setTagFilter] = React.useState<string | null>(null);
+  const [viewMode, setViewMode] = React.useState<LabBoardViewMode>(() =>
+    readStoredLabBoardViewMode(),
+  );
   const navigate = useNavigate();
   const preview = isLabV2Preview();
 
@@ -65,6 +74,14 @@ export function LabScreen() {
     (boardId: string) =>
       void navigate({ to: "/lab/boards/$boardId", params: { boardId } }),
     [navigate],
+  );
+
+  const handleViewModeChange = React.useCallback(
+    (nextViewMode: LabBoardViewMode) => {
+      setViewMode(nextViewMode);
+      writeStoredLabBoardViewMode(nextViewMode);
+    },
+    [],
   );
 
   return (
@@ -132,10 +149,19 @@ export function LabScreen() {
           </select>
         </label>
 
-        <span className="ml-auto text-xs text-muted-foreground">
-          {filteredBoards.length}{" "}
-          {filteredBoards.length === 1 ? "board" : "boards"}
-        </span>
+        <div className="ml-auto flex items-center gap-2">
+          <span
+            className="text-xs text-muted-foreground"
+            title="Sorted by last edited"
+          >
+            {filteredBoards.length}{" "}
+            {filteredBoards.length === 1 ? "board" : "boards"}
+          </span>
+          <LabBoardViewModeToggle
+            onViewModeChange={handleViewModeChange}
+            viewMode={viewMode}
+          />
+        </div>
       </div>
 
       {boardsQuery.isLoading ? (
@@ -155,6 +181,7 @@ export function LabScreen() {
           isFiltered={listFilter !== "all" || tagFilter !== null}
           onOpen={openBoard}
           onTagSelect={setTagFilter}
+          viewMode={viewMode}
         />
       )}
 

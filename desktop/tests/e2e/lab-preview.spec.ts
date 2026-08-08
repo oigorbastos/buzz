@@ -6,6 +6,7 @@ const PREVIEW_ORIGIN =
   process.env.LAB_PREVIEW_BASE_URL ?? "http://127.0.0.1:4173";
 const PREVIEW_URL = `${PREVIEW_ORIGIN}/?resetDevState=1&preview=lab-v2#/lab`;
 const COMMUNITY_BOARD_ID = "11111111-1111-4111-8111-111111111111";
+const PRIVATE_BOARD_ID = "22222222-2222-4222-8222-222222222222";
 const READONLY_BOARD_ID = "44444444-4444-4444-8444-444444444444";
 
 test("Lab v2 preview enforces all access scopes, tags, and board ID copy", async ({
@@ -44,6 +45,44 @@ test("Lab v2 preview enforces all access scopes, tags, and board ID copy", async
   await expect(
     page.getByTestId("lab-tag-filter").locator('option[value="sigilo-alheio"]'),
   ).toHaveCount(0);
+  await expect(page.getByTestId("lab-board-list")).toHaveAttribute(
+    "data-view-mode",
+    "grid",
+  );
+  await expect(page.getByTestId("lab-view-grid")).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await expect
+    .poll(() =>
+      page
+        .locator('[data-testid^="lab-board-card-"]')
+        .evaluateAll((items) =>
+          items.map((item) =>
+            item.getAttribute("data-testid")?.replace("lab-board-card-", ""),
+          ),
+        ),
+    )
+    .toEqual([COMMUNITY_BOARD_ID, READONLY_BOARD_ID, PRIVATE_BOARD_ID]);
+
+  await page.getByTestId("lab-view-list").click();
+  await expect(page.getByTestId("lab-board-list")).toHaveAttribute(
+    "data-view-mode",
+    "list",
+  );
+  await expect(page.getByTestId("lab-view-list")).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await page.reload();
+  await expect(page.getByTestId("lab-board-list")).toHaveAttribute(
+    "data-view-mode",
+    "list",
+  );
+  await expect(page.getByTestId("lab-view-list")).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
 
   await page.getByTestId(`lab-board-copy-id-${COMMUNITY_BOARD_ID}`).click();
   await expect(page).toHaveURL(/#\/lab$/);
