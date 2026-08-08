@@ -114,10 +114,15 @@ async fn ws_query(client: &mut BuzzTestClient, name: &str, filter: Filter) -> Ve
         .subscribe(&sub_id, vec![filter])
         .await
         .expect("subscribe to Lab Board query");
-    client
+    let events = client
         .collect_until_eose(&sub_id, Duration::from_secs(10))
         .await
-        .expect("collect Lab Board query")
+        .expect("collect Lab Board query");
+    client
+        .close_subscription(&sub_id)
+        .await
+        .expect("close Lab Board query subscription");
+    events
 }
 
 fn signed_board_event(
