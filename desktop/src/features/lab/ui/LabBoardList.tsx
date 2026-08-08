@@ -1,6 +1,7 @@
-import { FlaskConical, LockKeyhole, Users } from "lucide-react";
+import { Eye, FlaskConical, LockKeyhole, Users } from "lucide-react";
 
 import type { LabBoardHead } from "@/features/lab/api";
+import { LabBoardCopyIdButton } from "@/features/lab/ui/LabBoardCopyIdButton";
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
 import { Card } from "@/shared/ui/card";
@@ -16,6 +17,14 @@ function AccessPill({ board }: { board: LabBoardHead }) {
       <Badge className="gap-1 normal-case tracking-normal" variant="info">
         <LockKeyhole className="h-3 w-3" />
         Private
+      </Badge>
+    );
+  }
+  if (board.access === "community_readonly") {
+    return (
+      <Badge className="gap-1 normal-case tracking-normal" variant="outline">
+        <Eye className="h-3 w-3" />
+        Read-only
       </Badge>
     );
   }
@@ -52,7 +61,7 @@ export function LabBoardEmptyState({
         <p className="text-sm text-muted-foreground">
           {filtered
             ? "Try another access scope or tag."
-            : "Create a community or private board."}
+            : "Create a community, read-only, or private board."}
         </p>
       </div>
     </div>
@@ -99,6 +108,11 @@ export function LabBoardList({
                 {board.title}
               </span>
               <StatusPill status={board.status} />
+              <LabBoardCopyIdButton
+                boardId={board.boardId}
+                boardTitle={board.title}
+                compact
+              />
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5 px-4 pt-2">

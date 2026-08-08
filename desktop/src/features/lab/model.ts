@@ -1,8 +1,8 @@
 export const MAX_BOARD_TAGS = 12;
 export const MAX_BOARD_TAG_CHARS = 32;
 
-export type LabBoardAccess = "community" | "private";
-export type LabBoardListFilter = "all" | "community" | "private";
+export type LabBoardAccess = "community" | "community_readonly" | "private";
+export type LabBoardListFilter = "all" | LabBoardAccess;
 
 type FilterableBoard = {
   access: LabBoardAccess;
@@ -54,7 +54,11 @@ export function canReadBoard(
   board: Pick<FilterableBoard, "access" | "ownerPubkey">,
   currentPubkey: string | null | undefined,
 ): boolean {
-  return canEditBoard(board, currentPubkey);
+  if (board.access === "community" || board.access === "community_readonly") {
+    return true;
+  }
+  if (!board.ownerPubkey || !currentPubkey) return false;
+  return board.ownerPubkey.toLowerCase() === currentPubkey.toLowerCase();
 }
 
 export function availableBoardTags(
@@ -80,6 +84,9 @@ export function filterLabBoards<T extends FilterableBoard>(input: {
     if (input.tag && !board.tags.includes(input.tag)) return false;
     if (input.filter === "community") {
       return board.access === "community";
+    }
+    if (input.filter === "community_readonly") {
+      return board.access === "community_readonly";
     }
     if (input.filter === "private") {
       return (

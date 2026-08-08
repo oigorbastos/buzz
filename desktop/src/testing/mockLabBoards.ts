@@ -28,6 +28,8 @@ export const MOCK_LAB_OWN_PRIVATE_BOARD_ID =
   "22222222-2222-4222-8222-222222222222";
 export const MOCK_LAB_OTHER_PRIVATE_BOARD_ID =
   "33333333-3333-4333-8333-333333333333";
+export const MOCK_LAB_READONLY_BOARD_ID =
+  "44444444-4444-4444-8444-444444444444";
 
 let mockLabEnabled = false;
 let mockLabEventCounter = 1;
@@ -176,6 +178,18 @@ export function resetMockLabBoards(input: {
     tags: ["produto", "roadmap"],
   });
   seedBoard({
+    boardId: MOCK_LAB_READONLY_BOARD_ID,
+    title: "Guia publicado para a comunidade",
+    summary: "Uma referência que todos podem ler sem alterar o original.",
+    content:
+      "# Guia publicado\n\nEste board está visível para toda a comunidade em modo **somente leitura**.\n\n- Todos podem encontrar e ler\n- Somente o autor e os agentes dele podem editar\n",
+    revision: 2,
+    createdAt: now - 30 * 60,
+    access: "community_readonly",
+    ownerPubkey: OTHER_OWNER_PUBKEY,
+    tags: ["leitura", "referência"],
+  });
+  seedBoard({
     boardId: MOCK_LAB_OWN_PRIVATE_BOARD_ID,
     title: "Prompts e runbooks do Igor",
     summary: "Referências pessoais que Igor e seus agentes mantêm juntos.",
@@ -234,9 +248,35 @@ function canEffectiveOwnerReadHead(
   head: RelayEvent,
   effectiveOwnerPubkey: string,
 ): boolean {
-  const access = tagValue(head, "access_scope") ?? "community";
-  if (access === "community") return true;
+  const access = boardAccess(head);
+  if (access === "community" || access === "community_readonly") return true;
   if (access !== "private") return false;
+  return ownerMatches(head, effectiveOwnerPubkey);
+}
+
+function canEffectiveOwnerEditHead(
+  head: RelayEvent,
+  effectiveOwnerPubkey: string,
+): boolean {
+  const access = boardAccess(head);
+  if (access === "community") return true;
+  if (access !== "community_readonly" && access !== "private") return false;
+  return ownerMatches(head, effectiveOwnerPubkey);
+}
+
+function boardAccess(head: RelayEvent): LabBoardAccess | null {
+  const access = tagValue(head, "access_scope") ?? "community";
+  if (
+    access === "community" ||
+    access === "community_readonly" ||
+    access === "private"
+  ) {
+    return access;
+  }
+  return null;
+}
+
+function ownerMatches(head: RelayEvent, effectiveOwnerPubkey: string): boolean {
   return (
     tagValue(head, "owner")?.toLowerCase() ===
     effectiveOwnerPubkey.toLowerCase()
@@ -310,7 +350,9 @@ export function publishMockLabRevision(
     if (
       requestedRevision !== 1 ||
       !title ||
-      (access !== "community" && access !== "private")
+      (access !== "community" &&
+        access !== "community_readonly" &&
+        access !== "private")
     ) {
       return { accepted: false, message: "invalid: malformed create_v2" };
     }
@@ -340,7 +382,14 @@ export function publishMockLabRevision(
     // existence oracle for a private or malformed board.
     return { accepted: false, message: "BOARD_NOT_FOUND" };
   }
-  const access = tagValue(currentHead, "access_scope") ?? "community";
+  if (!canEffectiveOwnerEditHead(currentHead, effectiveOwnerPubkey)) {
+    // Read-only boards deliberately reveal their existence and content, so a
+    // write gets an explicit stable error. Check this before CAS so a stale
+    // token does not accidentally change the authorization answer.
+    return { accepted: false, message: "BOARD_READ_ONLY" };
+  }
+  const access = boardAccess(currentHead);
+  if (!access) return { accepted: false, message: "BOARD_NOT_FOUND" };
   const ownerPubkey = tagValue(currentHead, "owner");
 
   const currentRevision = Number.parseInt(
@@ -367,7 +416,7 @@ export function publishMockLabRevision(
       boardId,
       content: event.content,
       createdAt: event.created_at,
-      access: access === "private" ? "private" : "community",
+      access,
       headEventId: event.id,
       ownerPubkey: ownerPubkey ?? effectiveOwnerPubkey,
       revision: requestedRevision,

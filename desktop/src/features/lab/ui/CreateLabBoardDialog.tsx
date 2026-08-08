@@ -1,4 +1,4 @@
-import { Check, LockKeyhole, Users } from "lucide-react";
+import { Check, Eye, LockKeyhole, Users } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -103,10 +103,10 @@ export function CreateLabBoardDialog({
       open={open}
     >
       <ChooserDialogContent
-        className="max-w-xl"
+        className="max-w-2xl"
         contentClassName="pt-3"
         data-testid="create-lab-board-dialog"
-        description="Choose whether the whole community or only you and your agents can access this board."
+        description="Choose who can find, read, and edit this board."
         footer={
           <div className="flex w-full items-center justify-end gap-3">
             <Button
@@ -163,13 +163,20 @@ export function CreateLabBoardDialog({
             <legend className="text-sm font-medium text-foreground">
               Board access
             </legend>
-            <div className="grid gap-2 sm:grid-cols-2">
+            <div className="grid gap-2 sm:grid-cols-3">
               <EditPolicyOption
                 checked={access === "community"}
                 description="Everyone in the community can read and edit."
                 icon={<Users className="h-4 w-4" />}
                 label="Community"
                 onSelect={() => setAccess("community")}
+              />
+              <EditPolicyOption
+                checked={access === "community_readonly"}
+                description="Everyone can find and read. Only you and your agents can edit."
+                icon={<Eye className="h-4 w-4" />}
+                label="Read-only"
+                onSelect={() => setAccess("community_readonly")}
               />
               <EditPolicyOption
                 checked={access === "private"}

@@ -19,10 +19,31 @@ describe("Lab board model", () => {
     );
   });
 
-  it("keeps community access open and private access owner-only", () => {
+  it("separates community reads from owner-family writes for read-only boards", () => {
     assert.equal(
       canEditBoard({ access: "community", ownerPubkey: null }, null),
       true,
+    );
+    assert.equal(
+      canReadBoard(
+        { access: "community_readonly", ownerPubkey: "a".repeat(64) },
+        VIEWER,
+      ),
+      true,
+    );
+    assert.equal(
+      canEditBoard(
+        { access: "community_readonly", ownerPubkey: VIEWER },
+        VIEWER.toUpperCase(),
+      ),
+      true,
+    );
+    assert.equal(
+      canEditBoard(
+        { access: "community_readonly", ownerPubkey: "a".repeat(64) },
+        VIEWER,
+      ),
+      false,
     );
     assert.equal(
       canEditBoard(
@@ -54,6 +75,12 @@ describe("Lab board model", () => {
         tags: ["produto"],
       },
       {
+        id: "published",
+        access: "community_readonly",
+        ownerPubkey: "a".repeat(64),
+        tags: ["pesquisa", "referência"],
+      },
+      {
         id: "mine",
         access: "private",
         ownerPubkey: VIEWER,
@@ -68,9 +95,20 @@ describe("Lab board model", () => {
     ];
 
     assert.deepEqual(availableBoardTags(boards, VIEWER), [
+      "pesquisa",
       "produto",
       "prompts",
+      "referência",
     ]);
+    assert.deepEqual(
+      filterLabBoards({
+        boards,
+        currentPubkey: VIEWER,
+        filter: "community_readonly",
+        tag: null,
+      }).map((board) => board.id),
+      ["published"],
+    );
     assert.deepEqual(
       filterLabBoards({
         boards,
@@ -87,7 +125,7 @@ describe("Lab board model", () => {
         filter: "all",
         tag: "pesquisa",
       }).map((board) => board.id),
-      [],
+      ["published"],
     );
   });
 });

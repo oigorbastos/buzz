@@ -3,10 +3,11 @@
  *
  * A Lab Board is a Markdown document with one immutable access scope.
  * Community boards are readable and writable by every community member;
- * private boards are visible and writable only to their canonical human owner
- * and that owner's managed agents. Concurrency is settled by the relay with
- * compare-and-swap rather than by last-write-wins: each mutation names the
- * revision it was based on (`prev`), and the relay rejects it with
+ * read-only boards are community-readable but writable only by their owner
+ * family; private boards are visible and writable only to their canonical
+ * human owner and that owner's managed agents. Concurrency is settled by the
+ * relay with compare-and-swap rather than by last-write-wins: each mutation
+ * names the revision it was based on (`prev`), and the relay rejects it with
  * `BOARD_HEAD_MISMATCH` if that is no longer the head.
  *
  * Two kinds (see `@/shared/constants/kinds` for the full contract):
@@ -91,10 +92,28 @@ function parseStatus(raw: string | null): LabBoardStatus {
   return raw === "archived" || raw === "frozen" ? raw : "active";
 }
 
-function parseAccess(raw: string | null): LabBoardAccess | null {
-  if (raw === null || raw === "community") return "community";
-  if (raw === "private") return "private";
-  return null;
+function parseAccess(
+  raw: string | null,
+  legacyEditPolicy: string | null,
+): LabBoardAccess | null {
+  let canonical: LabBoardAccess | null = null;
+  if (raw !== null) {
+    if (
+      raw !== "community" &&
+      raw !== "community_readonly" &&
+      raw !== "private"
+    ) {
+      return null;
+    }
+    canonical = raw;
+  }
+
+  const legacy: LabBoardAccess | null =
+    legacyEditPolicy === "owner_agents" ? "community_readonly" : null;
+  if (legacyEditPolicy !== null && legacy === null) return null;
+
+  if (canonical && legacy && canonical !== legacy) return null;
+  return canonical ?? legacy ?? "community";
 }
 
 function isValidPubkey(raw: string | null): raw is string {
@@ -113,16 +132,17 @@ export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
   const boardId = tagValue(event, "d");
   const headEventId = tagValue(event, "head");
   const revision = parseIntTag(event, "revision");
-  const access = parseAccess(tagValue(event, "access_scope"));
+  const access = parseAccess(
+    tagValue(event, "access_scope"),
+    tagValue(event, "edit_policy"),
+  );
   const ownerPubkey = tagValue(event, "owner");
-  const unsafeLegacyScope = tagValue(event, "edit_policy") === "owner_agents";
   if (
     !boardId ||
     !headEventId ||
     revision === null ||
     access === null ||
-    unsafeLegacyScope ||
-    (access === "private" && !isValidPubkey(ownerPubkey))
+    (access !== "community" && !isValidPubkey(ownerPubkey))
   ) {
     return null;
   }
@@ -200,7 +220,7 @@ export function eventMatchesBoard(event: RelayEvent, boardId: string): boolean {
 
 /**
  * List every board the authenticated actor may access, most recently updated
- * first. The relay must apply private-board authorization before its limit;
+ * first. The relay must apply board authorization before its limit;
  * this client-side parser is only defence in depth.
  *
  * Safe to filter server-side by kind alone: 30623 is NIP-33, and we want all
@@ -340,7 +360,7 @@ export async function createBoard(input: {
   const tags: string[][] = [
     ["d", boardId],
     // V2 deliberately fails closed on an older relay instead of letting it
-    // ignore a private scope and create a community-visible board.
+    // ignore a restricted scope and create a community-writable board.
     ["op", "create_v2"],
     ["revision", "1"],
     ["title", input.title.trim()],

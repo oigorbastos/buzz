@@ -27,6 +27,7 @@ import { Button } from "@/shared/ui/button";
 const FILTERS: Array<{ label: string; value: LabBoardListFilter }> = [
   { label: "All", value: "all" },
   { label: "Community", value: "community" },
+  { label: "Read-only", value: "community_readonly" },
   { label: "Private", value: "private" },
 ];
 

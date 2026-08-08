@@ -5,6 +5,7 @@ import {
   MOCK_LAB_COMMUNITY_BOARD_ID,
   MOCK_LAB_OTHER_PRIVATE_BOARD_ID,
   MOCK_LAB_OWN_PRIVATE_BOARD_ID,
+  MOCK_LAB_READONLY_BOARD_ID,
   publishMockLabRevision,
   queryMockLabBoards,
   resetMockLabBoards,
@@ -44,13 +45,13 @@ function revisionEvent(head, overrides = {}) {
 }
 
 describe("Lab preview mock relay", () => {
-  it("seeds three boards but exposes only community and the viewer's private board", () => {
+  it("seeds four boards but exposes community, read-only, and the viewer's private board", () => {
     resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
     const heads = queryMockLabBoards([{ kinds: [KIND_LAB_BOARD_HEAD] }]);
-    assert.equal(heads.length, 2);
+    assert.equal(heads.length, 3);
     assert.deepEqual(
       heads.map((head) => tagValue(head, "access_scope")).sort(),
-      ["community", "private"],
+      ["community", "community_readonly", "private"],
     );
     assert.equal(
       heads.some(
@@ -106,7 +107,22 @@ describe("Lab preview mock relay", () => {
     );
     assert.deepEqual(queryMockLabBoards([{ ids: [foreignHead.id] }]), []);
     assert.deepEqual(queryMockLabBoards([{ ids: [foreignHistory[0].id] }]), []);
-    assert.deepEqual(queryMockLabBoards([{ authors: [OTHER_OWNER] }]), []);
+    const foreignAuthorEvents = queryMockLabBoards([
+      { authors: [OTHER_OWNER] },
+    ]);
+    assert.ok(foreignAuthorEvents.length > 0);
+    assert.equal(
+      foreignAuthorEvents.every(
+        (event) => tagValue(event, "d") === MOCK_LAB_READONLY_BOARD_ID,
+      ),
+      true,
+    );
+    assert.equal(
+      foreignAuthorEvents.some(
+        (event) => tagValue(event, "d") === MOCK_LAB_OTHER_PRIVATE_BOARD_ID,
+      ),
+      false,
+    );
 
     const union = queryMockLabBoards([
       {
@@ -248,7 +264,7 @@ describe("Lab preview mock relay", () => {
         revisionEvent(
           {
             tags: [
-              ["d", "44444444-4444-4444-8444-444444444444"],
+              ["d", "66666666-6666-4666-8666-666666666666"],
               ["head", "1".repeat(64)],
               ["revision", "1"],
             ],
@@ -293,6 +309,135 @@ describe("Lab preview mock relay", () => {
     assert.deepEqual(
       publishMockLabRevision(communityEdit, OTHER_OWNER, OTHER_OWNER),
       { accepted: true, message: "" },
+    );
+  });
+
+  it("lets other community members read a read-only board but rejects every write before CAS", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const [head] = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_HEAD],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    const historyBefore = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_REVISION],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    assert.ok(head);
+    assert.ok(historyBefore.length > 0);
+
+    assert.deepEqual(publishMockLabRevision(revisionEvent(head), VIEWER), {
+      accepted: false,
+      message: "BOARD_READ_ONLY",
+    });
+    assert.deepEqual(
+      publishMockLabRevision(
+        revisionEvent(head, {
+          id: "6".repeat(64),
+          tags: [
+            ["d", MOCK_LAB_READONLY_BOARD_ID],
+            ["op", "update_v2"],
+            ["prev", "0".repeat(64)],
+            ["revision", "99"],
+          ],
+        }),
+        VIEWER,
+      ),
+      { accepted: false, message: "BOARD_READ_ONLY" },
+    );
+
+    const [headAfter] = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_HEAD],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    const historyAfter = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_REVISION],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    assert.equal(tagValue(headAfter, "head"), tagValue(head, "head"));
+    assert.equal(historyAfter.length, historyBefore.length);
+  });
+
+  it("lets the owner edit a read-only board without changing its immutable access metadata", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: OTHER_OWNER });
+    const [head] = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_HEAD],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    const event = revisionEvent(head, {
+      id: "d".repeat(64),
+      pubkey: OTHER_OWNER,
+    });
+    event.tags.push(["access_scope", "community"], ["owner", VIEWER]);
+    assert.deepEqual(publishMockLabRevision(event, OTHER_OWNER, OTHER_OWNER), {
+      accepted: true,
+      message: "",
+    });
+
+    const [updated] = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_HEAD],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    assert.equal(tagValue(updated, "access_scope"), "community_readonly");
+    assert.equal(tagValue(updated, "owner"), OTHER_OWNER);
+  });
+
+  it("grants the owner's managed agents read-only-board writes and rejects other agents", () => {
+    resetMockLabBoards({
+      effectiveOwnerPubkey: OTHER_OWNER,
+      enabled: true,
+      viewerPubkey: OTHER_AGENT,
+    });
+    const [head] = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_HEAD],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    assert.deepEqual(
+      publishMockLabRevision(
+        revisionEvent(head, {
+          id: "e".repeat(64),
+          pubkey: OTHER_AGENT,
+        }),
+        OTHER_AGENT,
+        OTHER_OWNER,
+      ),
+      { accepted: true, message: "" },
+    );
+
+    resetMockLabBoards({
+      effectiveOwnerPubkey: VIEWER,
+      enabled: true,
+      viewerPubkey: VIEWER_AGENT,
+    });
+    const [foreignHead] = queryMockLabBoards([
+      {
+        kinds: [KIND_LAB_BOARD_HEAD],
+        "#d": [MOCK_LAB_READONLY_BOARD_ID],
+      },
+    ]);
+    assert.deepEqual(
+      publishMockLabRevision(
+        revisionEvent(foreignHead, {
+          id: "f".repeat(64),
+          pubkey: VIEWER_AGENT,
+        }),
+        VIEWER_AGENT,
+        VIEWER,
+      ),
+      { accepted: false, message: "BOARD_READ_ONLY" },
     );
   });
 

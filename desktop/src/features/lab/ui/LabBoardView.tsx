@@ -1,5 +1,6 @@
 import {
   ArrowLeft,
+  Eye,
   History,
   Link2,
   Pencil,
@@ -26,6 +27,7 @@ import {
   useUpdateLabBoardMutation,
 } from "@/features/lab/hooks";
 import { LabBoardHistory } from "@/features/lab/ui/LabBoardHistory";
+import { LabBoardCopyIdButton } from "@/features/lab/ui/LabBoardCopyIdButton";
 import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
 import { LabTagInput } from "@/features/lab/ui/LabTagInput";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -35,6 +37,7 @@ import {
 } from "@/shared/lib/relayError";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
+import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { Markdown } from "@/shared/ui/markdown";
 import { Textarea } from "@/shared/ui/textarea";
 
@@ -217,9 +220,10 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
         <Button
           data-testid="lab-board-copy-reference"
           onClick={() => {
-            void navigator.clipboard
-              .writeText(boardReference(board.boardId))
-              .catch(() => setErrorMessage("Could not copy the reference."));
+            copyTextToClipboard(
+              boardReference(board.boardId),
+              "Board reference copied",
+            );
           }}
           size="sm"
           type="button"
@@ -228,6 +232,10 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
           <Link2 className="h-4 w-4" />
           Copy link
         </Button>
+        <LabBoardCopyIdButton
+          boardId={board.boardId}
+          boardTitle={board.title}
+        />
         <Button
           data-testid="lab-board-history-toggle"
           onClick={() => setShowHistory((value) => !value)}
@@ -257,20 +265,36 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/20 px-4 py-2 text-xs text-muted-foreground">
         {board.access === "private" ? (
           <LockKeyhole className="h-3.5 w-3.5 shrink-0" />
+        ) : board.access === "community_readonly" ? (
+          <Eye className="h-3.5 w-3.5 shrink-0" />
         ) : (
           <Users className="h-3.5 w-3.5 shrink-0" />
         )}
         <span>
           {board.access === "community"
             ? "Everyone in this community can read and edit this board."
-            : "Only you and your agents can find, read, and edit this board."}
+            : board.access === "community_readonly"
+              ? canWrite
+                ? "Everyone in this community can find and read. Only you and your agents can edit."
+                : "Everyone in this community can find and read. Only the owner and their agents can edit."
+              : "Only you and your agents can find, read, and edit this board."}
           {isFrozen ? " It is frozen, so edits are disabled." : ""}
         </span>
         <Badge
           className="normal-case tracking-normal"
-          variant={board.access === "community" ? "secondary" : "info"}
+          variant={
+            board.access === "community"
+              ? "secondary"
+              : board.access === "community_readonly"
+                ? "outline"
+                : "info"
+          }
         >
-          {board.access === "community" ? "Community" : "Private"}
+          {board.access === "community"
+            ? "Community"
+            : board.access === "community_readonly"
+              ? "Read-only"
+              : "Private"}
         </Badge>
         {board.tags.map((tag) => (
           <span
