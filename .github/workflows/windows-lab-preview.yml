@@ -139,7 +139,7 @@ jobs:
 
       - name: Start isolated real relay with V2 authorization enabled
         shell: bash
-        run: BUZZ_ALLOW_NIP_OA_AUTH=true ./scripts/start-relay-for-tests.sh --profile ci --no-build
+        run: BUZZ_ALLOW_NIP_OA_AUTH=true BUZZ_AUTO_MIGRATE=true ./scripts/start-relay-for-tests.sh --profile ci --no-build
 
       - name: Run real four-identity ACL, query, count, and subscription E2E
         shell: bash
