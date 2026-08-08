@@ -77,6 +77,7 @@ test("static preview server is host-locked, read-only, and contained", async () 
     env: {
       ...process.env,
       BUZZ_PREVIEW_ALLOWED_HOST: ALLOWED_HOST,
+      BUZZ_PREVIEW_PROXY_HOST: "localhost",
       BUZZ_PREVIEW_ROOT: distRoot,
       BUZZ_PREVIEW_SOCKET: socketPath,
     },
@@ -104,6 +105,10 @@ test("static preview server is host-locked, read-only, and contained", async () 
       true,
     );
 
+    assert.equal(
+      (await unixRequest({ host: "localhost", socketPath })).status,
+      200,
+    );
     assert.equal(
       (await unixRequest({ host: "evil.example", socketPath })).status,
       403,

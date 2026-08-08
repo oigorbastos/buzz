@@ -12,11 +12,13 @@ import { extname, resolve, sep } from "node:path";
 const configuredRoot = process.env.BUZZ_PREVIEW_ROOT;
 const socketPath = process.env.BUZZ_PREVIEW_SOCKET;
 const allowedHost = process.env.BUZZ_PREVIEW_ALLOWED_HOST;
+const proxyHost = process.env.BUZZ_PREVIEW_PROXY_HOST;
 
 if (!configuredRoot || !socketPath || !allowedHost) {
   throw new Error("Preview root, socket, and allowed host are required.");
 }
 const root = realpathSync(resolve(configuredRoot));
+const allowedHosts = new Set([allowedHost, proxyHost].filter(Boolean));
 
 const indexHtml = readFileSync(resolve(root, "index.html"), "utf8");
 const inlineScriptHashes = [
@@ -79,7 +81,7 @@ function requestHostname(request) {
 }
 
 const server = createServer((request, response) => {
-  if (requestHostname(request) !== allowedHost) {
+  if (!allowedHosts.has(requestHostname(request))) {
     respond(response, 403, "Forbidden\n");
     return;
   }

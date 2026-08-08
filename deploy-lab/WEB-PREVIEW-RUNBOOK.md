@@ -13,6 +13,8 @@ This environment is a UX review surface, not a production relay staging.
 - The service has no IP networking (`AF_UNIX` only) and listens on the Unix
   socket `/run/buzz-alis-preview/http.sock`.
 - Tailscale Serve publishes it to the tailnet over HTTPS; Funnel is not used.
+- The static server accepts only the public tailnet hostname and Tailscale
+  Serve's internal `localhost` host on that root-only Unix socket.
 - CSP blocks browser connections outside the preview origin.
 
 ## Review URL

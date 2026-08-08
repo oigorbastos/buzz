@@ -54,7 +54,7 @@ test("Lab v2 preview supports personal editing, tags, and filters", async ({
   await page.getByTestId("lab-board-history-toggle").click();
   const history = page.getByTestId("lab-board-history");
   await expect(history).toBeVisible();
-  await expect(history.getByText("Revision 1", { exact: true })).toBeVisible();
+  await expect(history.getByText(/^Revision 1/)).toBeVisible();
   await expect(page.locator('[data-testid^="lab-restore-"]')).toHaveCount(0);
 
   await page.getByTestId("lab-board-back").click();

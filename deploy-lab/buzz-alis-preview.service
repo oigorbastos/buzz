@@ -11,6 +11,7 @@ WorkingDirectory=/srv/buzz-alis-preview/current
 Environment=NODE_ENV=production
 Environment=NO_UPDATE_NOTIFIER=1
 Environment=BUZZ_PREVIEW_ALLOWED_HOST=hermes-vps.taild6a99a.ts.net
+Environment=BUZZ_PREVIEW_PROXY_HOST=localhost
 Environment=BUZZ_PREVIEW_ROOT=/srv/buzz-alis-preview/current
 Environment=BUZZ_PREVIEW_SOCKET=/run/buzz-alis-preview/http.sock
 ExecStart=/usr/local/bin/node /srv/buzz-alis-preview/server/static-preview-server.mjs
