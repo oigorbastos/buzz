@@ -150,7 +150,19 @@ jobs:
 
       - name: Start isolated real relay with V2 authorization enabled
         shell: bash
-        run: BUZZ_ALLOW_NIP_OA_AUTH=true BUZZ_AUTO_MIGRATE=true ./scripts/start-relay-for-tests.sh --profile ci --no-build
+        run: BUZZ_ALLOW_NIP_OA_AUTH=true ./scripts/start-relay-for-tests.sh --profile ci --no-build
+
+      - name: Apply isolated Lab V2 migrations after base schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          for migration in \
+            migrations/0029_lab_boards.sql \
+            migrations/0030_lab_board_d_tag_backfill.sql \
+            migrations/0031_lab_board_acl_tags.sql; do
+            docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
+              psql -U buzz -d buzz -v ON_ERROR_STOP=1 < "$migration"
+          done
 
       - name: Run real four-identity ACL, query, count, and subscription E2E
         shell: bash
