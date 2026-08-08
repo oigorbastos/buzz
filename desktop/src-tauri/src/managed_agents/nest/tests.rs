@@ -43,7 +43,9 @@ fn nest_skill_contains_safe_mention_workflow() {
 
 #[test]
 fn nest_skill_contains_lab_cas_workflow() {
-    assert!(BUZZ_CLI_SKILL_MD.contains("Lab/Quadros are shared Markdown boards, not Channel Canvas"));
+    assert!(
+        BUZZ_CLI_SKILL_MD.contains("Lab/Quadros are shared Markdown boards, not Channel Canvas")
+    );
     assert!(BUZZ_CLI_SKILL_MD.contains("use `buzz lab`; never use `buzz canvas`"));
     assert!(BUZZ_CLI_SKILL_MD.contains("buzz lab list"));
     assert!(BUZZ_CLI_SKILL_MD.contains("not an `--index` flag"));
@@ -169,12 +171,22 @@ fn ensure_nest_materializes_claude_skill_on_windows() {
     ensure_nest_at(&root).unwrap();
 
     let claude_skill = root.join(".claude/skills/buzz-cli/SKILL.md");
-    assert!(claude_skill.is_file(), "Claude must receive a real Windows skill file");
-    assert_eq!(fs::read_to_string(&claude_skill).unwrap(), BUZZ_CLI_SKILL_MD);
+    assert!(
+        claude_skill.is_file(),
+        "Claude must receive a real Windows skill file"
+    );
+    assert_eq!(
+        fs::read_to_string(&claude_skill).unwrap(),
+        BUZZ_CLI_SKILL_MD
+    );
 
     let first = fs::read(&claude_skill).unwrap();
     ensure_nest_at(&root).unwrap();
-    assert_eq!(fs::read(&claude_skill).unwrap(), first, "second install is idempotent");
+    assert_eq!(
+        fs::read(&claude_skill).unwrap(),
+        first,
+        "second install is idempotent"
+    );
 }
 
 #[cfg(windows)]
@@ -193,9 +205,20 @@ fn ensure_nest_upgrades_windows_claude_skill_from_five_to_six() {
 
     ensure_nest_at(&root).unwrap();
 
-    assert_eq!(fs::read_to_string(&canonical_dir.join("SKILL.md")).unwrap(), BUZZ_CLI_SKILL_MD);
-    assert_eq!(fs::read_to_string(&claude_dir.join("SKILL.md")).unwrap(), BUZZ_CLI_SKILL_MD);
-    assert_eq!(fs::read_to_string(claude_dir.join(".skill-version")).unwrap().trim(), "6");
+    assert_eq!(
+        fs::read_to_string(&canonical_dir.join("SKILL.md")).unwrap(),
+        BUZZ_CLI_SKILL_MD
+    );
+    assert_eq!(
+        fs::read_to_string(&claude_dir.join("SKILL.md")).unwrap(),
+        BUZZ_CLI_SKILL_MD
+    );
+    assert_eq!(
+        fs::read_to_string(claude_dir.join(".skill-version"))
+            .unwrap()
+            .trim(),
+        "6"
+    );
 }
 
 #[test]
