@@ -184,7 +184,10 @@ const CLAUDE_LAB_ALLOWED_TOOLS: &[&str] = &[
     "Bash(buzz lab get:*)",
     "Bash(buzz lab history:*)",
     "Bash(buzz lab ref:*)",
-    "Bash(buzz lab update * --base *:*)",
+    // Keep this as a simple command-prefix rule. `buzz lab update` itself
+    // requires `--base`, so the semantic CAS guard lives in clap rather than
+    // in Claude Code's fragile shell-string glob matcher.
+    "Bash(buzz lab update:*)",
 ];
 
 fn claude_code_session_options(agent_name: &str) -> Option<ClaudeCodeSessionOptions> {
@@ -4166,7 +4169,7 @@ mod tests {
                 "Bash(buzz lab get:*)",
                 "Bash(buzz lab history:*)",
                 "Bash(buzz lab ref:*)",
-                "Bash(buzz lab update * --base *:*)",
+                "Bash(buzz lab update:*)",
             ]
         );
         let serialized = serde_json::to_value(&claude).unwrap();
