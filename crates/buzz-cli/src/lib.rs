@@ -1141,19 +1141,19 @@ pub enum LabCmd {
         #[arg(long)]
         content: String,
     },
-    /// Update a Lab Board (kind:40101, op=update). CAS'd against the
-    /// current head unless `--base` overrides it.
+    /// Update a Lab Board (kind:40101, op=update) with an explicit CAS base
+    /// captured from the same `lab get` as the edited Markdown snapshot.
     #[command(
-        after_help = "Examples:\n  buzz lab update <board-id> --content - < revised.md\n  buzz lab update <board-id> --title 'New Title' --content - < revised.md"
+        after_help = "Examples:\n  buzz lab update <board-id> --base <event-id> --content - < revised.md\n  buzz lab update <board-id> --base <event-id> --title 'New Title' --content - < revised.md"
     )]
     Update {
         /// Board id (UUID), as printed by `lab create`.
         board_id: String,
-        /// Event id (hex) to CAS against. Defaults to the current head,
-        /// resolved automatically via a kind:30623 lookup. Read-modify-write
-        /// callers should pass the token captured from the same `lab get`.
+        /// Event id (hex) to CAS against, captured from the same `lab get`.
+        /// Required so a stale read can never be submitted against a newer
+        /// head silently.
         #[arg(long)]
-        base: Option<String>,
+        base: String,
         /// New title. Omit to keep the current title.
         #[arg(long)]
         title: Option<String>,
@@ -2387,6 +2387,39 @@ mod tests {
                 "unban",
                 "untimeout"
             ]
+        );
+    }
+
+    #[test]
+    fn lab_update_requires_a_real_base_flag() {
+        let board_id = "86ebaa1e-ff37-41f6-824a-5dd3da4ffa92";
+
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "lab",
+                "update",
+                board_id,
+                "--content",
+                "markdown containing --base fake is still just content",
+            ])
+            .is_err(),
+            "the text --base inside Markdown must not satisfy the CAS argument"
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "lab",
+                "update",
+                board_id,
+                "--base",
+                "40bfd91f25d30f5cedab896deab1449c6bea39c67202449b9987c6f3ad3a05e2",
+                "--content",
+                "-",
+            ])
+            .is_ok(),
+            "an explicit base captured by lab get must parse"
         );
     }
 

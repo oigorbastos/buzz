@@ -1,8 +1,8 @@
-name: Windows Lab Preview
+name: Windows Lab Sidecar Hotfix
 
-# Push-only preview for the immutable Lab/Quadros canary branch. This workflow
-# intentionally creates only short-lived Actions artifacts: no tag, release,
-# updater metadata, or signing is involved.
+# Rebuild only the two Windows executables changed by the Lab agent-edit fix.
+# The unchanged desktop and sidecars are reused from the already-audited
+# portable test.8 package when this patch artifact is assembled locally.
 on:
   push:
     branches:
@@ -13,15 +13,15 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows Lab preview
+    name: Build Windows Lab ACP and CLI
     if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/build/lab-windows-canary'
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
       TARGET: x86_64-pc-windows-msvc
-      LAB_BASE_SHA: 3d66baf4e65f840d7168076f64ebba7e3b35fdd3
+      LAB_BASE_SHA: 9b6e65b1d5d050e16edbbcbfc02649327367f66e
       SOURCE_SHA: ${{ github.sha }}
       BUILD_WORKFLOW_SHA: ${{ github.sha }}
 
@@ -31,19 +31,23 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_REPOSITORY" == "oigorbastos/buzz" ]] || {
-            echo "::error::This preview is restricted to oigorbastos/buzz" >&2
+            echo "::error::This build is restricted to oigorbastos/buzz" >&2
             exit 1
           }
           [[ "$GITHUB_REF" == "refs/heads/build/lab-windows-canary" ]] || {
-            echo "::error::This preview is restricted to build/lab-windows-canary" >&2
+            echo "::error::This build is restricted to build/lab-windows-canary" >&2
+            exit 1
+          }
+          [[ "$LAB_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::LAB_BASE_SHA must be a complete feature commit SHA" >&2
             exit 1
           }
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "::error::SOURCE_SHA must be a complete 40-character commit SHA" >&2
+            echo "::error::SOURCE_SHA must be a complete commit SHA" >&2
             exit 1
           }
           [[ "$BUILD_WORKFLOW_SHA" == "$SOURCE_SHA" ]] || {
-            echo "::error::BUILD_WORKFLOW_SHA and SOURCE_SHA differ" >&2
+            echo "::error::Workflow SHA and source SHA differ" >&2
             exit 1
           }
 
@@ -53,21 +57,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify immutable lab source
+      - name: Verify immutable Lab source
         shell: bash
         run: |
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || {
-            echo "::error::Checked out commit does not equal SOURCE_SHA" >&2
+            echo "::error::Checked-out commit does not equal SOURCE_SHA" >&2
             exit 1
           }
-          git merge-base --is-ancestor "$LAB_BASE_SHA" HEAD || {
-            echo "::error::Lab source must descend from LAB_BASE_SHA" >&2
+          git merge-base --is-ancestor "$LAB_BASE_SHA" "$SOURCE_SHA" || {
+            echo "::error::Canary source must descend from LAB_BASE_SHA" >&2
             exit 1
           }
           mapfile -t changed_files < <(git diff --name-only "$LAB_BASE_SHA" "$SOURCE_SHA")
           [[ "${#changed_files[@]}" -eq 1 && "${changed_files[0]}" == ".github/workflows/windows-lab-preview.yml" ]] || {
-            echo "::error::Canary branch must change only the preview workflow" >&2
+            echo "::error::Relative to LAB_BASE_SHA, canary may change only the preview workflow" >&2
             printf '%s\n' "${changed_files[@]}" >&2
             exit 1
           }
@@ -87,29 +91,11 @@ jobs:
             exit 1
           }
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          node-version: 24.14.1
-
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
-        with:
-          version: 11.4.0
-
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        shell: bash
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: pnpm-${{ runner.os }}-
-
-      - name: Install desktop dependencies
-        shell: bash
-        run: pnpm install --frozen-lockfile
+          workspaces: .
+          key: windows-lab-sidecars
+          save-if: ${{ github.ref == 'refs/heads/build/lab-windows-canary' }}
 
       - name: Rust format check
         shell: bash
@@ -117,132 +103,57 @@ jobs:
 
       - name: Buzz ACP tests
         shell: bash
-        run: cargo test -p buzz-acp
-
-      - name: Desktop check
-        shell: bash
-        run: pnpm -C desktop check
-
-      - name: Desktop typecheck
-        shell: bash
-        run: pnpm -C desktop typecheck
-
-      - name: Desktop test
-        shell: bash
-        run: pnpm -C desktop test
+        run: cargo test --target "$TARGET" -p buzz-acp
 
       - name: Buzz CLI Lab tests
         shell: bash
-        run: cargo test -p buzz-cli lab --lib
+        run: cargo test --target "$TARGET" -p buzz-cli lab --lib
 
-      - name: Derive canary version
-        id: version
+      - name: Build only ACP and CLI Windows executables
         shell: bash
         run: |
           set -euo pipefail
-          BASE_VERSION=$(node -p "require('./desktop/package.json').version")
-          if ! [[ "$BASE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Desktop version '$BASE_VERSION' is not semver"
-            exit 1
-          fi
-          VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))-test.${GITHUB_RUN_NUMBER}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building canary version $VERSION from $SOURCE_SHA"
+          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-cli
+          test -f "target/${TARGET}/release/buzz-acp.exe"
+          test -f "target/${TARGET}/release/buzz.exe"
 
-      - name: Patch canary version
+      - name: Smoke required Lab CAS base in the real CLI
         shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
-          cd src-tauri && cargo update --workspace
-
-      - name: Generate unsigned, non-updating bundle config
-        shell: bash
-        run: |
-          cat > desktop/src-tauri/tauri.canary.conf.json <<'JSON'
-          {
-            "bundle": {
-              "createUpdaterArtifacts": false
-            },
-            "plugins": {
-              "updater": {
-                "endpoints": []
-              }
-            }
-          }
-          JSON
-
-      - name: Build sidecars
-        shell: bash
-        run: |
-          cargo build --release --target "$TARGET" \
-            -p buzz-acp \
-            -p buzz-agent \
-            -p buzz-dev-mcp \
-            -p git-credential-nostr \
-            -p buzz-cli
-          ./scripts/bundle-sidecars.sh "$TARGET"
-
-      - name: Managed-agent Nest tests
-        shell: bash
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
-
-      - name: Build unsigned Windows NSIS
-        shell: bash
-        run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --no-sign --config src-tauri/tauri.canary.conf.json
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-
-      - name: Package portable ZIP and second-stage NSIS
-        id: artifacts
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          TARGET_ROOT="desktop/src-tauri/target/${TARGET}/release"
-          BUNDLE_DIR="${TARGET_ROOT}/bundle"
-          APP_EXE=$(find "$TARGET_ROOT" -maxdepth 1 -type f \( -iname 'buzz-desktop.exe' -o -iname 'Buzz.exe' \) | head -1)
-          [[ -n "$APP_EXE" && -f "$APP_EXE" ]] || {
-            echo "::error::Tauri desktop executable not found in $TARGET_ROOT" >&2
+          CLI="target/${TARGET}/release/buzz.exe"
+          "$CLI" lab update --help > "$RUNNER_TEMP/lab-update-help.txt"
+          grep -F -- '--base <BASE>' "$RUNNER_TEMP/lab-update-help.txt"
+
+          set +e
+          missing_base_output=$("$CLI" lab update \
+            86ebaa1e-ff37-41f6-824a-5dd3da4ffa92 \
+            --content 'markdown containing --base fake is still only content' 2>&1)
+          missing_base_status=$?
+          set -e
+          printf '%s\n' "$missing_base_output"
+          [[ "$missing_base_status" -ne 0 ]] || {
+            echo "::error::lab update accepted an invocation without a real --base flag" >&2
+            exit 1
+          }
+          grep -F -- '--base <BASE>' <<< "$missing_base_output" || {
+            echo "::error::failure was not the expected missing --base parse error" >&2
             exit 1
           }
 
-          for sidecar in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
-            [[ -f "target/${TARGET}/release/${sidecar}.exe" ]] || {
-              echo "::error::Missing Windows sidecar: ${sidecar}.exe" >&2
-              exit 1
-            }
-          done
-
-          NSIS_SOURCE=$(find "$BUNDLE_DIR/nsis" -name '*.exe' -type f | head -1)
-          [[ -n "$NSIS_SOURCE" && -f "$NSIS_SOURCE" ]] || {
-            echo "::error::NSIS installer not found in $BUNDLE_DIR/nsis" >&2
-            exit 1
-          }
-
-          PORTABLE_ROOT="${RUNNER_TEMP}/buzz-lab-portable"
-          NSIS_ROOT="${RUNNER_TEMP}/buzz-lab-nsis"
-          PORTABLE_RELEASE_ROOT="${RUNNER_TEMP}/buzz-lab-portable-release"
-          NSIS_RELEASE_ROOT="${RUNNER_TEMP}/buzz-lab-nsis-release"
-          rm -rf "$PORTABLE_ROOT" "$NSIS_ROOT" "$PORTABLE_RELEASE_ROOT" "$NSIS_RELEASE_ROOT"
-          mkdir -p "$PORTABLE_ROOT" "$NSIS_ROOT" "$PORTABLE_RELEASE_ROOT" "$NSIS_RELEASE_ROOT"
-
-          cp "$APP_EXE" "$PORTABLE_ROOT/buzz-desktop.exe"
-          cp "target/${TARGET}/release/buzz-acp.exe" "$PORTABLE_ROOT/buzz-acp.exe"
-          cp "target/${TARGET}/release/buzz-agent.exe" "$PORTABLE_ROOT/buzz-agent.exe"
-          cp "target/${TARGET}/release/buzz-dev-mcp.exe" "$PORTABLE_ROOT/buzz-dev-mcp.exe"
-          cp "target/${TARGET}/release/git-credential-nostr.exe" "$PORTABLE_ROOT/git-credential-nostr.exe"
-          cp "target/${TARGET}/release/buzz.exe" "$PORTABLE_ROOT/buzz.exe"
-
-          NSIS_NAME="buzz-lab-windows-nsis-${VERSION}-${TARGET}-unsigned.exe"
-          cp "$NSIS_SOURCE" "$NSIS_ROOT/$NSIS_NAME"
+      - name: Package sidecar patch with provenance and hashes
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_ROOT="$RUNNER_TEMP/buzz-lab-windows-sidecar-hotfix"
+          rm -rf "$ARTIFACT_ROOT"
+          mkdir -p "$ARTIFACT_ROOT"
+          cp "target/${TARGET}/release/buzz-acp.exe" "$ARTIFACT_ROOT/buzz-acp.exe"
+          cp "target/${TARGET}/release/buzz.exe" "$ARTIFACT_ROOT/buzz.exe"
 
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          write_manifest() {
-            local destination="$1"
-            cat > "$destination" <<EOF
+          cat > "$ARTIFACT_ROOT/BUILD-MANIFEST.txt" <<EOF
           LAB_BASE_SHA=$LAB_BASE_SHA
           SOURCE_SHA=$SOURCE_SHA
           BUILD_WORKFLOW_SHA=$BUILD_WORKFLOW_SHA
@@ -251,129 +162,32 @@ jobs:
           GITHUB_REF=$GITHUB_REF
           GITHUB_RUN_ID=$GITHUB_RUN_ID
           GITHUB_RUN_URL=$RUN_URL
-          VERSION=$VERSION
           TARGET=$TARGET
-          RUNNER_OS=$RUNNER_OS
           RUST=1.95.0
-          NODE=24.14.1
-          PNPM=11.4.0
-          DESKTOP_CHECK=pnpm -C desktop check
-          DESKTOP_TYPECHECK=pnpm -C desktop typecheck
-          DESKTOP_TEST=pnpm -C desktop test
           CARGO_FMT=cargo fmt --all -- --check
-          ACP_TEST=cargo test -p buzz-acp
-          NEST_TEST=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
-          CLI_LAB_TEST=cargo test -p buzz-cli lab --lib
-          TAURI_BUNDLE=nsis
-          TAURI_SIGNING=disabled
-          CREATE_UPDATER_ARTIFACTS=false
+          ACP_TEST=cargo test --target $TARGET -p buzz-acp
+          CLI_LAB_TEST=cargo test --target $TARGET -p buzz-cli lab --lib
+          RELEASE_BUILD=cargo build --release --target $TARGET -p buzz-acp -p buzz-cli
+          CLI_BASE_FLAG=required-and-smoke-tested
+          INCLUDED_FILES=buzz-acp.exe,buzz.exe
           ARTIFACT_RETENTION_DAYS=7
-          PORTABLE_CLI=buzz.exe
           EOF
-          }
-
-          write_manifest "$PORTABLE_ROOT/BUILD-MANIFEST.txt"
-          write_manifest "$NSIS_ROOT/BUILD-MANIFEST.txt"
 
           (
-            cd "$PORTABLE_ROOT"
-            sha256sum \
-              buzz-desktop.exe \
-              buzz-acp.exe \
-              buzz-agent.exe \
-              buzz-dev-mcp.exe \
-              git-credential-nostr.exe \
-              buzz.exe
-          ) > "$PORTABLE_ROOT/SHA256SUMS.txt"
-          (
-            cd "$NSIS_ROOT"
-            sha256sum "$NSIS_NAME"
-          ) > "$NSIS_ROOT/SHA256SUMS.txt"
+            cd "$ARTIFACT_ROOT"
+            sha256sum buzz-acp.exe buzz.exe BUILD-MANIFEST.txt > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+          ls -lh "$ARTIFACT_ROOT"
+          cat "$ARTIFACT_ROOT/BUILD-MANIFEST.txt"
+          cat "$ARTIFACT_ROOT/SHA256SUMS.txt"
+          echo "root=$ARTIFACT_ROOT" >> "$GITHUB_OUTPUT"
 
-          PORTABLE_ZIP="${PORTABLE_RELEASE_ROOT}/buzz-lab-windows-portable-${VERSION}-${TARGET}.zip"
-          (cd "$PORTABLE_ROOT" && 7z a -tzip -mx=9 "$PORTABLE_ZIP" ./* >/dev/null)
-          cp "$PORTABLE_ROOT/BUILD-MANIFEST.txt" "$PORTABLE_RELEASE_ROOT/BUILD-MANIFEST.txt"
-          (
-            cd "$PORTABLE_RELEASE_ROOT"
-            sha256sum "$(basename "$PORTABLE_ZIP")" BUILD-MANIFEST.txt
-          ) > "$PORTABLE_RELEASE_ROOT/SHA256SUMS.txt"
-
-          cp "$NSIS_ROOT/$NSIS_NAME" "$NSIS_RELEASE_ROOT/"
-          cp "$NSIS_ROOT/BUILD-MANIFEST.txt" "$NSIS_RELEASE_ROOT/BUILD-MANIFEST.txt"
-          (
-            cd "$NSIS_RELEASE_ROOT"
-            sha256sum "$NSIS_NAME" BUILD-MANIFEST.txt
-          ) > "$NSIS_RELEASE_ROOT/SHA256SUMS.txt"
-
-          echo "portable_zip=$PORTABLE_ZIP" >> "$GITHUB_OUTPUT"
-          echo "portable_manifest=$PORTABLE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
-          echo "portable_sums=$PORTABLE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
-          echo "portable_root=$PORTABLE_ROOT" >> "$GITHUB_OUTPUT"
-          echo "nsis_exe=$NSIS_ROOT/$NSIS_NAME" >> "$GITHUB_OUTPUT"
-          echo "nsis_release_exe=$NSIS_RELEASE_ROOT/$NSIS_NAME" >> "$GITHUB_OUTPUT"
-          echo "nsis_manifest=$NSIS_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
-          echo "nsis_sums=$NSIS_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
-          echo "portable_release_manifest=$PORTABLE_RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
-          echo "portable_release_sums=$PORTABLE_RELEASE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
-          echo "nsis_release_manifest=$NSIS_RELEASE_ROOT/BUILD-MANIFEST.txt" >> "$GITHUB_OUTPUT"
-          echo "nsis_release_sums=$NSIS_RELEASE_ROOT/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
-
-      - name: Smoke test portable CLI
-        shell: bash
-        env:
-          PORTABLE_ROOT: ${{ steps.artifacts.outputs.portable_root }}
-        run: |
-          set -euo pipefail
-          cd "$PORTABLE_ROOT"
-          ./buzz.exe lab --help
-          ./buzz.exe lab get --help
-          ./buzz.exe lab update --help
-
-      - name: Print artifact names, sizes, and SHA-256
-        shell: bash
-        env:
-          PORTABLE_ZIP: ${{ steps.artifacts.outputs.portable_zip }}
-          NSIS_EXE: ${{ steps.artifacts.outputs.nsis_release_exe }}
-          PORTABLE_RELEASE_MANIFEST: ${{ steps.artifacts.outputs.portable_release_manifest }}
-          PORTABLE_RELEASE_SUMS: ${{ steps.artifacts.outputs.portable_release_sums }}
-          NSIS_RELEASE_MANIFEST: ${{ steps.artifacts.outputs.nsis_release_manifest }}
-          NSIS_RELEASE_SUMS: ${{ steps.artifacts.outputs.nsis_release_sums }}
-        run: |
-          set -euo pipefail
-          for file in "$PORTABLE_ZIP" "$NSIS_EXE" "$PORTABLE_RELEASE_MANIFEST" "$PORTABLE_RELEASE_SUMS" "$NSIS_RELEASE_MANIFEST" "$NSIS_RELEASE_SUMS"; do
-            stat -c '%n %s bytes' "$file"
-            sha256sum "$file"
-          done
-          cat "$PORTABLE_RELEASE_MANIFEST"
-          cat "$PORTABLE_RELEASE_SUMS"
-          cat "$NSIS_RELEASE_MANIFEST"
-          cat "$NSIS_RELEASE_SUMS"
-
-      - name: Upload portable ZIP (7 days)
+      - name: Upload ACP and CLI patch (7 days)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-lab-windows-portable-${{ github.sha }}
-          path: |
-            ${{ steps.artifacts.outputs.portable_zip }}
-            ${{ steps.artifacts.outputs.portable_release_manifest }}
-            ${{ steps.artifacts.outputs.portable_release_sums }}
+          name: buzz-lab-windows-sidecar-hotfix-${{ github.sha }}
+          path: ${{ steps.package.outputs.root }}
           if-no-files-found: error
           retention-days: 7
-
-      - name: Upload NSIS (second stage, 7 days)
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: buzz-lab-windows-nsis-second-stage-${{ github.sha }}
-          path: |
-            ${{ steps.artifacts.outputs.nsis_release_exe }}
-            ${{ steps.artifacts.outputs.nsis_release_manifest }}
-            ${{ steps.artifacts.outputs.nsis_release_sums }}
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Save pnpm store cache
-        if: success()
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          compression-level: 0

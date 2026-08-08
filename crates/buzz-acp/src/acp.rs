@@ -3663,7 +3663,7 @@ mod tests {
             "Bash(buzz lab get:*)".to_owned(),
             "Bash(buzz lab history:*)".to_owned(),
             "Bash(buzz lab ref:*)".to_owned(),
-            "Bash(buzz lab update * --base *:*)".to_owned(),
+            "Bash(buzz lab update:*)".to_owned(),
         ];
         let resp = client
             .session_new_full_with_claude_options(
@@ -3689,7 +3689,7 @@ mod tests {
                 "Bash(buzz lab get:*)",
                 "Bash(buzz lab history:*)",
                 "Bash(buzz lab ref:*)",
-                "Bash(buzz lab update * --base *:*)"
+                "Bash(buzz lab update:*)"
             ])
         );
     }

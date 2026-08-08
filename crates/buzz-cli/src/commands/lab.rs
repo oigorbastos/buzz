@@ -24,9 +24,9 @@
 //!   `board_id` (UUID v4 — matches `channels create`/`workflows create`'s
 //!   convention; the workspace `uuid` crate here only has the `v4` feature
 //!   enabled, so v7 was never an option), publishes op=create/revision=1.
-//! - `lab update <board-id> [--base <event-id>] [--title T] [--summary S]
-//!   --content -` — CAS'd against the current head unless `--base`
-//!   supplies the token captured by the caller. `--title`/
+//! - `lab update <board-id> --base <event-id> [--title T] [--summary S]
+//!   --content -` — CAS'd against the explicit token captured by the caller
+//!   from the same `lab get`. `--title`/
 //!   `--summary` omitted means "the relay carries the current value
 //!   forward"; there is no explicit-clear form (unlike `notes set`) because
 //!   the Lab Board wire protocol has no empty-tag-means-clear convention —
@@ -380,7 +380,7 @@ fn build_restore_event(
 /// `BOARD_HEAD_MISMATCH` hint text in [`friendly_lab_error`].
 enum LabWriteOp {
     Create,
-    Update { explicit_base: bool },
+    Update,
     Restore { explicit_base: bool },
 }
 
@@ -413,20 +413,15 @@ fn friendly_lab_error(e: CliError, op: LabWriteOp) -> CliError {
                     "the generated board id collided with an existing board — vanishingly \
                      unlikely with a fresh UUID; just re-run the command to mint a new one"
                 }
-                LabWriteOp::Update {
-                    explicit_base: true,
-                }
+                LabWriteOp::Update
                 | LabWriteOp::Restore {
                     explicit_base: true,
                 } => {
                     "the --base event id you passed is not this board's current head (or never \
-                     was) — drop --base to let the CLI resolve the latest head automatically, \
-                     or check `buzz lab history` for the right one"
+                     was) — run `buzz lab get`, reapply the intended edit to that complete \
+                     snapshot, and retry with its new `base`"
                 }
-                LabWriteOp::Update {
-                    explicit_base: false,
-                }
-                | LabWriteOp::Restore {
+                LabWriteOp::Restore {
                     explicit_base: false,
                 } => {
                     "someone else wrote to this board between your read and this write — \
@@ -542,7 +537,7 @@ pub async fn cmd_create(
 pub async fn cmd_update(
     client: &BuzzClient,
     board_id_raw: &str,
-    base: Option<&str>,
+    base: &str,
     title: Option<&str>,
     summary: Option<&str>,
     content: &str,
@@ -556,24 +551,17 @@ pub async fn cmd_update(
         ))
     })?;
 
-    let prev = match base {
-        Some(raw) => parse_event_id(raw)?,
-        None => head.head_event_id,
-    };
+    let prev = parse_event_id(base)?;
     let next_revision = head.revision + 1;
 
     let builder = build_update_event(board_id, prev, next_revision, title, summary, &body)?;
     let event = client.sign_event(builder)?;
     let event_id = event.id;
 
-    let raw = client.submit_event(event).await.map_err(|e| {
-        friendly_lab_error(
-            e,
-            LabWriteOp::Update {
-                explicit_base: base.is_some(),
-            },
-        )
-    })?;
+    let raw = client
+        .submit_event(event)
+        .await
+        .map_err(|e| friendly_lab_error(e, LabWriteOp::Update))?;
     let (accepted, message) = parse_accept(&raw)?;
     if !accepted {
         return Err(CliError::Other(format!("relay rejected event: {message}")));
@@ -827,7 +815,7 @@ pub async fn dispatch(cmd: crate::LabCmd, client: &BuzzClient) -> Result<(), Cli
             cmd_update(
                 client,
                 &board_id,
-                base.as_deref(),
+                &base,
                 title.as_deref(),
                 summary.as_deref(),
                 &content,
@@ -1144,13 +1132,8 @@ mod tests {
             status: 400,
             body: "invalid: BOARD_HEAD_MISMATCH — submitted prev ... does not match".into(),
         };
-        let mapped = friendly_lab_error(
-            e,
-            LabWriteOp::Update {
-                explicit_base: false,
-            },
-        );
-        assert!(matches!(mapped, CliError::Conflict(m) if m.contains("someone else wrote")));
+        let mapped = friendly_lab_error(e, LabWriteOp::Update);
+        assert!(matches!(mapped, CliError::Conflict(m) if m.contains("run `buzz lab get`")));
     }
 
     #[test]
@@ -1159,12 +1142,7 @@ mod tests {
             status: 400,
             body: "invalid: BOARD_HEAD_MISMATCH — mismatch".into(),
         };
-        let mapped = friendly_lab_error(
-            e,
-            LabWriteOp::Update {
-                explicit_base: true,
-            },
-        );
+        let mapped = friendly_lab_error(e, LabWriteOp::Update);
         assert!(
             matches!(mapped, CliError::Conflict(m) if m.contains("--base event id you passed"))
         );
@@ -1198,12 +1176,7 @@ mod tests {
             status: 400,
             body: "restricted: lab board is frozen and cannot be edited".into(),
         };
-        let mapped = friendly_lab_error(
-            e,
-            LabWriteOp::Update {
-                explicit_base: false,
-            },
-        );
+        let mapped = friendly_lab_error(e, LabWriteOp::Update);
         assert!(
             matches!(mapped, CliError::Relay { body, .. } if body == "lab board is frozen and cannot be edited")
         );
