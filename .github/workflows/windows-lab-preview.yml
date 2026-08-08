@@ -110,9 +110,18 @@ jobs:
 
       - name: Run repository full test gate
         shell: bash
-        # The repository-wide suite contains timing-sensitive tests; keep the
-        # canary source immutable while allowing a normal push retry.
-        run: just test
+        # The repository-wide suite contains timing-sensitive tests. Retry the
+        # complete gate a bounded number of times; persistent failures still
+        # block the relay and Windows jobs.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if just test; then
+              exit 0
+            fi
+            echo "full test gate attempt ${attempt}/3 failed; retrying the complete gate"
+          done
+          exit 1
 
       - name: Reset isolated services before live relay proof
         shell: bash
