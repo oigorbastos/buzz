@@ -144,6 +144,7 @@ jobs:
       - name: Run real four-identity ACL, query, count, and subscription E2E
         shell: bash
         env:
+          BUZZ_ALLOW_NIP_OA_AUTH: true
           DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
           RELAY_URL: ws://localhost:3000
         run: cargo test -p buzz-test-client --test e2e_lab_acl -- --ignored --nocapture
