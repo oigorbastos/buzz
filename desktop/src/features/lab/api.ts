@@ -317,7 +317,8 @@ export function validateBoardInput(input: {
   }
   if (
     input.tags !== undefined &&
-    normalizeBoardTags(input.tags).length !== input.tags.length
+    (normalizeBoardTags(input.tags).length !== input.tags.length ||
+      normalizeBoardTags(input.tags).some((tag) => [...tag].length > 32))
   ) {
     return "Tags must be unique, non-empty, and within the supported limits.";
   }

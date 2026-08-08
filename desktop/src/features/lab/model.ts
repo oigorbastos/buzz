@@ -12,7 +12,6 @@ type FilterableBoard = {
 
 function normalizeTag(raw: string): string {
   return [...raw.normalize("NFKC")]
-    .slice(0, MAX_BOARD_TAG_CHARS)
     .join("")
     .trim()
     .toLocaleLowerCase("pt-BR")
@@ -44,29 +43,36 @@ export function parseBoardTagsText(raw: string): string[] {
 export function canEditBoard(
   board: Pick<FilterableBoard, "access" | "ownerPubkey">,
   currentPubkey: string | null | undefined,
+  currentOwnerPubkey?: string | null,
 ): boolean {
   if (board.access === "community") return true;
   if (!board.ownerPubkey || !currentPubkey) return false;
-  return board.ownerPubkey.toLowerCase() === currentPubkey.toLowerCase();
+  return [currentPubkey, currentOwnerPubkey]
+    .filter((value): value is string => Boolean(value))
+    .some((value) => board.ownerPubkey?.toLowerCase() === value.toLowerCase());
 }
 
 export function canReadBoard(
   board: Pick<FilterableBoard, "access" | "ownerPubkey">,
   currentPubkey: string | null | undefined,
+  currentOwnerPubkey?: string | null,
 ): boolean {
   if (board.access === "community" || board.access === "community_readonly") {
     return true;
   }
   if (!board.ownerPubkey || !currentPubkey) return false;
-  return board.ownerPubkey.toLowerCase() === currentPubkey.toLowerCase();
+  return [currentPubkey, currentOwnerPubkey]
+    .filter((value): value is string => Boolean(value))
+    .some((value) => board.ownerPubkey?.toLowerCase() === value.toLowerCase());
 }
 
 export function availableBoardTags(
   boards: readonly FilterableBoard[],
   currentPubkey: string | null | undefined,
+  currentOwnerPubkey?: string | null,
 ): string[] {
   const readableBoards = boards.filter((board) =>
-    canReadBoard(board, currentPubkey),
+    canReadBoard(board, currentPubkey, currentOwnerPubkey),
   );
   return [...new Set(readableBoards.flatMap((board) => board.tags))].sort(
     (left, right) => left.localeCompare(right, "pt-BR"),
@@ -78,9 +84,11 @@ export function filterLabBoards<T extends FilterableBoard>(input: {
   filter: LabBoardListFilter;
   tag: string | null;
   currentPubkey: string | null | undefined;
+  currentOwnerPubkey?: string | null;
 }): T[] {
   return input.boards.filter((board) => {
-    if (!canReadBoard(board, input.currentPubkey)) return false;
+    if (!canReadBoard(board, input.currentPubkey, input.currentOwnerPubkey))
+      return false;
     if (input.tag && !board.tags.includes(input.tag)) return false;
     if (input.filter === "community") {
       return board.access === "community";
@@ -93,7 +101,11 @@ export function filterLabBoards<T extends FilterableBoard>(input: {
         board.access === "private" &&
         Boolean(board.ownerPubkey) &&
         Boolean(input.currentPubkey) &&
-        board.ownerPubkey?.toLowerCase() === input.currentPubkey?.toLowerCase()
+        [input.currentPubkey, input.currentOwnerPubkey]
+          .filter((value): value is string => Boolean(value))
+          .some(
+            (value) => board.ownerPubkey?.toLowerCase() === value.toLowerCase(),
+          )
       );
     }
     return true;

@@ -31,6 +31,7 @@ import { LabBoardCopyIdButton } from "@/features/lab/ui/LabBoardCopyIdButton";
 import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
 import { LabTagInput } from "@/features/lab/ui/LabTagInput";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useUserProfileQuery } from "@/features/profile/hooks";
 import {
   isRelayUnreachableError,
   RELAY_UNREACHABLE_SHORT,
@@ -52,6 +53,7 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
   const updateMutation = useUpdateLabBoardMutation(boardId);
   const restoreMutation = useRestoreLabBoardMutation(boardId);
   const identityQuery = useIdentityQuery();
+  const currentProfileQuery = useUserProfileQuery(identityQuery.data?.pubkey);
 
   const [isEditing, setIsEditing] = React.useState(false);
   // Poll only while editing — that is the only window where another writer's
@@ -170,7 +172,14 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
     );
   }
 
-  if (!board || !canReadBoard(board, identityQuery.data?.pubkey)) {
+  if (
+    !board ||
+    !canReadBoard(
+      board,
+      identityQuery.data?.pubkey,
+      currentProfileQuery.data?.ownerPubkey,
+    )
+  ) {
     return (
       <div className="p-4">
         <Button onClick={onBack} size="sm" type="button" variant="outline">
@@ -185,7 +194,11 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
   }
 
   const isFrozen = board.status === "frozen";
-  const canWrite = canEditBoard(board, identityQuery.data?.pubkey);
+  const canWrite = canEditBoard(
+    board,
+    identityQuery.data?.pubkey,
+    currentProfileQuery.data?.ownerPubkey,
+  );
   const isSaving = updateMutation.isPending;
   // The polled head has moved past the revision this draft was started from,
   // so saving will (correctly) be refused. Say so now rather than letting the

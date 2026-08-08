@@ -1140,6 +1140,12 @@ pub enum LabCmd {
         /// Markdown body (full document, not a diff). Use '-' to read from stdin.
         #[arg(long)]
         content: String,
+        /// Read/write scope: community, community_readonly, or private.
+        #[arg(long, default_value = "community")]
+        access: String,
+        /// Canonical topic tag; repeat to replace the board's full tag set.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// Update a Lab Board (kind:40101, op=update) with an explicit CAS base
     /// captured from the same `lab get` as the edited Markdown snapshot.
@@ -1163,6 +1169,12 @@ pub enum LabCmd {
         /// Markdown body (full document, not a diff). Use '-' to read from stdin.
         #[arg(long)]
         content: String,
+        /// Replace the full topic-tag set; repeat to provide multiple tags.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Clear all topic tags. Mutually exclusive with --tag.
+        #[arg(long)]
+        clear_tags: bool,
     },
     /// List the community's Lab Boards.
     List {

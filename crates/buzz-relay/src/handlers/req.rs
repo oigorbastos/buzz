@@ -45,7 +45,7 @@ const _: () = assert!(FILTER_QUERY_CONCURRENCY >= 2 && FILTER_QUERY_CONCURRENCY 
 /// Lab Boards carry their own read scope, so a request that touches them has
 /// to satisfy it. A filter with no `kinds` at all matches everything, Lab
 /// kinds included, and therefore counts.
-fn filters_request_lab_kinds(filters: &[Filter]) -> bool {
+pub(crate) fn filters_request_lab_kinds(filters: &[Filter]) -> bool {
     filters.iter().any(|filter| match &filter.kinds {
         Some(kinds) if !kinds.is_empty() => kinds.iter().any(|kind| {
             let value = u32::from(kind.as_u16());
@@ -53,6 +53,18 @@ fn filters_request_lab_kinds(filters: &[Filter]) -> bool {
         }),
         _ => true,
     })
+}
+
+pub(crate) fn filter_can_match_lab_kinds(filter: &Filter) -> bool {
+    match &filter.kinds {
+        Some(kinds) if !kinds.is_empty() => kinds.iter().any(|kind| {
+            matches!(
+                u32::from(kind.as_u16()),
+                KIND_LAB_BOARD_REVISION | KIND_LAB_BOARD_HEAD
+            )
+        }),
+        _ => true,
+    }
 }
 
 /// Handle a REQ message: register the subscription, deliver historical events, then send EOSE.
@@ -172,6 +184,21 @@ pub async fn handle_req(
         accessible_channels.retain(|channel_id| allowed.contains(channel_id));
     }
 
+    let lab_reader_principals = if filters_request_lab_kinds(&filters) {
+        match super::lab::lab_reader_principals(&state, conn.tenant.community(), &pubkey_bytes)
+            .await
+        {
+            Ok(principals) => Some(principals),
+            Err(e) => {
+                warn!(conn_id = %conn_id, "Lab ACL resolution failed: {e}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let channel_id = extract_channel_id_from_filters(&filters);
 
     // Build the conformance `AbstractState` once at request entry. The
@@ -289,6 +316,7 @@ pub async fn handle_req(
             token_channel_ids.is_none(),
             &conn.tenant,
             &pubkey_bytes,
+            lab_reader_principals.as_deref().unwrap_or(&[]),
             &conn,
             &state,
             trace_state.as_ref(),
@@ -360,6 +388,9 @@ pub async fn handle_req(
             // newer private events from starving older shared ones off the page.
             if filter_can_match_shared_gated_kinds(filter) {
                 params.shared_gated_reader = Some(pubkey_bytes.clone());
+            }
+            if filter_can_match_lab_kinds(filter) {
+                params.lab_reader_pubkeys = lab_reader_principals.clone();
             }
             (idx, per_filter_channel, params)
         })
@@ -457,6 +488,18 @@ pub async fn handle_req(
             // covers all three gated event classes.
             if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
                 continue;
+            }
+            if let Some(ref principals) = lab_reader_principals {
+                if !lab_event_visible_to_reader(
+                    &state,
+                    conn.tenant.community(),
+                    &stored.event,
+                    principals,
+                )
+                .await
+                {
+                    continue;
+                }
             }
 
             // Dedup AFTER acceptance — an event that fails filter A's constraints
@@ -595,6 +638,7 @@ async fn handle_search_req(
     include_global: bool,
     tenant: &TenantContext,
     reader_pubkey_bytes: &[u8],
+    lab_reader_principals: &[Vec<u8>],
     conn: &ConnectionState,
     state: &AppState,
     trace_state: Option<&crate::conformance::AbstractState>,
@@ -791,6 +835,17 @@ async fn handle_search_req(
                     if !event_visible_to_reader(&stored.event, reader_pubkey_bytes) {
                         continue;
                     }
+                    if filter_can_match_lab_kinds(filter)
+                        && !lab_event_visible_to_reader(
+                            state,
+                            tenant.community(),
+                            &stored.event,
+                            lab_reader_principals,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
                     // Dedup AFTER acceptance — an event that fails filter A's constraints
                     // must remain eligible for filter B (NIP-01 OR semantics).
                     if !seen_ids.insert(stored.event.id) {
@@ -824,6 +879,35 @@ pub async fn build_event_query_from_filter(
 ) -> EventQuery {
     let channel_id = extract_channel_id_from_filter(filter);
     filter_to_query_params(filter, channel_id, community)
+}
+
+/// Defense-in-depth result gate for search hydration and direct-id paths.
+/// Normal REQ/COUNT pages already apply the same predicate in SQL; this async
+/// check covers event-ID hydration paths that intentionally bypass that query.
+pub(crate) async fn lab_event_visible_to_reader(
+    state: &AppState,
+    community: buzz_core::tenant::CommunityId,
+    event: &nostr::Event,
+    principals: &[Vec<u8>],
+) -> bool {
+    let kind = u32::from(event.kind.as_u16());
+    if !matches!(kind, KIND_LAB_BOARD_REVISION | KIND_LAB_BOARD_HEAD) {
+        return true;
+    }
+    let board_id = event
+        .tags
+        .iter()
+        .find(|tag| tag.as_slice().first().map(String::as_str) == Some("d"))
+        .and_then(|tag| tag.as_slice().get(1))
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+    let Some(board_id) = board_id else {
+        return false;
+    };
+    state
+        .db
+        .lab_board_can_read(community, board_id, principals)
+        .await
+        .unwrap_or(false)
 }
 
 /// Maximum SQL candidate rows a non-pushable COUNT filter may inspect before

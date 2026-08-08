@@ -51,21 +51,17 @@
 //! 10. `tx.commit()`, THEN publish to subscribers via
 //!    `dispatch_persistent_event` — never before commit.
 //!
-//! ## Known gaps (foundation round — schema + kinds + CAS transaction only)
-//! - **Rate limiting** (spec §8): not wired into `buzz_auth::rate_limit`/
-//!   `admission::check_principal` this round. The existing `LimitType`
-//!   variants (`Messages`/`ApiCalls`/`WsEvents`/`IpConnections`) don't have an
-//!   obvious per-kind extension point from inside `ingest_event_inner` itself
-//!   — every current call site lives in `connection.rs`/`bridge.rs`, keyed by
-//!   transport, not by kind. A `LimitType::BoardWrites` (or similar) variant
-//!   plus a call from this handler is the natural follow-up, not built here
-//!   per the task's explicit "don't build a rate limiter from scratch this
-//!   round" allowance.
-//! - **No read API**: this round only builds the write-side CAS transaction
-//!   and the `buzz_db::lab` read helpers (`list_board_heads`,
-//!   `get_board_head`, `list_board_revisions`) — no HTTP/WS surface exposes
-//!   them yet, and no client (CLI/Desktop) exists to call one. Explicitly
-//!   out of scope per the task.
+//! ## V2 read and authorization invariants
+//! - `access_scope` and the canonical owner are immutable after `create_v2`;
+//!   legacy creates remain community-wide for compatibility with V1 rows.
+//! - The owner is derived from the authenticated principal and the durable
+//!   NIP-OA mapping. Client-supplied `owner` tags are rejected.
+//! - REQ, COUNT, HTTP search, historical hydration, and fan-out apply the
+//!   corresponding head ACL before pagination or delivery. The CLI and
+//!   desktop use the same `create_v2`/`update_v2` tag contract.
+//! - Private and read-only boards return the same opaque not-found response
+//!   for unauthorized writes, so a guessed board id is not an existence
+//!   oracle. Rate limiting is applied before the CAS transaction is opened.
 //! - **Moderation ops don't touch the head projection**: archive/unarchive/
 //!   freeze/unfreeze update `lab_board_heads.status` (+ audit columns) but
 //!   deliberately do not re-sign a new kind:30623 (content/revision are
@@ -78,6 +74,7 @@ use std::sync::Arc;
 
 use nostr::{Event, EventBuilder, Kind, Tag};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use buzz_core::kind::{KIND_LAB_BOARD_HEAD, KIND_LAB_BOARD_REVISION};
@@ -104,7 +101,9 @@ const MAX_SUMMARY_CHARS: usize = 500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LabBoardOp {
     Create,
+    CreateV2,
     Update,
+    UpdateV2,
     Restore,
     Archive,
     Unarchive,
@@ -116,7 +115,9 @@ impl LabBoardOp {
     fn from_tag(s: &str) -> Option<Self> {
         Some(match s {
             "create" => Self::Create,
+            "create_v2" => Self::CreateV2,
             "update" => Self::Update,
+            "update_v2" => Self::UpdateV2,
             "restore" => Self::Restore,
             "archive" => Self::Archive,
             "unarchive" => Self::Unarchive,
@@ -129,7 +130,9 @@ impl LabBoardOp {
     fn as_str(self) -> &'static str {
         match self {
             Self::Create => "create",
+            Self::CreateV2 => "create_v2",
             Self::Update => "update",
+            Self::UpdateV2 => "update_v2",
             Self::Restore => "restore",
             Self::Archive => "archive",
             Self::Unarchive => "unarchive",
@@ -141,7 +144,10 @@ impl LabBoardOp {
     /// `create`/`update`/`restore` — mutate Markdown content and CAS against
     /// `prev`; every one produces a `lab_board_revisions` row.
     fn is_content_mutation(self) -> bool {
-        matches!(self, Self::Create | Self::Update | Self::Restore)
+        matches!(
+            self,
+            Self::Create | Self::CreateV2 | Self::Update | Self::UpdateV2 | Self::Restore
+        )
     }
 
     /// `archive`/`unarchive`/`freeze`/`unfreeze` — status-only, no Markdown,
@@ -154,8 +160,8 @@ impl LabBoardOp {
     /// called when `is_content_mutation()` is true.
     fn revision_operation_label(self) -> &'static str {
         match self {
-            Self::Create => "create",
-            Self::Update => "update",
+            Self::Create | Self::CreateV2 => "create",
+            Self::Update | Self::UpdateV2 => "update",
             Self::Restore => "restore",
             _ => unreachable!("revision_operation_label called on a moderation op"),
         }
@@ -203,6 +209,10 @@ struct LabBoardEnvelope {
     claimed_revision: Option<i32>,
     title: Option<String>,
     summary: Option<String>,
+    /// V2 create-only immutable access scope.
+    access_scope: Option<String>,
+    /// V2 atomically replaced canonical topic tags.
+    tags: Option<Vec<String>>,
     /// Required exactly when `op == Restore`: the revision number being
     /// restored from. Existence within this board's history is enforced by
     /// the `lab_board_revisions` self-referential FK at insert time, not
@@ -248,10 +258,10 @@ fn parse_lab_board_envelope(event: &Event) -> Result<LabBoardEnvelope, String> {
         None => None,
     };
     if op.is_content_mutation() {
-        if op == LabBoardOp::Create && prev.is_some() {
+        if matches!(op, LabBoardOp::Create | LabBoardOp::CreateV2) && prev.is_some() {
             return Err("lab board `create` must not carry a `prev` tag".to_string());
         }
-        if op != LabBoardOp::Create && prev.is_none() {
+        if !matches!(op, LabBoardOp::Create | LabBoardOp::CreateV2) && prev.is_none() {
             return Err(format!("lab board `{}` requires a `prev` tag", op.as_str()));
         }
     }
@@ -282,7 +292,7 @@ fn parse_lab_board_envelope(event: &Event) -> Result<LabBoardEnvelope, String> {
             ));
         }
     }
-    if op == LabBoardOp::Create && title.is_none() {
+    if matches!(op, LabBoardOp::Create | LabBoardOp::CreateV2) && title.is_none() {
         return Err("lab board `create` requires a non-empty `title` tag".to_string());
     }
 
@@ -312,6 +322,68 @@ fn parse_lab_board_envelope(event: &Event) -> Result<LabBoardEnvelope, String> {
         return Err("lab board `restored_from` tag is only valid on `restore`".to_string());
     }
 
+    let access_scope = find_single_tag(event, "access_scope")?.map(str::to_owned);
+    if let Some(scope) = &access_scope {
+        if !matches!(
+            scope.as_str(),
+            "community" | "community_readonly" | "private"
+        ) {
+            return Err(
+                "lab board `access_scope` must be community, community_readonly, or private"
+                    .to_string(),
+            );
+        }
+    }
+    // The owner is always server-derived from the authenticated principal and
+    // the durable NIP-OA mapping. Accepting a client owner would let a signer
+    // grant itself access to another person's private board.
+    if find_single_tag(event, "owner")?.is_some() {
+        return Err(
+            "lab board `owner` is relay-derived and must not be supplied by clients".to_string(),
+        );
+    }
+
+    let tags_marker = find_single_tag(event, "tags")?.map(str::to_owned);
+    let mut topic_tags = Vec::new();
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.first().map(String::as_str) != Some("t") {
+            continue;
+        }
+        let raw = parts.get(1).map(String::as_str).unwrap_or("");
+        let normalized = normalize_lab_tag(raw);
+        if raw != normalized || normalized.is_empty() || normalized.chars().count() > 32 {
+            return Err(
+                "lab board topic tags must be canonical, non-empty, and <= 32 characters"
+                    .to_string(),
+            );
+        }
+        if topic_tags.iter().any(|existing| existing == &normalized) {
+            return Err("duplicate lab board topic tag".to_string());
+        }
+        topic_tags.push(normalized);
+    }
+    if topic_tags.len() > 12 {
+        return Err("lab board accepts at most 12 topic tags".to_string());
+    }
+
+    let is_v2_create = op == LabBoardOp::CreateV2;
+    let is_v2_update = op == LabBoardOp::UpdateV2;
+    if is_v2_create {
+        if access_scope.is_none() || tags_marker.as_deref() != Some("replace") {
+            return Err("lab board `create_v2` requires access_scope and tags=replace".to_string());
+        }
+    } else if is_v2_update {
+        if access_scope.is_some() || tags_marker.as_deref() != Some("replace") {
+            return Err(
+                "lab board `update_v2` may not change access_scope and requires tags=replace"
+                    .to_string(),
+            );
+        }
+    } else if access_scope.is_some() || tags_marker.is_some() || !topic_tags.is_empty() {
+        return Err("access_scope and topic tags require create_v2/update_v2".to_string());
+    }
+
     Ok(LabBoardEnvelope {
         board_id,
         op,
@@ -319,8 +391,37 @@ fn parse_lab_board_envelope(event: &Event) -> Result<LabBoardEnvelope, String> {
         claimed_revision,
         title,
         summary,
+        access_scope,
+        tags: if is_v2_create || is_v2_update {
+            Some(topic_tags)
+        } else {
+            None
+        },
         restored_from,
     })
+}
+
+/// Normalize a topic tag exactly as the desktop and CLI clients do before
+/// signing. Wire values are required to already equal this result, keeping
+/// relay, CLI, and desktop filtering deterministic.
+pub(crate) fn normalize_lab_tag(raw: &str) -> String {
+    let normalized: String = raw.nfkc().collect();
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in normalized.trim().to_lowercase().chars() {
+        if ch.is_whitespace() {
+            pending_dash = true;
+        } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            if pending_dash && !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    out.trim_matches(['-', '_']).to_owned()
 }
 
 /// Format a CAS-conflict rejection. Uses the exact same wire convention
@@ -353,6 +454,9 @@ fn build_head_projection_event(
     summary: Option<&str>,
     head_revision_event_hex: &str,
     status: &str,
+    access_scope: &str,
+    owner_pubkey: Option<&[u8]>,
+    topic_tags: &[String],
 ) -> Result<Event, IngestError> {
     let mut tags = vec![
         Tag::parse(["d", &board_id.to_string()]),
@@ -361,6 +465,7 @@ fn build_head_projection_event(
         Tag::parse(["title", title]),
         Tag::parse(["head", head_revision_event_hex]),
         Tag::parse(["status", status]),
+        Tag::parse(["access_scope", access_scope]),
     ]
     .into_iter()
     .collect::<Result<Vec<_>, _>>()
@@ -368,6 +473,19 @@ fn build_head_projection_event(
     if let Some(summary) = summary {
         tags.push(Tag::parse(["summary", summary]).map_err(|e| {
             IngestError::Internal(format!("error: building lab board head tags: {e}"))
+        })?);
+    }
+    if let Some(owner) = owner_pubkey {
+        tags.push(Tag::parse(["owner", &hex::encode(owner)]).map_err(|e| {
+            IngestError::Internal(format!("error: building lab board owner tag: {e}"))
+        })?);
+    }
+    tags.push(Tag::parse(["tags", "replace"]).map_err(|e| {
+        IngestError::Internal(format!("error: building lab board tags marker: {e}"))
+    })?);
+    for topic_tag in topic_tags {
+        tags.push(Tag::parse(["t", topic_tag]).map_err(|e| {
+            IngestError::Internal(format!("error: building lab board topic tag: {e}"))
         })?);
     }
 
@@ -402,7 +520,7 @@ fn build_head_projection_event(
 /// `relay_members` mid-session is denied on its very next Lab Board write,
 /// not just its next reconnect.
 pub async fn is_lab_board_member(
-    state: &Arc<AppState>,
+    state: &AppState,
     community: CommunityId,
     pubkey: &[u8],
 ) -> Result<bool, String> {
@@ -440,6 +558,73 @@ pub async fn is_lab_board_member(
     }
 
     Ok(false)
+}
+
+/// Resolve the principals that may read a board for this authenticated
+/// connection. The authenticated pubkey is always included; a managed agent's
+/// owner is included only when the relay has NIP-OA enabled and the durable
+/// user mapping proves that delegation.
+pub async fn lab_reader_principals(
+    state: &AppState,
+    community: CommunityId,
+    reader_pubkey: &[u8],
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut principals = vec![reader_pubkey.to_vec()];
+    if state.config.allow_nip_oa_auth {
+        if let Some((_, Some(owner))) = state
+            .db
+            .get_agent_channel_policy(community, reader_pubkey)
+            .await
+            .map_err(|e| format!("lab owner lookup failed: {e}"))?
+        {
+            if owner.as_slice() != reader_pubkey && !principals.iter().any(|p| p == &owner) {
+                principals.push(owner);
+            }
+        }
+    }
+    Ok(principals)
+}
+
+async fn lab_author_can_write(
+    state: &AppState,
+    community: CommunityId,
+    head: &BoardHead,
+    author_pubkey: &[u8],
+) -> Result<bool, String> {
+    if head.access_scope == "community" {
+        return Ok(true);
+    }
+    let Some(owner) = head.owner_pubkey.as_deref() else {
+        return Ok(false);
+    };
+    if owner == author_pubkey {
+        return Ok(true);
+    }
+    if !state.config.allow_nip_oa_auth {
+        return Ok(false);
+    }
+    state
+        .db
+        .is_agent_owner(community, author_pubkey, owner)
+        .await
+        .map_err(|e| format!("lab owner authorization failed: {e}"))
+}
+
+async fn effective_board_owner(
+    state: &AppState,
+    community: CommunityId,
+    author_pubkey: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    match state
+        .db
+        .get_agent_channel_policy(community, author_pubkey)
+        .await
+        .map_err(|e| format!("lab owner lookup failed: {e}"))?
+    {
+        Some((_, Some(owner))) => Ok(Some(owner)),
+        Some((_, None)) => Ok(Some(author_pubkey.to_vec())),
+        None => Ok(None),
+    }
 }
 
 async fn check_lab_board_membership(
@@ -694,20 +879,31 @@ async fn handle_content_mutation(
 
     // Step 4: CAS compare.
     match (envelope.op, &current_head) {
-        (LabBoardOp::Create, Some(_)) => {
+        (LabBoardOp::Create | LabBoardOp::CreateV2, Some(_)) => {
             return Err(board_head_mismatch(&format!(
                 "board {} already exists",
                 envelope.board_id
             )));
         }
-        (LabBoardOp::Create, None) => {}
-        (LabBoardOp::Update | LabBoardOp::Restore, None) => {
+        (LabBoardOp::Create | LabBoardOp::CreateV2, None) => {}
+        (LabBoardOp::Update | LabBoardOp::UpdateV2 | LabBoardOp::Restore, None) => {
             return Err(IngestError::Rejected(format!(
                 "invalid: lab board {} does not exist",
                 envelope.board_id
             )));
         }
-        (LabBoardOp::Update | LabBoardOp::Restore, Some(head)) => {
+        (LabBoardOp::Update | LabBoardOp::UpdateV2 | LabBoardOp::Restore, Some(head)) => {
+            if !lab_author_can_write(state, community, head, author_pubkey)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            {
+                // Deliberately use the same response as an unknown board for
+                // restricted writes: guessed private board IDs do not become
+                // an existence oracle.
+                return Err(IngestError::Rejected(
+                    "invalid: lab board not found".to_string(),
+                ));
+            }
             if head.status == "frozen" {
                 return Err(IngestError::Rejected(
                     "restricted: lab board is frozen and cannot be edited".into(),
@@ -784,6 +980,35 @@ async fn handle_content_mutation(
         .clone()
         .or_else(|| current_head.as_ref().and_then(|h| h.summary.clone()));
 
+    // ACL metadata is immutable after creation. V2 creates derive the owner
+    // from durable user/NIP-OA state; restricted boards fail closed when that
+    // state cannot produce a canonical owner. Legacy creates remain
+    // community boards so V1 staging rows retain compatibility.
+    let (access_scope, owner_pubkey, topic_tags) = match current_head.as_ref() {
+        None => {
+            let scope = envelope
+                .access_scope
+                .as_deref()
+                .unwrap_or("community")
+                .to_owned();
+            let owner = effective_board_owner(state, community, author_pubkey)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+            if scope != "community" && owner.is_none() {
+                return Err(IngestError::Rejected(
+                    "restricted: cannot create a restricted lab board without a canonical owner"
+                        .to_string(),
+                ));
+            }
+            (scope, owner, envelope.tags.clone().unwrap_or_default())
+        }
+        Some(head) => (
+            head.access_scope.clone(),
+            head.owner_pubkey.clone(),
+            envelope.tags.clone().unwrap_or_else(|| head.tags.clone()),
+        ),
+    };
+
     // Step 5: insert the client-signed revision event.
     let (revision_stored, inserted) = buzz_db::lab::insert_revision_event_tx(tx, community, event)
         .await
@@ -810,6 +1035,9 @@ async fn handle_content_mutation(
         summary.as_deref(),
         &event.id.to_hex(),
         &status,
+        &access_scope,
+        owner_pubkey.as_deref(),
+        &topic_tags,
     )?;
 
     // Step 8: replace the head projection event + upsert lab_board_heads —
@@ -835,6 +1063,9 @@ async fn handle_content_mutation(
             head_event.id.as_bytes(),
             &title,
             summary.as_deref(),
+            &access_scope,
+            owner_pubkey.as_deref(),
+            &topic_tags,
             author_pubkey.as_slice(),
         )
         .await
@@ -959,6 +1190,9 @@ async fn handle_moderation_op(
         head.summary.as_deref(),
         &hex::encode(&head.head_revision_event_id),
         new_status,
+        &head.access_scope,
+        head.owner_pubkey.as_deref(),
+        &head.tags,
     )?;
     let head_stored = buzz_db::lab::replace_head_projection_event_tx(
         tx,
@@ -981,4 +1215,69 @@ async fn handle_moderation_op(
     .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
 
     Ok((Some(revision_stored), Some(head_stored), String::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn revision_event(tags: impl IntoIterator<Item = Tag>) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_LAB_BOARD_REVISION as u16), "body")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign test Lab Board event")
+    }
+
+    #[test]
+    fn v2_envelope_requires_replace_marker_and_keeps_canonical_tags() {
+        let board_id = Uuid::new_v4().to_string();
+        let event = revision_event([
+            Tag::parse(["d", board_id.as_str()]).expect("d tag"),
+            Tag::parse(["op", "create_v2"]).expect("op tag"),
+            Tag::parse(["title", "Sprint"]).expect("title tag"),
+            Tag::parse(["access_scope", "private"]).expect("scope tag"),
+            Tag::parse(["tags", "replace"]).expect("tags marker"),
+            Tag::parse(["t", "sprint-plan"]).expect("topic tag"),
+        ]);
+        let envelope = parse_lab_board_envelope(&event).expect("parse V2 envelope");
+        assert_eq!(envelope.access_scope.as_deref(), Some("private"));
+        assert_eq!(envelope.tags, Some(vec!["sprint-plan".to_string()]));
+    }
+
+    #[test]
+    fn client_cannot_supply_owner_or_noncanonical_topic_tag() {
+        let board_id = Uuid::new_v4().to_string();
+        let owner_event = revision_event([
+            Tag::parse(["d", board_id.as_str()]).expect("d tag"),
+            Tag::parse(["op", "create_v2"]).expect("op tag"),
+            Tag::parse(["title", "Private"]).expect("title tag"),
+            Tag::parse(["access_scope", "private"]).expect("scope tag"),
+            Tag::parse(["tags", "replace"]).expect("tags marker"),
+            Tag::parse(["owner", "forged"]).expect("owner tag"),
+        ]);
+        assert!(parse_lab_board_envelope(&owner_event)
+            .err()
+            .expect("forged owner must be rejected")
+            .contains("owner"));
+
+        let tag_event = revision_event([
+            Tag::parse(["d", board_id.as_str()]).expect("d tag"),
+            Tag::parse(["op", "create_v2"]).expect("op tag"),
+            Tag::parse(["title", "Private"]).expect("title tag"),
+            Tag::parse(["access_scope", "private"]).expect("scope tag"),
+            Tag::parse(["tags", "replace"]).expect("tags marker"),
+            Tag::parse(["t", "Sprint Plan"]).expect("topic tag"),
+        ]);
+        assert!(parse_lab_board_envelope(&tag_event)
+            .err()
+            .expect("noncanonical tag must be rejected")
+            .contains("canonical"));
+    }
+
+    #[test]
+    fn tag_normalization_matches_wire_contract() {
+        assert_eq!(normalize_lab_tag("  Sprint / Plano  "), "sprint-plano");
+        assert_eq!(normalize_lab_tag("Café\u{00a0}Ação"), "café-ação");
+        assert_eq!(normalize_lab_tag("---_Roadmap_---"), "roadmap");
+    }
 }

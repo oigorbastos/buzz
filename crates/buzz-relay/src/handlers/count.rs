@@ -7,8 +7,9 @@ use tracing::warn;
 
 use crate::connection::{AuthState, ConnectionState};
 use crate::handlers::req::{
-    event_visible_to_reader, filter_can_match_result_gated_kinds,
-    filter_can_match_shared_gated_kinds, result_gated_count_safe_for_pushdown,
+    event_visible_to_reader, filter_can_match_lab_kinds, filter_can_match_result_gated_kinds,
+    filter_can_match_shared_gated_kinds, filters_request_lab_kinds, lab_event_visible_to_reader,
+    result_gated_count_safe_for_pushdown,
 };
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
@@ -48,6 +49,56 @@ pub async fn handle_count(
                 return;
             }
         }
+    };
+
+    {
+        let auth = conn.auth_state.read().await;
+        if let AuthState::Authenticated(ctx) = &*auth {
+            if !ctx.scopes.is_empty()
+                && !ctx.scopes.contains(&buzz_auth::Scope::BoardsRead)
+                && filters_request_lab_kinds(&filters)
+            {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted: insufficient scope for lab boards",
+                ));
+                return;
+            }
+        }
+    }
+
+    if state.config.require_relay_membership && filters_request_lab_kinds(&filters) {
+        match super::lab::is_lab_board_member(&state, conn.tenant.community(), &pubkey_bytes).await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted: not a relay member",
+                ));
+                return;
+            }
+            Err(e) => {
+                warn!(sub_id = %sub_id, "Lab membership check failed: {e}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    }
+
+    let lab_reader_principals = if filters_request_lab_kinds(&filters) {
+        match super::lab::lab_reader_principals(&state, conn.tenant.community(), &pubkey_bytes)
+            .await
+        {
+            Ok(principals) => Some(principals),
+            Err(e) => {
+                warn!(sub_id = %sub_id, "Lab ACL resolution failed: {e}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+        }
+    } else {
+        None
     };
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
@@ -162,6 +213,9 @@ pub async fn handle_count(
             if needs_shared_gate_filtering {
                 query.shared_gated_reader = Some(pubkey_bytes.clone());
             }
+            if filter_can_match_lab_kinds(filter) {
+                query.lab_reader_pubkeys = lab_reader_principals.clone();
+            }
             let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
                 !authors.is_empty()
                     && authors
@@ -206,6 +260,18 @@ pub async fn handle_count(
                             if !event_visible_to_reader(&se.event, &pubkey_bytes) {
                                 continue;
                             }
+                            if let Some(ref principals) = lab_reader_principals {
+                                if !lab_event_visible_to_reader(
+                                    &state,
+                                    conn.tenant.community(),
+                                    &se.event,
+                                    principals,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                            }
                             total += 1;
                         }
                     }
@@ -233,6 +299,9 @@ pub async fn handle_count(
             // Shared-gated visibility pushdown for the fallback query_events path.
             if needs_shared_gate_filtering {
                 query.shared_gated_reader = Some(pubkey_bytes.clone());
+            }
+            if filter_can_match_lab_kinds(filter) {
+                query.lab_reader_pubkeys = lab_reader_principals.clone();
             }
 
             let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
@@ -278,6 +347,18 @@ pub async fn handle_count(
                             }
                             if !event_visible_to_reader(&se.event, &pubkey_bytes) {
                                 continue;
+                            }
+                            if let Some(ref principals) = lab_reader_principals {
+                                if !lab_event_visible_to_reader(
+                                    &state,
+                                    conn.tenant.community(),
+                                    &se.event,
+                                    principals,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
                             }
                             total += 1;
                         }

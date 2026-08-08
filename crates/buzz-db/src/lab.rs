@@ -29,7 +29,7 @@
 //! like every other read-only query in this crate (no lock needed).
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row as _, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row as _, Transaction};
 use uuid::Uuid;
 
 use crate::error::{DbError, Result};
@@ -56,6 +56,12 @@ pub struct BoardHead {
     pub title: String,
     /// Current summary (<=500 chars), if any.
     pub summary: Option<String>,
+    /// Immutable read/write scope: `community`, `community_readonly`, or `private`.
+    pub access_scope: String,
+    /// Canonical human owner for restricted boards, if known.
+    pub owner_pubkey: Option<Vec<u8>>,
+    /// Canonical topic tags, atomically replaced by V2 edits.
+    pub tags: Vec<String>,
     /// When the board was first created.
     pub created_at: DateTime<Utc>,
     /// 32-byte pubkey of whoever created the board.
@@ -86,6 +92,9 @@ fn row_to_board_head(row: &sqlx::postgres::PgRow) -> Result<BoardHead> {
         head_projection_event_id: row.try_get("head_projection_event_id")?,
         title: row.try_get("title")?,
         summary: row.try_get("summary")?,
+        access_scope: row.try_get("access_scope")?,
+        owner_pubkey: row.try_get("owner_pubkey")?,
+        tags: row.try_get("tags")?,
         created_at: row.try_get("created_at")?,
         created_by: row.try_get("created_by")?,
         updated_at: row.try_get("updated_at")?,
@@ -106,7 +115,8 @@ macro_rules! board_head_columns {
     () => {
         "board_id, status, revision, head_revision_event_id, \
          head_projection_event_id, title, summary, created_at, created_by, \
-         updated_at, updated_by, archived_at, archived_by, frozen_at, frozen_by"
+         access_scope, owner_pubkey, tags, updated_at, updated_by, archived_at, \
+         archived_by, frozen_at, frozen_by"
     };
 }
 
@@ -449,13 +459,16 @@ pub async fn create_board_head_tx(
     head_projection_event_id: &[u8],
     title: &str,
     summary: Option<&str>,
+    access_scope: &str,
+    owner_pubkey: Option<&[u8]>,
+    tags: &[String],
     actor_pubkey: &[u8],
 ) -> Result<BoardHead> {
     let row = sqlx::query(concat!(
         "INSERT INTO lab_board_heads \
          (community_id, board_id, status, revision, head_revision_event_id, head_projection_event_id, \
-          title, summary, created_by, updated_by) \
-         VALUES ($1, $2, 'active', 1, $3, $4, $5, $6, $7, $7) \
+          title, summary, access_scope, owner_pubkey, tags, created_by, updated_by) \
+         VALUES ($1, $2, 'active', 1, $3, $4, $5, $6, $7, $8, $9, $10, $10) \
          RETURNING ",
         board_head_columns!()
     ))
@@ -465,6 +478,9 @@ pub async fn create_board_head_tx(
     .bind(head_projection_event_id)
     .bind(title)
     .bind(summary)
+    .bind(access_scope)
+    .bind(owner_pubkey)
+    .bind(tags)
     .bind(actor_pubkey)
     .fetch_one(&mut **tx)
     .await?;
@@ -661,6 +677,40 @@ pub async fn get_board_head(
     .await?;
 
     row.as_ref().map(row_to_board_head).transpose()
+}
+
+/// Test the board ACL for one authenticated reader.
+///
+/// `principals` contains the reader pubkey and, when the reader is a managed
+/// agent and NIP-OA is enabled by the relay, its canonical owner pubkey.  The
+/// query is intentionally a single boolean and never returns a head row, so a
+/// caller can apply the same fail-closed decision to history, subscriptions,
+/// and fan-out without creating an existence oracle.
+pub async fn board_can_read(
+    pool: &PgPool,
+    community: CommunityId,
+    board_id: Uuid,
+    principals: &[Vec<u8>],
+) -> Result<bool> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "SELECT EXISTS (SELECT 1 FROM lab_board_heads h \
+         WHERE h.community_id = ",
+    );
+    query.push_bind(community.as_uuid());
+    query.push(" AND h.board_id = ");
+    query.push_bind(board_id);
+    query
+        .push(" AND (h.access_scope IN ('community', 'community_readonly') OR h.owner_pubkey IN (");
+    if principals.is_empty() {
+        query.push("NULL");
+    } else {
+        let mut separated = query.separated(", ");
+        for principal in principals {
+            separated.push_bind(principal.clone());
+        }
+    }
+    query.push(")))");
+    Ok(query.build_query_scalar().fetch_one(pool).await?)
 }
 
 /// List a board's revision history, newest first.

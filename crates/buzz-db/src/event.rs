@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_i32, is_ephemeral, KIND_AUTH, KIND_EVENT_REMINDER, KIND_HUDDLE_STARTED,
-    SHARED_GATED_KINDS,
+    KIND_LAB_BOARD_HEAD, KIND_LAB_BOARD_REVISION, SHARED_GATED_KINDS,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -95,6 +95,10 @@ pub struct EventQuery {
     /// SQL pushdown is sound.  Keeping `event_visible_to_reader` as post-filter
     /// defense-in-depth catches any residual mismatch.
     pub shared_gated_reader: Option<Vec<u8>>,
+    /// Reader principals allowed to see Lab Board events. Applied before
+    /// ordering, pagination, and COUNT so private boards cannot create a
+    /// page/count oracle.
+    pub lab_reader_pubkeys: Option<Vec<Vec<u8>>>,
 }
 
 impl EventQuery {
@@ -124,6 +128,7 @@ impl EventQuery {
             channel_ids: None,
             max_limit: None,
             shared_gated_reader: None,
+            lab_reader_pubkeys: None,
         }
     }
 }
@@ -554,6 +559,28 @@ pub(crate) async fn query_events_on(
         qb.push(")");
     }
 
+    // Lab Board ACL pushdown. This is intentionally before ORDER/LIMIT, so a
+    // private board cannot consume a page slot before the ACL removes it.
+    if let Some(ref principals) = q.lab_reader_pubkeys {
+        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
+        qb.push_bind(KIND_LAB_BOARD_REVISION as i32);
+        qb.push(", ");
+        qb.push_bind(KIND_LAB_BOARD_HEAD as i32);
+        qb.push(format!(
+            ") OR EXISTS (SELECT 1 FROM lab_board_heads h WHERE h.community_id = {col_prefix}community_id \
+             AND h.board_id::text = {col_prefix}d_tag AND (h.access_scope IN ('community', 'community_readonly') OR h.owner_pubkey IN ("
+        ));
+        if principals.is_empty() {
+            qb.push("NULL");
+        } else {
+            let mut sep = qb.separated(", ");
+            for principal in principals {
+                sep.push_bind(principal.clone());
+            }
+        }
+        qb.push("))))");
+    }
+
     // Composite ordering for deterministic pagination across ALL callers of
     // query_events (WebSocket REQ, REST endpoints, canvas, notes, etc.).
     // The `id ASC` tiebreaker ensures stable results when events share the
@@ -764,6 +791,29 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
             }
             qb.push(")");
         }
+    }
+
+    // Keep COUNT's ACL predicate identical to query_events' predicate. It is
+    // applied in SQL, before the aggregate, so COUNT cannot reveal private
+    // board existence through an authorized-looking filter.
+    if let Some(ref principals) = q.lab_reader_pubkeys {
+        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
+        qb.push_bind(KIND_LAB_BOARD_REVISION as i32);
+        qb.push(", ");
+        qb.push_bind(KIND_LAB_BOARD_HEAD as i32);
+        qb.push(format!(
+            ") OR EXISTS (SELECT 1 FROM lab_board_heads h WHERE h.community_id = {col_prefix}community_id \
+             AND h.board_id::text = {col_prefix}d_tag AND (h.access_scope IN ('community', 'community_readonly') OR h.owner_pubkey IN ("
+        ));
+        if principals.is_empty() {
+            qb.push("NULL");
+        } else {
+            let mut sep = qb.separated(", ");
+            for principal in principals {
+                sep.push_bind(principal.clone());
+            }
+        }
+        qb.push("))))");
     }
 
     let row = qb.build().fetch_one(&mut *conn).await?;

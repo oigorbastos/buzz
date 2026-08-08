@@ -22,6 +22,7 @@ import {
   writeStoredLabBoardViewMode,
 } from "@/features/lab/viewPreference";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useUserProfileQuery } from "@/features/profile/hooks";
 import { cn } from "@/shared/lib/cn";
 import {
   isRelayUnreachableError,
@@ -41,6 +42,7 @@ export function LabScreen() {
   const boardsQuery = useLabBoardsQuery();
   const createMutation = useCreateLabBoardMutation();
   const identityQuery = useIdentityQuery();
+  const currentProfileQuery = useUserProfileQuery(identityQuery.data?.pubkey);
   const [isCreateOpen, setIsCreateOpen] = React.useState(false);
   const [listFilter, setListFilter] = React.useState<LabBoardListFilter>("all");
   const [tagFilter, setTagFilter] = React.useState<string | null>(null);
@@ -52,18 +54,30 @@ export function LabScreen() {
 
   const boards = boardsQuery.data ?? [];
   const availableTags = React.useMemo(
-    () => availableBoardTags(boards, identityQuery.data?.pubkey),
-    [boards, identityQuery.data?.pubkey],
+    () =>
+      availableBoardTags(
+        boards,
+        identityQuery.data?.pubkey,
+        currentProfileQuery.data?.ownerPubkey,
+      ),
+    [boards, identityQuery.data?.pubkey, currentProfileQuery.data?.ownerPubkey],
   );
   const filteredBoards = React.useMemo(
     () =>
       filterLabBoards({
         boards,
         currentPubkey: identityQuery.data?.pubkey,
+        currentOwnerPubkey: currentProfileQuery.data?.ownerPubkey,
         filter: listFilter,
         tag: tagFilter,
       }),
-    [boards, identityQuery.data?.pubkey, listFilter, tagFilter],
+    [
+      boards,
+      identityQuery.data?.pubkey,
+      currentProfileQuery.data?.ownerPubkey,
+      listFilter,
+      tagFilter,
+    ],
   );
 
   React.useEffect(() => {
