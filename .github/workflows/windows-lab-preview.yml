@@ -135,7 +135,7 @@ jobs:
 
       - name: Build isolated relay and CLI
         shell: bash
-        run: cargo build --profile ci -p buzz-relay -p buzz-cli
+        run: cargo build --profile ci -p buzz-relay -p buzz-cli -p git-credential-nostr
 
       - name: Start isolated real relay with V2 authorization enabled
         shell: bash
@@ -433,4 +433,3 @@ jobs:
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-
