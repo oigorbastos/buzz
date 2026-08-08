@@ -1,4 +1,4 @@
-import { Check, UserRound, Users } from "lucide-react";
+import { Check, LockKeyhole, Users } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -6,7 +6,7 @@ import {
   MAX_TITLE_CHARS,
   validateBoardInput,
 } from "@/features/lab/api";
-import type { LabBoardEditPolicy } from "@/features/lab/model";
+import type { LabBoardAccess } from "@/features/lab/model";
 import { LabTagInput } from "@/features/lab/ui/LabTagInput";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -26,7 +26,7 @@ type CreateLabBoardDialogProps = {
     title: string;
     summary?: string;
     content: string;
-    editPolicy: LabBoardEditPolicy;
+    access: LabBoardAccess;
     tags: string[];
   }) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
@@ -42,8 +42,7 @@ export function CreateLabBoardDialog({
   const [title, setTitle] = React.useState("");
   const [summary, setSummary] = React.useState("");
   const [content, setContent] = React.useState("");
-  const [editPolicy, setEditPolicy] =
-    React.useState<LabBoardEditPolicy>("community");
+  const [access, setAccess] = React.useState<LabBoardAccess>("community");
   const [tags, setTags] = React.useState<string[]>([]);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const titleInputRef = React.useRef<HTMLInputElement>(null);
@@ -53,7 +52,7 @@ export function CreateLabBoardDialog({
     setTitle("");
     setSummary("");
     setContent("");
-    setEditPolicy("community");
+    setAccess("community");
     setTags([]);
     setErrorMessage(null);
     const timerId = globalThis.setTimeout(() => {
@@ -84,7 +83,7 @@ export function CreateLabBoardDialog({
         title: trimmedTitle,
         summary: summary.trim() || undefined,
         content,
-        editPolicy,
+        access,
         tags,
       });
       onOpenChange(false);
@@ -107,7 +106,7 @@ export function CreateLabBoardDialog({
         className="max-w-xl"
         contentClassName="pt-3"
         data-testid="create-lab-board-dialog"
-        description="Choose who can edit. Every board remains readable by the whole community."
+        description="Choose whether the whole community or only you and your agents can access this board."
         footer={
           <div className="flex w-full items-center justify-end gap-3">
             <Button
@@ -162,22 +161,22 @@ export function CreateLabBoardDialog({
 
           <fieldset className="space-y-2">
             <legend className="text-sm font-medium text-foreground">
-              Editing access
+              Board access
             </legend>
             <div className="grid gap-2 sm:grid-cols-2">
               <EditPolicyOption
-                checked={editPolicy === "community"}
+                checked={access === "community"}
                 description="Everyone in the community can read and edit."
                 icon={<Users className="h-4 w-4" />}
                 label="Community"
-                onSelect={() => setEditPolicy("community")}
+                onSelect={() => setAccess("community")}
               />
               <EditPolicyOption
-                checked={editPolicy === "owner_agents"}
-                description="Everyone reads. Only you and your agents edit."
-                icon={<UserRound className="h-4 w-4" />}
-                label="Personal editing"
-                onSelect={() => setEditPolicy("owner_agents")}
+                checked={access === "private"}
+                description="Only you and your agents can find, read, and edit."
+                icon={<LockKeyhole className="h-4 w-4" />}
+                label="Private"
+                onSelect={() => setAccess("private")}
               />
             </div>
           </fieldset>

@@ -2,6 +2,15 @@
 
 This environment is a UX review surface, not a production relay staging.
 
+The preview simulates the authorization contract in its in-browser mock. A
+foreign private board is deliberately present in the fictional seed so tests
+can prove that its title, content, tags, history, and existence do not reach the
+viewer. Because those synthetic strings are compiled into the static test
+bundle, this environment demonstrates UX and query behavior; it is not proof
+of confidentiality in the production relay. Real private boards require the
+same authorization in the relay, database queries, live subscriptions, and
+CLI before a Windows release.
+
 ## Safety contract
 
 - It contains fictional, disposable boards only.

@@ -1,9 +1,10 @@
 /**
  * Lab Boards ("Quadros") — relay access layer.
  *
- * A Lab Board is a community-readable Markdown document. Community boards are
- * multi-writer; personal-editing boards can be changed only by their owner and
- * that owner's managed agents. Concurrency is settled by the relay with
+ * A Lab Board is a Markdown document with one immutable access scope.
+ * Community boards are readable and writable by every community member;
+ * private boards are visible and writable only to their canonical human owner
+ * and that owner's managed agents. Concurrency is settled by the relay with
  * compare-and-swap rather than by last-write-wins: each mutation names the
  * revision it was based on (`prev`), and the relay rejects it with
  * `BOARD_HEAD_MISMATCH` if that is no longer the head.
@@ -25,10 +26,7 @@ import {
   KIND_LAB_BOARD_HEAD,
   KIND_LAB_BOARD_REVISION,
 } from "@/shared/constants/kinds";
-import {
-  type LabBoardEditPolicy,
-  normalizeBoardTags,
-} from "@/features/lab/model";
+import { type LabBoardAccess, normalizeBoardTags } from "@/features/lab/model";
 
 /** Relay-enforced caps, mirrored so the UI can fail before a round trip. */
 export const MAX_TITLE_CHARS = 160;
@@ -48,8 +46,8 @@ export type LabBoardHead = {
   content: string;
   revision: number;
   status: LabBoardStatus;
-  /** Who may write. Reading remains community-wide in both modes. */
-  editPolicy: LabBoardEditPolicy;
+  /** Who may discover, read history, receive updates, and write. */
+  access: LabBoardAccess;
   /** Canonical human owner, derived and signed by the relay. */
   ownerPubkey: string | null;
   tags: string[];
@@ -93,8 +91,14 @@ function parseStatus(raw: string | null): LabBoardStatus {
   return raw === "archived" || raw === "frozen" ? raw : "active";
 }
 
-function parseEditPolicy(raw: string | null): LabBoardEditPolicy {
-  return raw === "owner_agents" ? "owner_agents" : "community";
+function parseAccess(raw: string | null): LabBoardAccess | null {
+  if (raw === null || raw === "community") return "community";
+  if (raw === "private") return "private";
+  return null;
+}
+
+function isValidPubkey(raw: string | null): raw is string {
+  return raw !== null && /^[0-9a-f]{64}$/i.test(raw);
 }
 
 /**
@@ -109,7 +113,19 @@ export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
   const boardId = tagValue(event, "d");
   const headEventId = tagValue(event, "head");
   const revision = parseIntTag(event, "revision");
-  if (!boardId || !headEventId || revision === null) return null;
+  const access = parseAccess(tagValue(event, "access_scope"));
+  const ownerPubkey = tagValue(event, "owner");
+  const unsafeLegacyScope = tagValue(event, "edit_policy") === "owner_agents";
+  if (
+    !boardId ||
+    !headEventId ||
+    revision === null ||
+    access === null ||
+    unsafeLegacyScope ||
+    (access === "private" && !isValidPubkey(ownerPubkey))
+  ) {
+    return null;
+  }
 
   return {
     boardId,
@@ -118,8 +134,8 @@ export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
     content: event.content,
     revision,
     status: parseStatus(tagValue(event, "status")),
-    editPolicy: parseEditPolicy(tagValue(event, "edit_policy")),
-    ownerPubkey: tagValue(event, "owner"),
+    access,
+    ownerPubkey,
     tags: normalizeBoardTags(tagValues(event, "t")),
     headEventId,
     updatedAt: event.created_at,
@@ -183,7 +199,9 @@ export function eventMatchesBoard(event: RelayEvent, boardId: string): boolean {
 }
 
 /**
- * List every board in the community, most recently updated first.
+ * List every board the authenticated actor may access, most recently updated
+ * first. The relay must apply private-board authorization before its limit;
+ * this client-side parser is only defence in depth.
  *
  * Safe to filter server-side by kind alone: 30623 is NIP-33, and we want all
  * `d` values, so no `#d` constraint is involved.
@@ -315,18 +333,18 @@ export async function createBoard(input: {
   title: string;
   summary?: string;
   content: string;
-  editPolicy: LabBoardEditPolicy;
+  access: LabBoardAccess;
   tags: string[];
 }): Promise<{ boardId: string; eventId: string }> {
   const boardId = crypto.randomUUID();
   const tags: string[][] = [
     ["d", boardId],
     // V2 deliberately fails closed on an older relay instead of letting it
-    // ignore a personal-editing policy and create a community-writable board.
+    // ignore a private scope and create a community-visible board.
     ["op", "create_v2"],
     ["revision", "1"],
     ["title", input.title.trim()],
-    ["edit_policy", input.editPolicy],
+    ["access_scope", input.access],
     ["tags", "replace"],
   ];
   const summary = input.summary?.trim();

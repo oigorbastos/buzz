@@ -1,11 +1,11 @@
 export const MAX_BOARD_TAGS = 12;
 export const MAX_BOARD_TAG_CHARS = 32;
 
-export type LabBoardEditPolicy = "community" | "owner_agents";
-export type LabBoardListFilter = "all" | "community" | "mine";
+export type LabBoardAccess = "community" | "private";
+export type LabBoardListFilter = "all" | "community" | "private";
 
 type FilterableBoard = {
-  editPolicy: LabBoardEditPolicy;
+  access: LabBoardAccess;
   ownerPubkey: string | null;
   tags: string[];
 };
@@ -42,18 +42,29 @@ export function parseBoardTagsText(raw: string): string[] {
 }
 
 export function canEditBoard(
-  board: Pick<FilterableBoard, "editPolicy" | "ownerPubkey">,
+  board: Pick<FilterableBoard, "access" | "ownerPubkey">,
   currentPubkey: string | null | undefined,
 ): boolean {
-  if (board.editPolicy === "community") return true;
+  if (board.access === "community") return true;
   if (!board.ownerPubkey || !currentPubkey) return false;
   return board.ownerPubkey.toLowerCase() === currentPubkey.toLowerCase();
 }
 
+export function canReadBoard(
+  board: Pick<FilterableBoard, "access" | "ownerPubkey">,
+  currentPubkey: string | null | undefined,
+): boolean {
+  return canEditBoard(board, currentPubkey);
+}
+
 export function availableBoardTags(
   boards: readonly FilterableBoard[],
+  currentPubkey: string | null | undefined,
 ): string[] {
-  return [...new Set(boards.flatMap((board) => board.tags))].sort(
+  const readableBoards = boards.filter((board) =>
+    canReadBoard(board, currentPubkey),
+  );
+  return [...new Set(readableBoards.flatMap((board) => board.tags))].sort(
     (left, right) => left.localeCompare(right, "pt-BR"),
   );
 }
@@ -65,13 +76,14 @@ export function filterLabBoards<T extends FilterableBoard>(input: {
   currentPubkey: string | null | undefined;
 }): T[] {
   return input.boards.filter((board) => {
+    if (!canReadBoard(board, input.currentPubkey)) return false;
     if (input.tag && !board.tags.includes(input.tag)) return false;
     if (input.filter === "community") {
-      return board.editPolicy === "community";
+      return board.access === "community";
     }
-    if (input.filter === "mine") {
+    if (input.filter === "private") {
       return (
-        board.editPolicy === "owner_agents" &&
+        board.access === "private" &&
         Boolean(board.ownerPubkey) &&
         Boolean(input.currentPubkey) &&
         board.ownerPubkey?.toLowerCase() === input.currentPubkey?.toLowerCase()

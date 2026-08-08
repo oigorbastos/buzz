@@ -58,18 +58,18 @@ describe("parseBoardHead", () => {
     assert.equal(head.headEventId, EVENT_ID);
     assert.equal(head.status, "active");
     assert.equal(head.content, "# hello");
-    assert.equal(head.editPolicy, "community");
+    assert.equal(head.access, "community");
     assert.equal(head.ownerPubkey, null);
     assert.deepEqual(head.tags, []);
   });
 
-  it("reads personal editing metadata and canonical tags", () => {
+  it("reads private access metadata and canonical tags", () => {
     const head = parseBoardHead(
       headEvent([
         ["d", BOARD],
         ["revision", "2"],
         ["head", EVENT_ID],
-        ["edit_policy", "owner_agents"],
+        ["access_scope", "private"],
         ["owner", PUBKEY],
         ["t", "Prompts"],
         ["t", "operação"],
@@ -77,9 +77,39 @@ describe("parseBoardHead", () => {
       ]),
     );
 
-    assert.equal(head.editPolicy, "owner_agents");
+    assert.equal(head.access, "private");
     assert.equal(head.ownerPubkey, PUBKEY);
     assert.deepEqual(head.tags, ["prompts", "operação"]);
+  });
+
+  it("fails closed for malformed or ambiguous private metadata", () => {
+    const baseTags = [
+      ["d", BOARD],
+      ["revision", "2"],
+      ["head", EVENT_ID],
+    ];
+    assert.equal(
+      parseBoardHead(headEvent([...baseTags, ["access_scope", "private"]])),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(
+        headEvent([
+          ...baseTags,
+          ["access_scope", "private"],
+          ["owner", "not-a-pubkey"],
+        ]),
+      ),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(headEvent([...baseTags, ["access_scope", "future-mode"]])),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(headEvent([...baseTags, ["edit_policy", "owner_agents"]])),
+      null,
+    );
   });
 
   it("rejects an event of the wrong kind", () => {

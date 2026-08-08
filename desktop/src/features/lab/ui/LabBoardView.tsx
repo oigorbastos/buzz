@@ -4,7 +4,7 @@ import {
   Link2,
   Pencil,
   Save,
-  UserRound,
+  LockKeyhole,
   Users,
   X,
 } from "lucide-react";
@@ -18,7 +18,7 @@ import {
   type LabBoardRevision,
   validateBoardInput,
 } from "@/features/lab/api";
-import { canEditBoard } from "@/features/lab/model";
+import { canEditBoard, canReadBoard } from "@/features/lab/model";
 import {
   useLabBoardHistoryQuery,
   useLabBoardQuery,
@@ -167,7 +167,7 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
     );
   }
 
-  if (!board) {
+  if (!board || !canReadBoard(board, identityQuery.data?.pubkey)) {
     return (
       <div className="p-4">
         <Button onClick={onBack} size="sm" type="button" variant="outline">
@@ -175,7 +175,7 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
           Back
         </Button>
         <p className="mt-4 text-sm text-muted-foreground">
-          This board no longer exists on the relay.
+          This board is not available.
         </p>
       </div>
     );
@@ -255,24 +255,22 @@ export function LabBoardView({ boardId, onBack }: LabBoardViewProps) {
       <LabPreviewBanner />
 
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/20 px-4 py-2 text-xs text-muted-foreground">
-        {board.editPolicy === "owner_agents" ? (
-          <UserRound className="h-3.5 w-3.5 shrink-0" />
+        {board.access === "private" ? (
+          <LockKeyhole className="h-3.5 w-3.5 shrink-0" />
         ) : (
           <Users className="h-3.5 w-3.5 shrink-0" />
         )}
         <span>
-          {board.editPolicy === "community"
+          {board.access === "community"
             ? "Everyone in this community can read and edit this board."
-            : canWrite
-              ? "Everyone can read. Only you and your agents can edit this board."
-              : "Everyone can read. Only the owner and their agents can edit this board."}
+            : "Only you and your agents can find, read, and edit this board."}
           {isFrozen ? " It is frozen, so edits are disabled." : ""}
         </span>
         <Badge
           className="normal-case tracking-normal"
-          variant={board.editPolicy === "community" ? "secondary" : "info"}
+          variant={board.access === "community" ? "secondary" : "info"}
         >
-          {board.editPolicy === "community" ? "Community" : "Personal editing"}
+          {board.access === "community" ? "Community" : "Private"}
         </Badge>
         {board.tags.map((tag) => (
           <span

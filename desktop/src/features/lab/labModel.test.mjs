@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
   availableBoardTags,
   canEditBoard,
+  canReadBoard,
   filterLabBoards,
   normalizeBoardTags,
 } from "./model.ts";
@@ -18,51 +19,55 @@ describe("Lab board model", () => {
     );
   });
 
-  it("keeps community writes open and personal writes owner-only", () => {
+  it("keeps community access open and private access owner-only", () => {
     assert.equal(
-      canEditBoard({ editPolicy: "community", ownerPubkey: null }, null),
+      canEditBoard({ access: "community", ownerPubkey: null }, null),
       true,
     );
     assert.equal(
       canEditBoard(
-        { editPolicy: "owner_agents", ownerPubkey: VIEWER },
+        { access: "private", ownerPubkey: VIEWER },
         VIEWER.toUpperCase(),
       ),
       true,
     );
     assert.equal(
-      canEditBoard(
-        { editPolicy: "owner_agents", ownerPubkey: "a".repeat(64) },
-        VIEWER,
-      ),
+      canEditBoard({ access: "private", ownerPubkey: "a".repeat(64) }, VIEWER),
+      false,
+    );
+    assert.equal(
+      canReadBoard({ access: "private", ownerPubkey: VIEWER }, VIEWER),
+      true,
+    );
+    assert.equal(
+      canReadBoard({ access: "private", ownerPubkey: "a".repeat(64) }, VIEWER),
       false,
     );
   });
 
-  it("filters by editing mode and tag without hiding readable boards", () => {
+  it("filters already-authorized boards by access scope and tag", () => {
     const boards = [
       {
         id: "community",
-        editPolicy: "community",
+        access: "community",
         ownerPubkey: VIEWER,
         tags: ["produto"],
       },
       {
         id: "mine",
-        editPolicy: "owner_agents",
+        access: "private",
         ownerPubkey: VIEWER,
         tags: ["prompts"],
       },
       {
         id: "theirs",
-        editPolicy: "owner_agents",
+        access: "private",
         ownerPubkey: "a".repeat(64),
         tags: ["pesquisa"],
       },
     ];
 
-    assert.deepEqual(availableBoardTags(boards), [
-      "pesquisa",
+    assert.deepEqual(availableBoardTags(boards, VIEWER), [
       "produto",
       "prompts",
     ]);
@@ -70,7 +75,7 @@ describe("Lab board model", () => {
       filterLabBoards({
         boards,
         currentPubkey: VIEWER,
-        filter: "mine",
+        filter: "private",
         tag: null,
       }).map((board) => board.id),
       ["mine"],
@@ -82,7 +87,7 @@ describe("Lab board model", () => {
         filter: "all",
         tag: "pesquisa",
       }).map((board) => board.id),
-      ["theirs"],
+      [],
     );
   });
 });

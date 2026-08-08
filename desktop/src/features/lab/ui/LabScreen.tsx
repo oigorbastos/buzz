@@ -27,7 +27,7 @@ import { Button } from "@/shared/ui/button";
 const FILTERS: Array<{ label: string; value: LabBoardListFilter }> = [
   { label: "All", value: "all" },
   { label: "Community", value: "community" },
-  { label: "Mine", value: "mine" },
+  { label: "Private", value: "private" },
 ];
 
 export function LabScreen() {
@@ -42,8 +42,8 @@ export function LabScreen() {
 
   const boards = boardsQuery.data ?? [];
   const availableTags = React.useMemo(
-    () => availableBoardTags(boards),
-    [boards],
+    () => availableBoardTags(boards, identityQuery.data?.pubkey),
+    [boards, identityQuery.data?.pubkey],
   );
   const filteredBoards = React.useMemo(
     () =>
@@ -93,7 +93,7 @@ export function LabScreen() {
 
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/10 px-4 py-2.5">
         <fieldset className="flex rounded-lg border border-border/60 bg-background p-0.5">
-          <legend className="sr-only">Filter boards by editing access</legend>
+          <legend className="sr-only">Filter boards by access scope</legend>
           {FILTERS.map((filter) => (
             <button
               aria-pressed={listFilter === filter.value}

@@ -1,4 +1,4 @@
-import { FlaskConical, UserRound, Users } from "lucide-react";
+import { FlaskConical, LockKeyhole, Users } from "lucide-react";
 
 import type { LabBoardHead } from "@/features/lab/api";
 import { cn } from "@/shared/lib/cn";
@@ -10,12 +10,12 @@ function StatusPill({ status }: { status: string }) {
   return <Badge variant="outline">{status}</Badge>;
 }
 
-function EditPolicyPill({ board }: { board: LabBoardHead }) {
-  if (board.editPolicy === "owner_agents") {
+function AccessPill({ board }: { board: LabBoardHead }) {
+  if (board.access === "private") {
     return (
       <Badge className="gap-1 normal-case tracking-normal" variant="info">
-        <UserRound className="h-3 w-3" />
-        Personal editing
+        <LockKeyhole className="h-3 w-3" />
+        Private
       </Badge>
     );
   }
@@ -51,8 +51,8 @@ export function LabBoardEmptyState({
         </p>
         <p className="text-sm text-muted-foreground">
           {filtered
-            ? "Try another editing mode or tag."
-            : "Create a community board or one with personal editing."}
+            ? "Try another access scope or tag."
+            : "Create a community or private board."}
         </p>
       </div>
     </div>
@@ -102,7 +102,7 @@ export function LabBoardList({
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5 px-4 pt-2">
-              <EditPolicyPill board={board} />
+              <AccessPill board={board} />
               {board.tags.slice(0, 3).map((tag) => (
                 <button
                   className={cn(
