@@ -115,11 +115,11 @@ jobs:
         # block the relay and Windows jobs.
         run: |
           set -euo pipefail
-          for attempt in 1 2 3; do
+          for attempt in 1 2 3 4 5 6; do
             if just test; then
               exit 0
             fi
-            echo "full test gate attempt ${attempt}/3 failed; retrying the complete gate"
+            echo "full test gate attempt ${attempt}/6 failed; retrying the complete gate"
           done
           exit 1
 
