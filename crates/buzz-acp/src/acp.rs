@@ -44,7 +44,7 @@ pub struct EnvVar {
 /// This is deliberately a separate type from the generic ACP request so a
 /// permission policy cannot leak to another adapter by accident. The harness
 /// remains in `dontAsk`; this narrow allowlist is the only pre-authorization
-/// Claude receives for Lab read/modify/write commands.
+/// Claude receives for managed Buzz commands, including publishing its reply.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ClaudeCodeSessionOptions {
     #[serde(rename = "allowedTools")]
@@ -3659,6 +3659,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let allowed_tools = vec![
+            "Bash(buzz messages send:*)".to_owned(),
             "Bash(buzz lab list:*)".to_owned(),
             "Bash(buzz lab get:*)".to_owned(),
             "Bash(buzz lab history:*)".to_owned(),
@@ -3685,6 +3686,7 @@ mod tests {
         assert_eq!(
             received["params"]["_meta"]["claudeCode"]["options"]["allowedTools"],
             serde_json::json!([
+                "Bash(buzz messages send:*)",
                 "Bash(buzz lab list:*)",
                 "Bash(buzz lab get:*)",
                 "Bash(buzz lab history:*)",

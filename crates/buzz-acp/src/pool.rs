@@ -179,7 +179,11 @@ pub struct OwnedAgent {
 /// rename, so the new name is a reliable capability gate.
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
-const CLAUDE_LAB_ALLOWED_TOOLS: &[&str] = &[
+const CLAUDE_BUZZ_ALLOWED_TOOLS: &[&str] = &[
+    // The base prompt requires every human-facing result to be published with
+    // this command. Keep it pre-authorized when adding feature-specific tools,
+    // otherwise Claude can do the work but cannot report the outcome.
+    "Bash(buzz messages send:*)",
     "Bash(buzz lab list:*)",
     "Bash(buzz lab get:*)",
     "Bash(buzz lab history:*)",
@@ -192,7 +196,7 @@ const CLAUDE_LAB_ALLOWED_TOOLS: &[&str] = &[
 
 fn claude_code_session_options(agent_name: &str) -> Option<ClaudeCodeSessionOptions> {
     (agent_name == CLAUDE_AGENT_ACP_NAME).then(|| ClaudeCodeSessionOptions {
-        allowed_tools: CLAUDE_LAB_ALLOWED_TOOLS
+        allowed_tools: CLAUDE_BUZZ_ALLOWED_TOOLS
             .iter()
             .map(|tool| (*tool).to_owned())
             .collect(),
@@ -4159,12 +4163,13 @@ mod tests {
     }
 
     #[test]
-    fn lab_allowlist_is_only_for_claude_and_is_narrow() {
+    fn claude_allowlist_preserves_reply_and_narrow_lab_permissions() {
         let claude = claude_code_session_options(CLAUDE_AGENT_ACP_NAME)
-            .expect("Claude must receive the typed Lab policy");
+            .expect("Claude must receive the typed Buzz policy");
         assert_eq!(
             claude.allowed_tools,
             vec![
+                "Bash(buzz messages send:*)",
                 "Bash(buzz lab list:*)",
                 "Bash(buzz lab get:*)",
                 "Bash(buzz lab history:*)",
@@ -4173,17 +4178,17 @@ mod tests {
             ]
         );
         let serialized = serde_json::to_value(&claude).unwrap();
-        assert!(serialized["allowedTools"]
-            .as_array()
-            .unwrap()
+        let allowed_tools = serialized["allowedTools"].as_array().unwrap();
+        assert!(allowed_tools
             .iter()
-            .all(|tool| {
-                let value = tool.as_str().unwrap();
-                !value.contains("buzz canvas")
-                    && !value.contains(" create")
-                    && !value.contains(" restore")
-                    && value.contains("Bash(buzz lab")
-            }));
+            .any(|tool| tool == "Bash(buzz messages send:*)"));
+        assert!(allowed_tools.iter().all(|tool| {
+            let value = tool.as_str().unwrap();
+            !value.contains("buzz canvas")
+                && !value.contains(" create")
+                && !value.contains(" restore")
+                && (value == "Bash(buzz messages send:*)" || value.contains("Bash(buzz lab"))
+        }));
         for adapter in [
             "goose",
             "codex",
