@@ -1,8 +1,8 @@
-name: Windows Lab Sidecar Hotfix
+name: Windows Lab ACP Reply Hotfix
 
-# Rebuild only the two Windows executables changed by the Lab agent-edit fix.
-# The unchanged desktop and sidecars are reused from the already-audited
-# portable test.8 package when this patch artifact is assembled locally.
+# Rebuild only buzz-acp.exe after restoring the managed-agent reply permission.
+# The desktop, CLI, and other sidecars are reused from the already-audited
+# portable hotfix.1 package when this patch artifact is assembled locally.
 on:
   push:
     branches:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows Lab ACP and CLI
+    name: Build Windows Lab ACP reply hotfix
     if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/build/lab-windows-canary'
     runs-on: windows-latest
     timeout-minutes: 60
@@ -21,7 +21,7 @@ jobs:
       contents: read
     env:
       TARGET: x86_64-pc-windows-msvc
-      LAB_BASE_SHA: 9b6e65b1d5d050e16edbbcbfc02649327367f66e
+      LAB_BASE_SHA: 88da732c22991dbf66c2fee4b527e04818401f4e
       SOURCE_SHA: ${{ github.sha }}
       BUILD_WORKFLOW_SHA: ${{ github.sha }}
 
@@ -105,43 +105,14 @@ jobs:
         shell: bash
         run: cargo test --target "$TARGET" -p buzz-acp
 
-      - name: Buzz CLI Lab tests
-        shell: bash
-        run: cargo test --target "$TARGET" -p buzz-cli lab --lib
-
-      - name: Build only ACP and CLI Windows executables
+      - name: Build only the ACP Windows executable
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-cli
+          cargo build --release --target "$TARGET" -p buzz-acp
           test -f "target/${TARGET}/release/buzz-acp.exe"
-          test -f "target/${TARGET}/release/buzz.exe"
 
-      - name: Smoke required Lab CAS base in the real CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          CLI="target/${TARGET}/release/buzz.exe"
-          "$CLI" lab update --help > "$RUNNER_TEMP/lab-update-help.txt"
-          grep -F -- '--base <BASE>' "$RUNNER_TEMP/lab-update-help.txt"
-
-          set +e
-          missing_base_output=$("$CLI" lab update \
-            86ebaa1e-ff37-41f6-824a-5dd3da4ffa92 \
-            --content 'markdown containing --base fake is still only content' 2>&1)
-          missing_base_status=$?
-          set -e
-          printf '%s\n' "$missing_base_output"
-          [[ "$missing_base_status" -ne 0 ]] || {
-            echo "::error::lab update accepted an invocation without a real --base flag" >&2
-            exit 1
-          }
-          grep -F -- '--base <BASE>' <<< "$missing_base_output" || {
-            echo "::error::failure was not the expected missing --base parse error" >&2
-            exit 1
-          }
-
-      - name: Package sidecar patch with provenance and hashes
+      - name: Package ACP patch with provenance and hashes
         id: package
         shell: bash
         run: |
@@ -150,7 +121,6 @@ jobs:
           rm -rf "$ARTIFACT_ROOT"
           mkdir -p "$ARTIFACT_ROOT"
           cp "target/${TARGET}/release/buzz-acp.exe" "$ARTIFACT_ROOT/buzz-acp.exe"
-          cp "target/${TARGET}/release/buzz.exe" "$ARTIFACT_ROOT/buzz.exe"
 
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           cat > "$ARTIFACT_ROOT/BUILD-MANIFEST.txt" <<EOF
@@ -166,16 +136,14 @@ jobs:
           RUST=1.95.0
           CARGO_FMT=cargo fmt --all -- --check
           ACP_TEST=cargo test --target $TARGET -p buzz-acp
-          CLI_LAB_TEST=cargo test --target $TARGET -p buzz-cli lab --lib
-          RELEASE_BUILD=cargo build --release --target $TARGET -p buzz-acp -p buzz-cli
-          CLI_BASE_FLAG=required-and-smoke-tested
-          INCLUDED_FILES=buzz-acp.exe,buzz.exe
+          RELEASE_BUILD=cargo build --release --target $TARGET -p buzz-acp
+          INCLUDED_FILES=buzz-acp.exe
           ARTIFACT_RETENTION_DAYS=7
           EOF
 
           (
             cd "$ARTIFACT_ROOT"
-            sha256sum buzz-acp.exe buzz.exe BUILD-MANIFEST.txt > SHA256SUMS.txt
+            sha256sum buzz-acp.exe BUILD-MANIFEST.txt > SHA256SUMS.txt
             sha256sum -c SHA256SUMS.txt
           )
           ls -lh "$ARTIFACT_ROOT"
@@ -183,10 +151,10 @@ jobs:
           cat "$ARTIFACT_ROOT/SHA256SUMS.txt"
           echo "root=$ARTIFACT_ROOT" >> "$GITHUB_OUTPUT"
 
-      - name: Upload ACP and CLI patch (7 days)
+      - name: Upload ACP reply patch (7 days)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-lab-windows-sidecar-hotfix-${{ github.sha }}
+          name: buzz-lab-windows-acp-reply-hotfix-${{ github.sha }}
           path: ${{ steps.package.outputs.root }}
           if-no-files-found: error
           retention-days: 7
