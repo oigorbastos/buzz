@@ -5,7 +5,7 @@ name: Windows Lab V2 Portable Canary
 on:
   push:
     branches:
-      - codex/lab-v2-windows-canary-20260808-05
+      - codex/lab-v2-windows-canary-20260808-06
 
 permissions:
   contents: read
@@ -16,8 +16,8 @@ concurrency:
 
 env:
   APPROVED_UX_SHA: 1550474e325c979ae890709bb7ac89accd4125b3
-  FEATURE_SHA: 2ba75701a13d3345b2cf6e1ce9728e737cac5a89
-  LAB_BASE_SHA: 2ba75701a13d3345b2cf6e1ce9728e737cac5a89
+  FEATURE_SHA: 6cd14b6d8e3dba0b5357af4f2cd49186da73cf82
+  LAB_BASE_SHA: 6cd14b6d8e3dba0b5357af4f2cd49186da73cf82
   SOURCE_SHA: ${{ github.sha }}
   BUILD_WORKFLOW_SHA: ${{ github.sha }}
   TARGET: x86_64-pc-windows-msvc
@@ -25,7 +25,7 @@ env:
 jobs:
   linux-preflight:
     name: Linux full-stack preflight
-    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/codex/lab-v2-windows-canary-20260808-05'
+    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/codex/lab-v2-windows-canary-20260808-06'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -37,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_REPOSITORY" == "oigorbastos/buzz" ]] || exit 1
-          [[ "$GITHUB_REF" == "refs/heads/codex/lab-v2-windows-canary-20260808-05" ]] || exit 1
+          [[ "$GITHUB_REF" == "refs/heads/codex/lab-v2-windows-canary-20260808-06" ]] || exit 1
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$BUILD_WORKFLOW_SHA" == "$SOURCE_SHA" ]] || exit 1
           [[ "$APPROVED_UX_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
@@ -198,7 +198,7 @@ jobs:
   windows-portable:
     name: Windows unsigned portable ZIP
     needs: linux-preflight
-    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/codex/lab-v2-windows-canary-20260808-05'
+    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/codex/lab-v2-windows-canary-20260808-06'
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -210,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_REPOSITORY" == "oigorbastos/buzz" ]] || exit 1
-          [[ "$GITHUB_REF" == "refs/heads/codex/lab-v2-windows-canary-20260808-05" ]] || exit 1
+          [[ "$GITHUB_REF" == "refs/heads/codex/lab-v2-windows-canary-20260808-06" ]] || exit 1
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$BUILD_WORKFLOW_SHA" == "$SOURCE_SHA" ]] || exit 1
           [[ "$FEATURE_SHA" == "$LAB_BASE_SHA" ]] || exit 1
