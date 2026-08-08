@@ -110,6 +110,8 @@ jobs:
 
       - name: Run repository full test gate
         shell: bash
+        # The repository-wide suite contains timing-sensitive tests; keep the
+        # canary source immutable while allowing a normal push retry.
         run: just test
 
       - name: Reset isolated services before live relay proof
