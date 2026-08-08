@@ -1,9 +1,26 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 
 const host = process.env.TAURI_DEV_HOST;
+const previewAllowedHost = process.env.BUZZ_PREVIEW_ALLOWED_HOST;
+const indexHtml = readFileSync(
+  new URL("./index.html", import.meta.url),
+  "utf8",
+);
+const inlineScriptHashes = [
+  ...indexHtml.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g),
+]
+  .map((match) => match[1])
+  .filter((script) => script.length > 0)
+  .map(
+    (script) =>
+      `'sha256-${createHash("sha256").update(script).digest("base64")}'`,
+  );
+const previewScriptPolicy = ["'self'", ...inlineScriptHashes].join(" ");
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -24,7 +41,10 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": "/src",
-      "@features-manifest": path.resolve(__dirname, "../preview-features.json"),
+      "@features-manifest": path.resolve(
+        import.meta.dirname,
+        "../preview-features.json",
+      ),
     },
   },
 
@@ -47,6 +67,18 @@ export default defineConfig(async () => ({
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
+    },
+  },
+  preview: {
+    allowedHosts: previewAllowedHost ? [previewAllowedHost] : undefined,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": `default-src 'self'; script-src ${previewScriptPolicy}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
+      "Cross-Origin-Resource-Policy": "same-origin",
+      "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
     },
   },
 }));
