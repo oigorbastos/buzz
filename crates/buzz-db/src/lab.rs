@@ -492,7 +492,9 @@ pub async fn create_board_head_tx(
 ///
 /// `title`/`summary` are the caller-resolved *effective* values (the relay
 /// handler already merged "tag present" vs "keep existing" before calling
-/// this — this function always overwrites unconditionally).
+/// this — this function always overwrites unconditionally). `tags` is the
+/// caller-resolved effective topic-tag set and is persisted with the head
+/// pointer so the database projection cannot drift from the signed head event.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_board_content_head_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -503,12 +505,13 @@ pub async fn update_board_content_head_tx(
     head_projection_event_id: &[u8],
     title: &str,
     summary: Option<&str>,
+    tags: &[String],
     actor_pubkey: &[u8],
 ) -> Result<BoardHead> {
     let row = sqlx::query(concat!(
         "UPDATE lab_board_heads \
          SET revision = $3, head_revision_event_id = $4, head_projection_event_id = $5, \
-             title = $6, summary = $7, updated_at = now(), updated_by = $8 \
+             title = $6, summary = $7, tags = $8, updated_at = now(), updated_by = $9 \
          WHERE community_id = $1 AND board_id = $2 \
          RETURNING ",
         board_head_columns!()
@@ -520,6 +523,7 @@ pub async fn update_board_content_head_tx(
     .bind(head_projection_event_id)
     .bind(title)
     .bind(summary)
+    .bind(tags)
     .bind(actor_pubkey)
     .fetch_optional(&mut **tx)
     .await?;

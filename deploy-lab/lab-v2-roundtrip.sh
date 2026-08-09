@@ -72,6 +72,6 @@ import sys
 
 rows = json.load(open(sys.argv[1], encoding="utf-8"))
 assert [row["revision"] for row in rows] == [1, 2, 3], rows
-assert [row["op"] for row in rows] == ["create", "update", "update"], rows
+assert [row["op"] for row in rows] == ["create_v2", "update_v2", "update"], rows
 print("CLI V2 round-trip passed: private metadata, tag replacement/preservation, CAS, history")
 PY

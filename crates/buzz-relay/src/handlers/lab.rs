@@ -1080,6 +1080,7 @@ async fn handle_content_mutation(
             head_event.id.as_bytes(),
             &title,
             summary.as_deref(),
+            &topic_tags,
             author_pubkey.as_slice(),
         )
         .await

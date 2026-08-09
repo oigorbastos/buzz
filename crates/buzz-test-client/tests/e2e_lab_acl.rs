@@ -96,6 +96,36 @@ fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
     })
 }
 
+fn topic_tag_values(event: &Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.first().map(String::as_str) == Some("t"))
+                .then(|| parts.get(1).cloned())
+                .flatten()
+        })
+        .collect()
+}
+
+async fn db_head_snapshot(
+    pool: &PgPool,
+    community_id: Uuid,
+    board_id: Uuid,
+) -> (Vec<u8>, Vec<String>) {
+    sqlx::query_as(
+        "SELECT head_projection_event_id, tags
+         FROM lab_board_heads
+         WHERE community_id = $1 AND board_id = $2",
+    )
+    .bind(community_id)
+    .bind(board_id)
+    .fetch_one(pool)
+    .await
+    .expect("load Lab Board head snapshot")
+}
+
 fn board_filter(board_id: Uuid) -> Filter {
     Filter::new()
         .kinds([
@@ -448,4 +478,150 @@ async fn lab_v2_acl_queries_counts_subscriptions_and_managed_agents() {
     for client in [ws_a, ws_agent_a, ws_b, ws_agent_b] {
         client.disconnect().await.expect("disconnect E2E client");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated Postgres/Redis-backed relay"]
+async fn lab_v2_tag_replacement_survives_legacy_update_in_db_and_projection() {
+    assert_eq!(
+        std::env::var("BUZZ_ALLOW_NIP_OA_AUTH").as_deref(),
+        Ok("true"),
+        "the real V2 tag proof requires NIP-OA owner mappings to be enabled"
+    );
+
+    let owner = Keys::generate();
+    let agent = Keys::generate();
+    let other_owner = Keys::generate();
+    let other_agent = Keys::generate();
+    let pool = database_pool().await;
+    let community_id = seed_users(&pool, [&owner, &agent, &other_owner, &other_agent]).await;
+    let mut client = BuzzTestClient::connect(&relay_url(), &owner)
+        .await
+        .expect("connect Lab tag regression client");
+    let mut agent_client = BuzzTestClient::connect(&relay_url(), &agent)
+        .await
+        .expect("connect Lab tag regression managed agent");
+
+    let board_id = Uuid::new_v4();
+    let create = signed_board_event(
+        &owner,
+        board_id,
+        "create_v2",
+        "tag regression v1",
+        [
+            Tag::parse(["title", "Tag regression"]).expect("title tag"),
+            Tag::parse(["revision", "1"]).expect("revision tag"),
+            Tag::parse(["access_scope", "private"]).expect("scope tag"),
+            Tag::parse(["tags", "replace"]).expect("tags marker"),
+            Tag::parse(["t", "initial-tag"]).expect("initial topic tag"),
+        ],
+    );
+    let create_id = create.id;
+    let accepted = client
+        .send_event(create)
+        .await
+        .expect("send tag regression create");
+    assert!(accepted.accepted, "create rejected: {}", accepted.message);
+
+    let initial_events =
+        ws_query(&mut client, "tag-regression-create", board_filter(board_id)).await;
+    let initial_head = initial_events
+        .iter()
+        .find(|event| event.kind == Kind::Custom(KIND_LAB_BOARD_HEAD as u16))
+        .expect("initial head projection");
+    assert_eq!(
+        tag_value(initial_head, "head"),
+        Some(create_id.to_hex().as_str())
+    );
+    assert_eq!(topic_tag_values(initial_head), vec!["initial-tag"]);
+    let (initial_projection_id, initial_db_tags) =
+        db_head_snapshot(&pool, community_id, board_id).await;
+    assert_eq!(initial_projection_id, initial_head.id.as_bytes());
+    assert_eq!(initial_db_tags, vec!["initial-tag"]);
+
+    let create_id_hex = create_id.to_hex();
+    let update_v2 = signed_board_event(
+        &agent,
+        board_id,
+        "update_v2",
+        "tag regression v2",
+        [
+            Tag::parse(["prev", create_id_hex.as_str()]).expect("update prev tag"),
+            Tag::parse(["revision", "2"]).expect("update revision tag"),
+            Tag::parse(["tags", "replace"]).expect("replacement marker"),
+            Tag::parse(["t", "replacement-tag"]).expect("replacement topic tag"),
+        ],
+    );
+    let update_v2_id = update_v2.id;
+    let accepted = agent_client
+        .send_event(update_v2)
+        .await
+        .expect("send V2 tag replacement");
+    assert!(
+        accepted.accepted,
+        "update_v2 rejected: {}",
+        accepted.message
+    );
+
+    let replaced_events = ws_query(&mut client, "tag-regression-v2", board_filter(board_id)).await;
+    let replaced_head = replaced_events
+        .iter()
+        .find(|event| event.kind == Kind::Custom(KIND_LAB_BOARD_HEAD as u16))
+        .expect("replacement head projection");
+    assert_eq!(
+        tag_value(replaced_head, "head"),
+        Some(update_v2_id.to_hex().as_str())
+    );
+    assert_eq!(topic_tag_values(replaced_head), vec!["replacement-tag"]);
+    let (replaced_projection_id, replaced_db_tags) =
+        db_head_snapshot(&pool, community_id, board_id).await;
+    assert_eq!(replaced_projection_id, replaced_head.id.as_bytes());
+    assert_eq!(replaced_db_tags, vec!["replacement-tag"]);
+
+    let update_v2_id_hex = update_v2_id.to_hex();
+    let legacy_update = signed_board_event(
+        &agent,
+        board_id,
+        "update",
+        "tag regression v3",
+        [
+            Tag::parse(["prev", update_v2_id_hex.as_str()]).expect("legacy prev tag"),
+            Tag::parse(["revision", "3"]).expect("legacy revision tag"),
+        ],
+    );
+    let legacy_update_id = legacy_update.id;
+    let accepted = agent_client
+        .send_event(legacy_update)
+        .await
+        .expect("send legacy tag-preserving update");
+    assert!(
+        accepted.accepted,
+        "legacy update rejected: {}",
+        accepted.message
+    );
+
+    let legacy_events =
+        ws_query(&mut client, "tag-regression-legacy", board_filter(board_id)).await;
+    let legacy_head = legacy_events
+        .iter()
+        .find(|event| event.kind == Kind::Custom(KIND_LAB_BOARD_HEAD as u16))
+        .expect("legacy update head projection");
+    assert_eq!(
+        tag_value(legacy_head, "head"),
+        Some(legacy_update_id.to_hex().as_str())
+    );
+    assert_eq!(topic_tag_values(legacy_head), vec!["replacement-tag"]);
+    let (legacy_projection_id, legacy_db_tags) =
+        db_head_snapshot(&pool, community_id, board_id).await;
+    assert_eq!(legacy_projection_id, legacy_head.id.as_bytes());
+    assert_eq!(legacy_db_tags, vec!["replacement-tag"]);
+
+    client
+        .disconnect()
+        .await
+        .expect("disconnect tag regression client");
+    agent_client
+        .disconnect()
+        .await
+        .expect("disconnect tag regression agent");
 }
