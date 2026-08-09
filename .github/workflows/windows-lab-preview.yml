@@ -1,53 +1,75 @@
-name: Windows Lab ACP Reply Hotfix
+name: Windows Lab V2 Portable Recovery
 
-# Rebuild only buzz-acp.exe after restoring the managed-agent reply permission.
-# The desktop, CLI, and other sidecars are reused from the already-audited
-# portable hotfix.1 package when this patch artifact is assembled locally.
+# Recovery-only workflow: reuse the immutable successful Linux proof and run
+# only the targeted Windows gates needed to build and audit one portable ZIP.
 on:
   push:
     branches:
-      - build/lab-windows-canary
+      - codex/lab-v2-windows-recovery-20260809-02
 
 permissions:
   contents: read
 
+concurrency:
+  group: buzz-lab-v2-windows-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_REPOSITORY: oigorbastos/buzz
+  EXPECTED_REF: refs/heads/codex/lab-v2-windows-recovery-20260809-02
+  APPROVED_UX_SHA: 1550474e325c979ae890709bb7ac89accd4125b3
+  FEATURE_SHA: 1766ec542d6738d4825a5f8940e93b79a8ad0910
+  LAB_BASE_SHA: 1766ec542d6738d4825a5f8940e93b79a8ad0910
+  SOURCE_SHA: ${{ github.sha }}
+  BUILD_WORKFLOW_SHA: ${{ github.sha }}
+  PROVEN_LINUX_RUN_ID: "31312528178"
+  PROVEN_LINUX_RUN_URL: https://github.com/oigorbastos/buzz/actions/runs/31312528178
+  PROVEN_LINUX_HEAD_SHA: 6d4846826d7b6150fbe9c73d79ab791c9505915d
+  PROVEN_LINUX_JOB_ID: "93242422306"
+  PROVEN_LINUX_JOB_NAME: Linux full-stack preflight
+  TARGET: x86_64-pc-windows-msvc
+
 jobs:
-  build:
-    name: Build Windows Lab ACP reply hotfix
-    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/build/lab-windows-canary'
-    runs-on: windows-latest
-    timeout-minutes: 60
+  verify-proven-linux:
+    name: Verify immutable Linux proof
+    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/codex/lab-v2-windows-recovery-20260809-02' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
-    env:
-      TARGET: x86_64-pc-windows-msvc
-      LAB_BASE_SHA: 88da732c22991dbf66c2fee4b527e04818401f4e
-      SOURCE_SHA: ${{ github.sha }}
-      BUILD_WORKFLOW_SHA: ${{ github.sha }}
+      actions: read
 
     steps:
-      - name: Require fork, branch, and complete source SHA
+      - name: Require repository, ref, and exact immutable SHAs
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REPOSITORY" == "oigorbastos/buzz" ]] || {
-            echo "::error::This build is restricted to oigorbastos/buzz" >&2
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] || {
+            echo "::error::Unexpected repository: $GITHUB_REPOSITORY" >&2
             exit 1
           }
-          [[ "$GITHUB_REF" == "refs/heads/build/lab-windows-canary" ]] || {
-            echo "::error::This build is restricted to build/lab-windows-canary" >&2
+          [[ "$GITHUB_REF" == "$EXPECTED_REF" ]] || {
+            echo "::error::Unexpected ref: $GITHUB_REF" >&2
             exit 1
           }
-          [[ "$LAB_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "::error::LAB_BASE_SHA must be a complete feature commit SHA" >&2
+          [[ "$FEATURE_SHA" == "1766ec542d6738d4825a5f8940e93b79a8ad0910" ]] || {
+            echo "::error::FEATURE_SHA differs from the approved feature" >&2
+            exit 1
+          }
+          [[ "$LAB_BASE_SHA" == "$FEATURE_SHA" ]] || {
+            echo "::error::LAB_BASE_SHA must equal FEATURE_SHA" >&2
             exit 1
           }
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "::error::SOURCE_SHA must be a complete commit SHA" >&2
+            echo "::error::SOURCE_SHA must be a full commit SHA" >&2
             exit 1
           }
           [[ "$BUILD_WORKFLOW_SHA" == "$SOURCE_SHA" ]] || {
             echo "::error::Workflow SHA and source SHA differ" >&2
+            exit 1
+          }
+          [[ "$PROVEN_LINUX_HEAD_SHA" == "6d4846826d7b6150fbe9c73d79ab791c9505915d" ]] || {
+            echo "::error::Proven Linux head SHA changed" >&2
             exit 1
           }
 
@@ -57,21 +79,146 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify immutable Lab source
+      - name: Verify one direct workflow-only child of the feature
         shell: bash
         run: |
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || {
-            echo "::error::Checked-out commit does not equal SOURCE_SHA" >&2
+            echo "::error::Checkout does not equal SOURCE_SHA" >&2
             exit 1
           }
-          git merge-base --is-ancestor "$LAB_BASE_SHA" "$SOURCE_SHA" || {
-            echo "::error::Canary source must descend from LAB_BASE_SHA" >&2
+          [[ "$(git rev-list --parents -n 1 "$SOURCE_SHA")" == "$SOURCE_SHA $FEATURE_SHA" ]] || {
+            echo "::error::Recovery source must be a non-merge direct child of FEATURE_SHA" >&2
             exit 1
           }
-          mapfile -t changed_files < <(git diff --name-only "$LAB_BASE_SHA" "$SOURCE_SHA")
+          [[ "$(git rev-list --count "$FEATURE_SHA..$SOURCE_SHA")" == "1" ]] || {
+            echo "::error::Recovery branch must contain exactly one commit after FEATURE_SHA" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$FEATURE_SHA" "$SOURCE_SHA"
+          mapfile -t changed_files < <(git diff --name-only "$FEATURE_SHA" "$SOURCE_SHA")
           [[ "${#changed_files[@]}" -eq 1 && "${changed_files[0]}" == ".github/workflows/windows-lab-preview.yml" ]] || {
-            echo "::error::Relative to LAB_BASE_SHA, canary may change only the preview workflow" >&2
+            echo "::error::Recovery commit may change only the Windows workflow" >&2
+            printf '%s\n' "${changed_files[@]}" >&2
+            exit 1
+          }
+          git diff --check "$FEATURE_SHA" "$SOURCE_SHA"
+          [[ -z "$(git status --porcelain)" ]] || {
+            echo "::error::Checkout is unexpectedly dirty" >&2
+            exit 1
+          }
+
+      - name: Verify workflow shape and Windows exclusions
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow=".github/workflows/windows-lab-preview.yml"
+          mapfile -t job_ids < <(
+            awk '
+              /^jobs:$/ { in_jobs = 1; next }
+              in_jobs && /^  [A-Za-z0-9_-]+:$/ {
+                value = $0
+                sub(/^  /, "", value)
+                sub(/:$/, "", value)
+                print value
+              }
+            ' "$workflow"
+          )
+          [[ "${#job_ids[@]}" -eq 2 ]] || {
+            echo "::error::Workflow must contain exactly two jobs" >&2
+            printf '%s\n' "${job_ids[@]}" >&2
+            exit 1
+          }
+          [[ "${job_ids[0]}" == "verify-proven-linux" && "${job_ids[1]}" == "windows-portable" ]] || {
+            echo "::error::Unexpected workflow job set" >&2
+            printf '%s\n' "${job_ids[@]}" >&2
+            exit 1
+          }
+          windows_job=$(sed -n '/^  windows-portable:$/,$p' "$workflow")
+          if grep -Eiq 'activate-hermit|bin/hermit|HERMIT_STATE_DIR|(^|[[:space:]])just([[:space:]]|$)' <<<"$windows_job"; then
+            echo "::error::Forbidden tool or Linux gate found in Windows job" >&2
+            exit 1
+          fi
+
+      - name: Verify the approved Linux job through the GitHub API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PROVEN_LINUX_RUN_ID")
+          [[ "$(jq -r '.repository.full_name' <<<"$run_json")" == "$EXPECTED_REPOSITORY" ]] || {
+            echo "::error::Proven run belongs to a different repository" >&2
+            exit 1
+          }
+          [[ "$(jq -r '.head_sha' <<<"$run_json")" == "$PROVEN_LINUX_HEAD_SHA" ]] || {
+            echo "::error::Proven run head SHA differs from the approved canary" >&2
+            exit 1
+          }
+          [[ "$(jq -r '.status' <<<"$run_json")" == "completed" ]] || {
+            echo "::error::Proven run is not completed" >&2
+            exit 1
+          }
+
+          jobs_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PROVEN_LINUX_RUN_ID/jobs?per_page=100")
+          job_count=$(jq --arg name "$PROVEN_LINUX_JOB_NAME" '[.jobs[] | select(.name == $name)] | length' <<<"$jobs_json")
+          [[ "$job_count" == "1" ]] || {
+            echo "::error::Expected exactly one proven Linux job, found $job_count" >&2
+            exit 1
+          }
+          job_id=$(jq -r --arg name "$PROVEN_LINUX_JOB_NAME" '.jobs[] | select(.name == $name) | .id' <<<"$jobs_json")
+          job_status=$(jq -r --arg name "$PROVEN_LINUX_JOB_NAME" '.jobs[] | select(.name == $name) | .status' <<<"$jobs_json")
+          job_conclusion=$(jq -r --arg name "$PROVEN_LINUX_JOB_NAME" '.jobs[] | select(.name == $name) | .conclusion' <<<"$jobs_json")
+          [[ "$job_id" == "$PROVEN_LINUX_JOB_ID" ]] || {
+            echo "::error::Proven Linux job ID differs from the approved job" >&2
+            exit 1
+          }
+          [[ "$job_status" == "completed" && "$job_conclusion" == "success" ]] || {
+            echo "::error::Proven Linux job is not a completed success" >&2
+            exit 1
+          }
+          {
+            echo "Verified Linux proof: $PROVEN_LINUX_RUN_URL"
+            echo "Head SHA: $PROVEN_LINUX_HEAD_SHA"
+            echo "Job: $PROVEN_LINUX_JOB_NAME ($PROVEN_LINUX_JOB_ID) — success"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows-portable:
+    name: Windows unsigned portable ZIP
+    needs: verify-proven-linux
+    if: github.repository == 'oigorbastos/buzz' && github.ref == 'refs/heads/codex/lab-v2-windows-recovery-20260809-02' && github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require immutable recovery source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] || exit 1
+          [[ "$GITHUB_REF" == "$EXPECTED_REF" ]] || exit 1
+          [[ "$FEATURE_SHA" == "1766ec542d6738d4825a5f8940e93b79a8ad0910" ]] || exit 1
+          [[ "$LAB_BASE_SHA" == "$FEATURE_SHA" ]] || exit 1
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$BUILD_WORKFLOW_SHA" == "$SOURCE_SHA" ]] || exit 1
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify direct-child source and workflow-only diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || exit 1
+          [[ "$(git rev-list --parents -n 1 "$SOURCE_SHA")" == "$SOURCE_SHA $FEATURE_SHA" ]] || exit 1
+          [[ "$(git rev-list --count "$FEATURE_SHA..$SOURCE_SHA")" == "1" ]] || exit 1
+          mapfile -t changed_files < <(git diff --name-only "$FEATURE_SHA" "$SOURCE_SHA")
+          [[ "${#changed_files[@]}" -eq 1 && "${changed_files[0]}" == ".github/workflows/windows-lab-preview.yml" ]] || {
             printf '%s\n' "${changed_files[@]}" >&2
             exit 1
           }
@@ -81,49 +228,157 @@ jobs:
           targets: ${{ env.TARGET }}
           components: rustfmt
 
-      - name: Verify Rust toolchain
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.14.1
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.4.0
+
+      - name: Verify pinned toolchains
         shell: bash
         run: |
           set -euo pipefail
           rustc --version
-          [[ "$(rustc --version)" == rustc\ 1.95.0* ]] || {
-            echo "::error::Expected Rust 1.95.0" >&2
-            exit 1
-          }
+          node --version
+          pnpm --version
+          [[ "$(rustc --version)" == rustc\ 1.95.0* ]] || exit 1
+          [[ "$(node --version)" == "v24.14.1" ]] || exit 1
+          [[ "$(pnpm --version)" == "11.4.0" ]] || exit 1
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: .
-          key: windows-lab-sidecars
-          save-if: ${{ github.ref == 'refs/heads/build/lab-windows-canary' }}
+      - name: Install frozen JavaScript dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
 
-      - name: Rust format check
+      - name: Check Rust formatting
         shell: bash
         run: cargo fmt --all -- --check
 
-      - name: Buzz ACP tests
-        shell: bash
-        run: cargo test --target "$TARGET" -p buzz-acp
-
-      - name: Build only the ACP Windows executable
+      - name: Run targeted Rust tests
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --target "$TARGET" -p buzz-acp
-          test -f "target/${TARGET}/release/buzz-acp.exe"
+          cargo test -p buzz-acp
+          cargo test -p buzz-cli lab --lib
 
-      - name: Package ACP patch with provenance and hashes
+      - name: Run desktop checks and unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -C desktop check
+          pnpm -C desktop typecheck
+          pnpm -C desktop test
+
+      - name: Build desktop E2E and production frontends
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -C desktop build:e2e
+          pnpm -C desktop build
+
+      - name: Build and bundle Windows sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET" \
+            -p buzz-acp \
+            -p buzz-agent \
+            -p buzz-dev-mcp \
+            -p git-credential-nostr \
+            -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+          for sidecar in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+            test -f "target/$TARGET/release/$sidecar.exe"
+            test -f "desktop/src-tauri/binaries/$sidecar-$TARGET.exe"
+          done
+
+      - name: Run managed-agent Nest test
+        shell: bash
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+
+      - name: Generate temporary non-updating Tauri config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > desktop/src-tauri/tauri.canary.conf.json <<'JSON'
+          {
+            "bundle": { "createUpdaterArtifacts": false },
+            "plugins": { "updater": { "endpoints": [] } }
+          }
+          JSON
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const actual = JSON.parse(fs.readFileSync("desktop/src-tauri/tauri.canary.conf.json", "utf8"));
+          const expected = {
+            bundle: { createUpdaterArtifacts: false },
+            plugins: { updater: { endpoints: [] } },
+          };
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+            throw new Error("Temporary Tauri config differs from the approved non-updating config");
+          }
+          NODE
+
+      - name: Build Windows desktop executable without bundle or signing
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          set -euo pipefail
+          rm -rf "desktop/src-tauri/target/$TARGET/release/bundle"
+          pnpm -C desktop tauri build \
+            --target x86_64-pc-windows-msvc \
+            --no-bundle \
+            --no-sign \
+            --ci \
+            --config src-tauri/tauri.canary.conf.json
+
+      - name: Package, reextract, and audit one portable ZIP
         id: package
         shell: bash
         run: |
           set -euo pipefail
-          ARTIFACT_ROOT="$RUNNER_TEMP/buzz-lab-windows-sidecar-hotfix"
-          rm -rf "$ARTIFACT_ROOT"
-          mkdir -p "$ARTIFACT_ROOT"
-          cp "target/${TARGET}/release/buzz-acp.exe" "$ARTIFACT_ROOT/buzz-acp.exe"
+          TARGET_ROOT="desktop/src-tauri/target/$TARGET/release"
+          APP_EXE="$TARGET_ROOT/buzz-desktop.exe"
+          [[ -f "$APP_EXE" ]] || {
+            echo "::error::Desktop executable not found at $APP_EXE" >&2
+            exit 1
+          }
+          for sidecar in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+            [[ -f "target/$TARGET/release/$sidecar.exe" ]] || {
+              echo "::error::Missing sidecar: $sidecar.exe" >&2
+              exit 1
+            }
+          done
+          [[ ! -d "$TARGET_ROOT/bundle" ]] || {
+            echo "::error::Tauri bundle directory exists after --no-bundle" >&2
+            exit 1
+          }
+          if find "$TARGET_ROOT" -type f \( -iname '*.msi' -o -iname '*.nsis' -o -iname '*.appinstaller' -o -iname '*.sig' \) -print -quit | grep -q .; then
+            echo "::error::Installer, updater, or signature output found" >&2
+            exit 1
+          fi
 
-          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          cat > "$ARTIFACT_ROOT/BUILD-MANIFEST.txt" <<EOF
+          PORTABLE_ROOT="$RUNNER_TEMP/buzz-alis-lab-v2-portable-root"
+          EXTRACT_ROOT="$RUNNER_TEMP/buzz-alis-lab-v2-portable-reextract"
+          RELEASE_ROOT="$RUNNER_TEMP/buzz-alis-lab-v2-portable-release"
+          rm -rf "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
+          mkdir -p "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
+          cp "$APP_EXE" "$PORTABLE_ROOT/buzz-desktop.exe"
+          cp "target/$TARGET/release/buzz-acp.exe" "$PORTABLE_ROOT/buzz-acp.exe"
+          cp "target/$TARGET/release/buzz-agent.exe" "$PORTABLE_ROOT/buzz-agent.exe"
+          cp "target/$TARGET/release/buzz-dev-mcp.exe" "$PORTABLE_ROOT/buzz-dev-mcp.exe"
+          cp "target/$TARGET/release/git-credential-nostr.exe" "$PORTABLE_ROOT/git-credential-nostr.exe"
+          cp "target/$TARGET/release/buzz.exe" "$PORTABLE_ROOT/buzz.exe"
+
+          VERSION=$(node -p "require('./desktop/package.json').version")
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          RUST_VERSION=$(rustc --version)
+          NODE_VERSION=$(node --version)
+          PNPM_VERSION=$(pnpm --version)
+          cat > "$PORTABLE_ROOT/BUILD-MANIFEST.txt" <<EOF
+          APPROVED_UX_SHA=$APPROVED_UX_SHA
+          FEATURE_SHA=$FEATURE_SHA
           LAB_BASE_SHA=$LAB_BASE_SHA
           SOURCE_SHA=$SOURCE_SHA
           BUILD_WORKFLOW_SHA=$BUILD_WORKFLOW_SHA
@@ -132,30 +387,158 @@ jobs:
           GITHUB_REF=$GITHUB_REF
           GITHUB_RUN_ID=$GITHUB_RUN_ID
           GITHUB_RUN_URL=$RUN_URL
+          PROVEN_LINUX_RUN_ID=$PROVEN_LINUX_RUN_ID
+          PROVEN_LINUX_RUN_URL=$PROVEN_LINUX_RUN_URL
+          PROVEN_LINUX_HEAD_SHA=$PROVEN_LINUX_HEAD_SHA
+          PROVEN_LINUX_JOB_ID=$PROVEN_LINUX_JOB_ID
+          PROVEN_LINUX_JOB_NAME=$PROVEN_LINUX_JOB_NAME
+          PROVEN_LINUX_JOB_RESULT=success
+          CURRENT_LINUX_COMPILATION=not-run-authorized-recovery
+          VERSION=$VERSION
           TARGET=$TARGET
-          RUST=1.95.0
-          CARGO_FMT=cargo fmt --all -- --check
-          ACP_TEST=cargo test --target $TARGET -p buzz-acp
-          RELEASE_BUILD=cargo build --release --target $TARGET -p buzz-acp
-          INCLUDED_FILES=buzz-acp.exe
+          RUNNER=windows-latest
+          RUNNER_OS=$RUNNER_OS
+          RUNNER_ARCH=$RUNNER_ARCH
+          RUST=$RUST_VERSION
+          NODE=$NODE_VERSION
+          PNPM=$PNPM_VERSION
+          WINDOWS_GATE_01=cargo fmt --all -- --check
+          WINDOWS_GATE_02=cargo test -p buzz-acp
+          WINDOWS_GATE_03=cargo test -p buzz-cli lab --lib
+          WINDOWS_GATE_04=pnpm -C desktop check
+          WINDOWS_GATE_05=pnpm -C desktop typecheck
+          WINDOWS_GATE_06=pnpm -C desktop test
+          WINDOWS_GATE_07=pnpm -C desktop build:e2e
+          WINDOWS_GATE_08=pnpm -C desktop build
+          SIDECAR_BUILD=cargo build --release --target x86_64-pc-windows-msvc -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh x86_64-pc-windows-msvc
+          NEST_TEST=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+          TAURI_COMMAND=pnpm -C desktop tauri build --target x86_64-pc-windows-msvc --no-bundle --no-sign --ci --config src-tauri/tauri.canary.conf.json
+          TAURI_BUNDLE=none
+          TAURI_SIGNING=disabled
+          CREATE_UPDATER_ARTIFACTS=false
+          UPDATER_ENDPOINTS=[]
+          INSTALLERS=none
+          NSIS=disabled
+          MSI=disabled
+          AUTHENTICODE=NotSigned
+          REAL_CREDENTIALS_INCLUDED=false
+          PRODUCTION_CONTACTED=false
+          STAGING_CONTACTED=false
+          INCLUDED_FILES=buzz-desktop.exe,buzz-acp.exe,buzz-agent.exe,buzz-dev-mcp.exe,git-credential-nostr.exe,buzz.exe,BUILD-MANIFEST.txt,SHA256SUMS.txt
+          INTERNAL_SHA256_SCOPE=six executables plus BUILD-MANIFEST.txt; SHA256SUMS.txt excluded
+          EXECUTED_SMOKES=buzz --help; buzz lab --help; buzz lab get --help; buzz lab update --help; buzz-acp --help
           ARTIFACT_RETENTION_DAYS=7
           EOF
 
           (
-            cd "$ARTIFACT_ROOT"
-            sha256sum buzz-acp.exe BUILD-MANIFEST.txt > SHA256SUMS.txt
+            cd "$PORTABLE_ROOT"
+            sha256sum \
+              buzz-desktop.exe \
+              buzz-acp.exe \
+              buzz-agent.exe \
+              buzz-dev-mcp.exe \
+              git-credential-nostr.exe \
+              buzz.exe \
+              BUILD-MANIFEST.txt > SHA256SUMS.txt
             sha256sum -c SHA256SUMS.txt
           )
-          ls -lh "$ARTIFACT_ROOT"
-          cat "$ARTIFACT_ROOT/BUILD-MANIFEST.txt"
-          cat "$ARTIFACT_ROOT/SHA256SUMS.txt"
-          echo "root=$ARTIFACT_ROOT" >> "$GITHUB_OUTPUT"
 
-      - name: Upload ACP reply patch (7 days)
+          ZIP_NAME="buzz-alis-lab-v2-windows-portable-$TARGET.zip"
+          ZIP_PATH="$RELEASE_ROOT/$ZIP_NAME"
+          (
+            cd "$PORTABLE_ROOT"
+            7z a -tzip -mx=9 "$ZIP_PATH" ./* >/dev/null
+          )
+          7z t "$ZIP_PATH" >/dev/null
+          ZIP_SHA=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          ZIP_SIZE=$(stat -c '%s' "$ZIP_PATH")
+          cat > "$RELEASE_ROOT/ZIP-SHA256.txt" <<EOF
+          SHA256=$ZIP_SHA
+          SIZE_BYTES=$ZIP_SIZE
+          ZIP=$ZIP_NAME
+          SOURCE_SHA=$SOURCE_SHA
+          GITHUB_RUN_ID=$GITHUB_RUN_ID
+          GITHUB_RUN_URL=$RUN_URL
+          EOF
+
+          7z x -y "$ZIP_PATH" -o"$EXTRACT_ROOT" >/dev/null
+          EXPECTED_LIST="$RUNNER_TEMP/expected-portable-files.txt"
+          printf '%s\n' \
+            BUILD-MANIFEST.txt \
+            SHA256SUMS.txt \
+            buzz-acp.exe \
+            buzz-agent.exe \
+            buzz-desktop.exe \
+            buzz-dev-mcp.exe \
+            buzz.exe \
+            git-credential-nostr.exe | sort > "$EXPECTED_LIST"
+          diff -u "$EXPECTED_LIST" <(find "$EXTRACT_ROOT" -mindepth 1 -printf '%P\n' | sort)
+          (
+            cd "$EXTRACT_ROOT"
+            sha256sum -c SHA256SUMS.txt
+          )
+          if find "$EXTRACT_ROOT" -type f \( -iname '*.msi' -o -iname '*.nsis' -o -iname '*.appinstaller' -o -iname '*.sig' \) -print -quit | grep -q .; then
+            echo "::error::Forbidden installer, updater, or signature found in ZIP" >&2
+            exit 1
+          fi
+
+          export EXTRACT_ROOT
+          powershell -NoProfile -NonInteractive -Command '
+            $ErrorActionPreference = "Stop"
+            $root = $env:EXTRACT_ROOT
+            $files = @(
+              "buzz-desktop.exe",
+              "buzz-acp.exe",
+              "buzz-agent.exe",
+              "buzz-dev-mcp.exe",
+              "git-credential-nostr.exe",
+              "buzz.exe"
+            )
+            foreach ($name in $files) {
+              $path = Join-Path $root $name
+              $stream = [System.IO.File]::OpenRead($path)
+              try {
+                if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+                  throw "$name is not a PE executable"
+                }
+              } finally {
+                $stream.Dispose()
+              }
+              $signature = Get-AuthenticodeSignature -LiteralPath $path
+              if ($signature.Status -ne "NotSigned") {
+                throw "$name has Authenticode status $($signature.Status)"
+              }
+            }
+          '
+
+          "$EXTRACT_ROOT/buzz.exe" --help
+          "$EXTRACT_ROOT/buzz.exe" lab --help
+          "$EXTRACT_ROOT/buzz.exe" lab get --help
+          update_help=$("$EXTRACT_ROOT/buzz.exe" lab update --help)
+          printf '%s\n' "$update_help"
+          grep -F -- '--base <BASE>' <<<"$update_help"
+          grep -E '^Usage: .*--base <BASE>' <<<"$update_help"
+          "$EXTRACT_ROOT/buzz-acp.exe" --help
+
+          echo "portable_zip=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "zip_sha=$ZIP_SHA" >> "$GITHUB_OUTPUT"
+          echo "zip_size=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
+          echo "release_root=$RELEASE_ROOT" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          stat -c '%n %s bytes' "$ZIP_PATH"
+          sha256sum "$ZIP_PATH"
+          cat "$PORTABLE_ROOT/BUILD-MANIFEST.txt"
+          cat "$PORTABLE_ROOT/SHA256SUMS.txt"
+          cat "$RELEASE_ROOT/ZIP-SHA256.txt"
+
+      - name: Upload the only build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-lab-windows-acp-reply-hotfix-${{ github.sha }}
-          path: ${{ steps.package.outputs.root }}
+          name: buzz-alis-lab-v2-windows-portable-${{ env.SOURCE_SHA }}
+          path: |
+            ${{ steps.package.outputs.portable_zip }}
+            ${{ steps.package.outputs.release_root }}/ZIP-SHA256.txt
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
