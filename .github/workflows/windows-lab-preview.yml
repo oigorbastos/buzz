@@ -225,6 +225,12 @@ jobs:
           mapfile -t changed_files < <(git diff --name-only "$LAB_BASE_SHA" "$SOURCE_SHA")
           [[ "${#changed_files[@]}" -eq 1 && "${changed_files[0]}" == ".github/workflows/windows-lab-preview.yml" ]] || exit 1
 
+      - name: Set Windows Hermit state directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'HERMIT_STATE_DIR=%s\n' "$HOME/.cache/hermit" >> "$GITHUB_ENV"
+
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
