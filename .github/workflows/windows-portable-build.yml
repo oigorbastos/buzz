@@ -164,9 +164,21 @@ jobs:
     permissions:
       contents: read
     steps:
+      # fetch-depth: 2, not the actions/checkout default of 1: `pnpm -C
+      # desktop check` (below) runs desktop/scripts/check-file-sizes.mjs,
+      # which — per scripts/check-file-sizes-core.mjs's resolveBaseRef() —
+      # always diffs against `HEAD^1` when GITHUB_ACTIONS=true, and
+      # deliberately hard-fails ("Fail clearly instead of silently turning a
+      # missing/shallow base into a pass") if that parent commit isn't
+      # present. A depth-1 checkout has no parent commit at all, so
+      # `git cat-file -e HEAD^1^{commit}` errors before any file-size
+      # comparison runs. ci.yml's desktop-facing jobs already set
+      # fetch-depth: 2 for the same reason; this job needs it for the same
+      # check.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       # No Hermit, no `just` here on purpose: those are Linux/macOS-only
       # hermetic tooling with no business on windows-latest, and a prior
