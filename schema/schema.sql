@@ -1126,7 +1126,9 @@ INSERT INTO replica_heartbeat (id) VALUES (1);
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('replica_heartbeat', 'single-row replication freshness token; describes deployment topology, never tenant data');
 
--- ── Whole-community deletion control plane (migration 0029) ─────────────────
+-- ── Whole-community deletion control plane (migration 0031, ported from ────
+-- ── upstream's 0029_community_deletion.sql; renumbered on this fork ─────────
+-- ── because 0029/0030 are this fork's own Lab boards migrations) ────────────
 CREATE TABLE community_deletion_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     community_id UUID NOT NULL REFERENCES communities(id),
