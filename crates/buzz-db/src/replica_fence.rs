@@ -315,7 +315,16 @@ impl ReplicaFence {
 ///
 /// This is a name-and-shape check only; it cannot detect a sabotaged
 /// function body. [`verify_floor_guard_behavior`] proves the semantics.
-pub async fn verify_floor_guard_catalog(pool: &PgPool) -> crate::Result<()> {
+///
+/// Generic over the executor so the migration path can run it on the
+/// lock-holding connection while the startup probe keeps using the pool.
+/// (Not instrumented with `#[datastore_span]` — this fork does not carry
+/// the `buzz-datastore-tracing` crate; that PostgreSQL tracing-spans
+/// infrastructure predates and is independent of this ported deletion
+/// feature, so it was deliberately left out of the port.)
+pub async fn verify_floor_guard_catalog<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+) -> crate::Result<()> {
     // tgtype bits: 1 = ROW, 2 = BEFORE, 4 = INSERT, 16 = UPDATE, 64 = INSTEAD.
     // Required: ROW + INSERT + UPDATE set, BEFORE + INSTEAD clear.
     let missing: Vec<String> = sqlx::query_scalar(
@@ -342,7 +351,7 @@ pub async fn verify_floor_guard_catalog(pool: &PgPool) -> crate::Result<()> {
         )
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     if !missing.is_empty() {
         return Err(crate::error::DbError::InvalidData(format!(
