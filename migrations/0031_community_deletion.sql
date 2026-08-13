@@ -554,6 +554,14 @@ SELECT attach_community_write_fence('event_mentions');
 SELECT attach_community_write_fence('events');
 SELECT attach_community_write_fence('git_repo_names');
 SELECT attach_community_write_fence('join_policy_acceptances');
+-- lab_board_heads / lab_board_revisions (this fork's Lab boards feature,
+-- migrations 0029/0030, both predating this migration's renumbering to
+-- 0031) are ordinary community_id-scoped tables. The dynamic bootstrap loop
+-- above already fences them automatically since they exist by the time this
+-- migration runs; these two explicit calls exist for the same declarative-
+-- visibility reason as every other line in this block (see comment above).
+SELECT attach_community_write_fence('lab_board_heads');
+SELECT attach_community_write_fence('lab_board_revisions');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');

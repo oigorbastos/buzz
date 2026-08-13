@@ -65,6 +65,8 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "events",
     "git_repo_names",
     "join_policy_acceptances",
+    "lab_board_heads",
+    "lab_board_revisions",
     "moderation_actions",
     "moderation_reports",
     "parameterized_event_watermarks",
@@ -98,6 +100,19 @@ pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "thread_metadata",
     "moderation_actions",
     "workflows",
+    // lab_board_revisions -> lab_board_heads via
+    // FOREIGN KEY (community_id, board_id) REFERENCES lab_board_heads
+    // (community_id, board_id) (migrations/0029_lab_boards.sql, no ON DELETE
+    // CASCADE): the child revision rows must be purged before the parent
+    // head row. Neither table is referenced by, nor references, any other
+    // scoped table, so this pair has no ordering constraint against the
+    // rest of the array; placed here at the boundary between the
+    // dependency-chained cluster above (workflow_* / channel_members /
+    // thread_metadata / moderation_reports / subscriptions / api_tokens,
+    // all of which resolve against workflows/users/channels) and the
+    // independent single-purpose tables below.
+    "lab_board_revisions",
+    "lab_board_heads",
     "event_mentions",
     "reactions",
     "push_match_queue",

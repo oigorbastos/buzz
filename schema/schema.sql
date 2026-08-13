@@ -1126,6 +1126,70 @@ INSERT INTO replica_heartbeat (id) VALUES (1);
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('replica_heartbeat', 'single-row replication freshness token; describes deployment topology, never tenant data');
 
+-- ── Lab Boards (migrations 0029/0030) — community-wide, multi-writer ────────
+-- Markdown documents ("Quadros") with compare-and-swap (CAS) concurrency and
+-- full, append-only revision history. See migrations/0029_lab_boards.sql for
+-- the full design note (kind:40101 revisions, kind:30623 relay-signed heads)
+-- and crates/buzz-relay/src/handlers/lab.rs for the CAS transaction. This
+-- fork-only feature predates the ported whole-community deletion pipeline
+-- below; both lab_board_heads and lab_board_revisions are ordinary
+-- community_id-scoped tables and get the same universal write fence as every
+-- other tenant table (see EXPECTED_SCOPED_TABLES / PURGE_SCOPED_TABLES in
+-- crates/buzz-db/src/deletion.rs and the attach_community_write_fence calls
+-- below).
+CREATE TABLE lab_board_heads (
+    community_id              UUID NOT NULL REFERENCES communities(id),
+    board_id                  UUID NOT NULL,
+    status                    TEXT NOT NULL DEFAULT 'active'
+                                   CHECK (status IN ('active', 'archived', 'frozen')),
+    revision                  INT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    head_revision_event_id    BYTEA NOT NULL CHECK (length(head_revision_event_id) = 32),
+    head_projection_event_id  BYTEA CHECK (head_projection_event_id IS NULL OR length(head_projection_event_id) = 32),
+    title                     VARCHAR(160) NOT NULL,
+    summary                   VARCHAR(500),
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by                BYTEA NOT NULL CHECK (length(created_by) = 32),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by                BYTEA NOT NULL CHECK (length(updated_by) = 32),
+    archived_at               TIMESTAMPTZ,
+    archived_by               BYTEA CHECK (archived_by IS NULL OR length(archived_by) = 32),
+    frozen_at                 TIMESTAMPTZ,
+    frozen_by                 BYTEA CHECK (frozen_by IS NULL OR length(frozen_by) = 32),
+    PRIMARY KEY (community_id, board_id)
+);
+
+CREATE INDEX idx_lab_board_heads_status ON lab_board_heads (community_id, status);
+CREATE INDEX idx_lab_board_heads_updated_at ON lab_board_heads (community_id, updated_at DESC);
+
+CREATE TABLE lab_board_revisions (
+    community_id   UUID NOT NULL REFERENCES communities(id),
+    board_id       UUID NOT NULL,
+    revision       INT NOT NULL CHECK (revision >= 1),
+    event_id       BYTEA NOT NULL CHECK (length(event_id) = 32),
+    base_event_id  BYTEA CHECK (base_event_id IS NULL OR length(base_event_id) = 32),
+    operation      TEXT NOT NULL CHECK (operation IN ('create', 'update', 'restore')),
+    author_pubkey  BYTEA NOT NULL CHECK (length(author_pubkey) = 32),
+    accepted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    content_hash   BYTEA NOT NULL CHECK (length(content_hash) = 32),
+    restored_from  INT,
+    PRIMARY KEY (community_id, board_id, revision),
+    UNIQUE (community_id, event_id),
+    FOREIGN KEY (community_id, board_id)
+        REFERENCES lab_board_heads (community_id, board_id),
+    FOREIGN KEY (community_id, board_id, restored_from)
+        REFERENCES lab_board_revisions (community_id, board_id, revision),
+    CHECK (
+        (operation = 'create' AND revision = 1 AND base_event_id IS NULL)
+        OR (operation <> 'create' AND revision > 1 AND base_event_id IS NOT NULL)
+    ),
+    CHECK (operation = 'restore' OR restored_from IS NULL)
+);
+
+CREATE INDEX idx_lab_board_revisions_board_history
+    ON lab_board_revisions (community_id, board_id, revision DESC);
+CREATE INDEX idx_lab_board_revisions_author
+    ON lab_board_revisions (community_id, author_pubkey, accepted_at DESC);
+
 -- ── Whole-community deletion control plane (migration 0031, ported from ────
 -- ── upstream's 0029_community_deletion.sql; renumbered on this fork ─────────
 -- ── because 0029/0030 are this fork's own Lab boards migrations) ────────────
@@ -1652,6 +1716,8 @@ SELECT attach_community_write_fence('event_mentions');
 SELECT attach_community_write_fence('events');
 SELECT attach_community_write_fence('git_repo_names');
 SELECT attach_community_write_fence('join_policy_acceptances');
+SELECT attach_community_write_fence('lab_board_heads');
+SELECT attach_community_write_fence('lab_board_revisions');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');
