@@ -5,12 +5,12 @@ import {
   MAX_TITLE_CHARS,
   validateBoardInput,
 } from "@/features/lab/api";
+import { LabMarkdownEditor } from "@/features/lab/ui/LabMarkdownEditor";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
-import { Textarea } from "@/shared/ui/textarea";
 
 const FIELD_SHELL_CLASS =
   "rounded-xl border border-input bg-muted/40 transition-colors duration-150 ease-out hover:border-muted-foreground/40 focus-within:border-muted-foreground/50";
@@ -91,7 +91,7 @@ export function CreateLabBoardDialog({
       open={open}
     >
       <ChooserDialogContent
-        className="max-w-lg"
+        className="max-w-3xl"
         contentClassName="pt-3"
         data-testid="create-lab-board-dialog"
         description="Boards are shared: everyone in this community can read and edit them."
@@ -182,11 +182,11 @@ export function CreateLabBoardDialog({
             >
               Content
             </label>
-            <Textarea
-              className="min-h-40 font-mono text-sm"
+            <LabMarkdownEditor
+              aria-label="Content"
               data-testid="create-lab-board-content"
               id="create-lab-board-content"
-              onChange={(event) => setContent(event.target.value)}
+              onChange={setContent}
               placeholder="Write in Markdown..."
               value={content}
             />
