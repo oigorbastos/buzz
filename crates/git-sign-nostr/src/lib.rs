@@ -1017,7 +1017,7 @@ fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
     let oa = load_auth_tag()?;
     if let Some(ref oa_val) = oa {
         // Owner pubkey must be a valid BIP-340 key
-        if PublicKey::from_hex(&oa_val.0).is_err() {
+        if validate_bip340_pubkey(&oa_val.0).is_err() {
             return Err(Error::Fatal(
                 "auth tag owner (oa[0]) is not a valid BIP-340 public key".to_string(),
             ));
@@ -1243,7 +1243,7 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     let oa_result = if let Some(ref oa) = envelope.oa {
         // Validate oa[0] is a valid BIP-340 public key. Per NIP-GS spec,
         // an invalid owner pubkey is a structural error → ERRSIG.
-        if PublicKey::from_hex(&oa.0).is_err() {
+        if validate_bip340_pubkey(&oa.0).is_err() {
             write_errsig(status, Some(&envelope.pk));
             return Err(Error::VerifyFailed {
                 pk: Some(envelope.pk),
@@ -1420,7 +1420,7 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
         }
 
         // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
-        PublicKey::from_hex(owner)
+        validate_bip340_pubkey(owner)
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
@@ -1443,6 +1443,21 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
         t,
         oa,
     })
+}
+
+/// Validate that `hex` decodes to a curve-valid BIP-340 x-only public key.
+///
+/// Use this — never bare `PublicKey::from_hex` — anywhere the result gates a
+/// security decision. Since nostr 0.44, `PublicKey` is a plain `[u8; 32]`
+/// newtype and `from_hex` only hex-decodes; the curve-point check moved to
+/// `PublicKey::xonly()`. Calling `from_hex` alone still compiles and still
+/// returns a `Result`, so a validation site that drops the `xonly()` call
+/// silently degrades into a hex-shape check with no error anywhere.
+fn validate_bip340_pubkey(hex: &str) -> Result<(), String> {
+    PublicKey::from_hex(hex)
+        .and_then(|pk| pk.xonly())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn validate_hex_field(val: &str, expected_len: usize, name: &str) -> Result<(), String> {

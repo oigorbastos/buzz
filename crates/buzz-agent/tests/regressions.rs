@@ -96,6 +96,15 @@ async fn spawn_capturing_llm_with_status(responses: Vec<(u16, Value)>) -> Captur
     CapturingLlm { url, captured }
 }
 
+/// How long a stderr assertion may wait for the log line it is about.
+///
+/// Scheduler-scale, not work-scale: by the time the response a log line
+/// precedes has been read off stdout, that line is already sitting in the
+/// stderr pipe — this only has to cover how long the pump task takes to be
+/// polled and drain it. Generous anyway, because overshooting costs nothing: a
+/// line that never arrives still fails the caller's `assert!`, just 5s later.
+const STDERR_SETTLE: Duration = Duration::from_secs(5);
+
 struct Harness {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
@@ -204,8 +213,47 @@ impl Harness {
         let _ = self.child.start_kill();
     }
 
+    /// Whatever the pump task has drained from the child's stderr *so far*.
+    ///
+    /// Fine for failure messages, and for asserting a line is ABSENT. For
+    /// asserting a line is PRESENT, use [`Harness::stderr_containing`] or
+    /// [`Harness::stderr_when`] — a bare snapshot is a race.
     fn stderr_text(&self) -> String {
         self.stderr.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Wait (up to [`STDERR_SETTLE`]) for the captured stderr to satisfy
+    /// `ready`, then return that capture — settled or not, so the caller's own
+    /// `assert!` is still what fails, with its own message and the full text.
+    ///
+    /// Stderr arrives over a different pipe than the JSON-RPC responses on
+    /// stdout, drained by a separate task. A line the agent logged *before* the
+    /// response it produced can therefore still be undrained when that response
+    /// is read, so asserting on [`Harness::stderr_text`] straight after
+    /// `recv_until` only passes because the pump happened to be polled in time.
+    /// Under heavy CPU contention — a fully parallel `cargo test --workspace`
+    /// — it loses that coin flip and a correct agent looks like a broken one.
+    /// So poll for the line, the same way `recv_until` waits on stdout.
+    ///
+    /// The pump appends in pipe order, which is emission order, so anything the
+    /// agent logged *before* the line waited on is also present in the returned
+    /// text. That makes corroborating assertions on earlier lines (counting
+    /// rungs, checking a preceding WARN) safe against the same race.
+    async fn stderr_when<F: FnMut(&str) -> bool>(&self, mut ready: F) -> String {
+        let deadline = Instant::now() + STDERR_SETTLE;
+        loop {
+            let text = self.stderr_text();
+            if ready(&text) || Instant::now() >= deadline {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// [`Harness::stderr_when`] for the common case: wait for one line to show
+    /// up, then hand back the whole capture to assert against.
+    async fn stderr_containing(&self, needle: &str) -> String {
+        self.stderr_when(|text| text.contains(needle)).await
     }
 }
 
@@ -1424,7 +1472,7 @@ async fn token_usage_over_budget_triggers_handoff() {
         "expected handoff summarize() between the two prompts (3 reqs), saw {captured} — \
          token gate did not fire on usage over budget"
     );
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("handoff #1 (history").await;
     assert!(
         stderr.contains("handoff #1 (history"),
         "expected handoff log line in stderr, got: {stderr}"
@@ -2429,7 +2477,9 @@ async fn context_window_400_recovers_instead_of_sticking() {
         "expected reject + summarize + retry (4 reqs total), saw {captured} — stderr={}",
         h.stderr_text()
     );
-    let stderr = h.stderr_text();
+    let stderr = h
+        .stderr_containing("provider reported context overflow; forcing handoff")
+        .await;
     assert!(
         stderr.contains("provider reported context overflow; forcing handoff"),
         "expected the forced-handoff log line, got: {stderr}"
@@ -2742,7 +2792,7 @@ async fn context_recovery_budget_exhaustion_surfaces_the_error() {
     // — and the floor can fire on the first rung without the budget ever being
     // consumed, which would make this test silently exercise a different
     // mechanism than its name claims. Pin the budget explicitly.
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("context recovery budget spent").await;
     assert!(
         stderr.contains("context recovery budget spent"),
         "the per-run recovery BUDGET must be what stops the loop here, not the prompt floor; \
@@ -2806,7 +2856,7 @@ async fn small_history_context_400_refuses_rescue_at_the_prompt_floor() {
         r0.get("error").is_some(),
         "a context 400 with no shrinkable history must surface the error, got: {r0}"
     );
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("below the").await;
     assert!(
         stderr.contains("below the") && stderr.contains("floor"),
         "the prompt-budget FLOOR must be what stops this, not the recovery budget; got: {stderr}"
@@ -2956,7 +3006,7 @@ async fn recovery_shrinks_further_on_each_rung() {
 
     // The second rung must actually have been taken — otherwise the byte
     // comparison below would compare rung 1 against the retry.
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("did not run; shrinking further").await;
     assert!(
         stderr.contains("did not run; shrinking further"),
         "rung 1 must have been Skipped so rung 2 runs; got: {stderr}"
@@ -3107,13 +3157,20 @@ async fn reactive_reset_clears_usage_baseline_so_the_gate_is_not_blind() {
     .await
     .expect("turn 2 must return");
     assert!(r1.get("error").is_none(), "turn 2 should recover: {r1}");
+    // Both lines, not just the WARN: the count below is the baseline for turn
+    // 3's delta, so it must be read after turn 2's own `handoff #` line lands
+    // — otherwise a baseline of 0 makes the delta assertion vacuous.
+    let stderr = h
+        .stderr_when(|text| {
+            text.contains("provider reported context overflow; forcing handoff")
+                && text.contains("handoff #")
+        })
+        .await;
     assert!(
-        h.stderr_text()
-            .contains("provider reported context overflow; forcing handoff"),
-        "precondition: the reactive path must have run in turn 2. stderr={}",
-        h.stderr_text()
+        stderr.contains("provider reported context overflow; forcing handoff"),
+        "precondition: the reactive path must have run in turn 2. stderr={stderr}"
     );
-    let handoffs_after_turn2 = h.stderr_text().matches("handoff #").count();
+    let handoffs_after_turn2 = stderr.matches("handoff #").count();
 
     // Turn 3: large prompt. A cleared baseline sees it via the byte signal and
     // hands off; a stale pair under-projects and stays blind.
@@ -3130,7 +3187,12 @@ async fn reactive_reset_clears_usage_baseline_so_the_gate_is_not_blind() {
     .await
     .expect("turn 3 must return");
     assert!(r2.get("error").is_none(), "turn 3 should succeed: {r2}");
-    let stderr = h.stderr_text();
+    // Waiting for the count to grow is not circular: if turn 3 genuinely fails
+    // to hand off, no new line ever appears, the wait runs out, and the
+    // assertion below fails exactly as it should — just [`STDERR_SETTLE`] later.
+    let stderr = h
+        .stderr_when(|text| text.matches("handoff #").count() > handoffs_after_turn2)
+        .await;
     let handoffs_after_turn3 = stderr.matches("handoff #").count();
     assert!(
         handoffs_after_turn3 > handoffs_after_turn2,
@@ -3221,7 +3283,7 @@ async fn handoff_cap_resets_per_turn_not_per_session() {
         3,
         "turn 2 must produce 2 LLM requests (summarize + complete), 3 total"
     );
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("handoff #1").await;
     assert!(
         stderr.contains("handoff #1"),
         "expected first handoff log after turn 2; got: {stderr}"
@@ -3242,7 +3304,7 @@ async fn handoff_cap_resets_per_turn_not_per_session() {
         "turn 3 must also produce 2 LLM requests (per-turn cap reset → handoff fires again), \
          5 total"
     );
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("handoff #2").await;
     assert!(
         stderr.contains("handoff #2"),
         "expected second handoff log after turn 3 (cap reset); got: {stderr}"
@@ -3431,7 +3493,7 @@ async fn handoff_cap_binds_within_a_single_turn() {
         "expected 4 LLM requests (seed + summarize + tool-call + final); got {count}"
     );
 
-    let stderr = h.stderr_text();
+    let stderr = h.stderr_containing("handoff cap reached").await;
     assert!(
         stderr.contains("handoff cap reached"),
         "expected cap-reached WARN in stderr; got: {stderr}"
@@ -3569,7 +3631,9 @@ async fn failed_summarize_burns_handoff_attempt_budget() {
         }
     }
 
-    let stderr = h.stderr_text();
+    // Anchored on the LATER of the two lines (round 1's cap WARN): the round-0
+    // summarize-failure WARN precedes it, so one wait settles both assertions.
+    let stderr = h.stderr_containing("handoff cap reached").await;
     // Round 0: the failed summarize should warn about the failure.
     assert!(
         stderr.contains("handoff failed") || stderr.contains("handoff returned empty"),
