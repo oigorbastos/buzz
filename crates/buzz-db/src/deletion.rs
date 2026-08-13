@@ -4719,4 +4719,149 @@ mod postgres_tests {
         .await
         .expect("drop probe database");
     }
+
+    /// End-to-end confirmation that a real Lab board's rows are actually
+    /// purged, in FK-safe order, by a full deletion run — not just that the
+    /// catalog checks accept the two tables' presence (see
+    /// [`destructive_stages_serialize_with_migrations_and_fail_closed_on_new_scoped_tables`]
+    /// and [`checkpointed_resume_is_idempotent_and_tombstone_blocks_name_reuse`]
+    /// for that). Seeds a throwaway community with one throwaway Lab board
+    /// (one `lab_board_heads` row and its one `lab_board_revisions` row,
+    /// respecting the `lab_board_revisions -> lab_board_heads` foreign key),
+    /// runs it through every deletion stage, and asserts both tables are
+    /// empty for that community afterward with no foreign-key violation
+    /// along the way (a violation would have surfaced as an `Err` from
+    /// `purge_postgres` — `PURGE_SCOPED_TABLES` deletes
+    /// `lab_board_revisions` before `lab_board_heads`).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn full_deletion_run_purges_a_real_lab_board_with_no_fk_violation() {
+        let (db, store) = store().await;
+        let (request, inventory) = inventoried_request(&db, &store).await;
+        let community = request.community_id;
+
+        let board_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO lab_board_heads \
+             (community_id, board_id, status, revision, head_revision_event_id, \
+              head_projection_event_id, title, summary, created_by, updated_by) \
+             VALUES ($1, $2, 'active', 1, $3, $4, $5, NULL, $6, $6)",
+        )
+        .bind(community.as_uuid())
+        .bind(board_id)
+        .bind(vec![0xAB_u8; 32])
+        .bind(vec![0xCD_u8; 32])
+        .bind("Throwaway deletion-test board")
+        .bind(vec![0xEF_u8; 32])
+        .execute(&db.pool)
+        .await
+        .expect("seed throwaway lab board head");
+        sqlx::query(
+            "INSERT INTO lab_board_revisions \
+             (community_id, board_id, revision, event_id, base_event_id, operation, \
+              author_pubkey, content_hash, restored_from) \
+             VALUES ($1, $2, 1, $3, NULL, 'create', $4, $5, NULL)",
+        )
+        .bind(community.as_uuid())
+        .bind(board_id)
+        .bind(vec![0xAB_u8; 32])
+        .bind(vec![0xEF_u8; 32])
+        .bind(vec![0x11_u8; 32])
+        .execute(&db.pool)
+        .await
+        .expect("seed throwaway lab board revision");
+
+        let lab_heads_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM lab_board_heads WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count lab_board_heads before purge");
+        let lab_revisions_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM lab_board_revisions WHERE community_id = $1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count lab_board_revisions before purge");
+        assert_eq!(lab_heads_before, 1);
+        assert_eq!(lab_revisions_before, 1);
+
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
+        let generation = store.fence(&claim.lease).await.expect("fence");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
+        store
+            .freeze_destructive_storage_manifest(&token, &inventory.storage)
+            .await
+            .expect("freeze destructive storage");
+        store.mark_drained(&token).await.expect("drain");
+        store
+            .mark_bindings_removed(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("bindings");
+
+        // The purge itself: if PURGE_SCOPED_TABLES ordered lab_board_heads
+        // before lab_board_revisions, this DELETE FROM lab_board_heads would
+        // fail closed with a Postgres foreign_key_violation while the
+        // revision row still referenced it, and this `expect` would panic
+        // the test with that error.
+        let deleted = store.purge_postgres(&token).await.expect("purge postgres");
+        assert_eq!(
+            deleted.get("lab_board_heads").copied(),
+            Some(1),
+            "purge must report exactly the one seeded lab_board_heads row"
+        );
+        assert_eq!(
+            deleted.get("lab_board_revisions").copied(),
+            Some(1),
+            "purge must report exactly the one seeded lab_board_revisions row"
+        );
+
+        let lab_heads_after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM lab_board_heads WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count lab_board_heads after purge");
+        let lab_revisions_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM lab_board_revisions WHERE community_id = $1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count lab_board_revisions after purge");
+        assert_eq!(lab_heads_after, 0, "lab_board_heads must be purged");
+        assert_eq!(lab_revisions_after, 0, "lab_board_revisions must be purged");
+
+        store
+            .mark_cache_purged(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("cache purged");
+        store
+            .verify_postgres_logically_deleted(&token)
+            .await
+            .expect("verify postgres");
+        store
+            .mark_logically_verified(&token, serde_json::json!({"all": true}))
+            .await
+            .expect("logically verified");
+        store
+            .mark_retention_pending(&token, serde_json::json!({"lab_board": "purged"}))
+            .await
+            .expect("terminal");
+        let terminal = store.get(request.id).await.expect("terminal request");
+        assert_eq!(terminal.stage, DeletionStage::RetentionPending);
+    }
 }
