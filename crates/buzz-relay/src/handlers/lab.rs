@@ -36,8 +36,9 @@
 //!    *before* any write.
 //! 5. Insert the signed revision event ([`buzz_db::lab::insert_revision_event_tx`]).
 //! 6. Build and sign the new kind:30623 head projection with
-//!    `state.relay_keypair` (content mutations only — see the module doc on
-//!    moderation ops below for why status-only transitions skip this step).
+//!    `state.relay_keypair` — for content mutations *and* for moderation ops
+//!    (see the module doc on moderation ops below: a status flip re-signs the
+//!    projection with the same content/revision and the new `status` tag).
 //! 7. Persist the head projection
 //!    ([`buzz_db::lab::replace_head_projection_event_tx`]) — same transaction.
 //! 8. Upsert `lab_board_heads` ([`buzz_db::lab::create_board_head_tx`] /
@@ -62,13 +63,16 @@
 //! - Private and read-only boards return the same opaque not-found response
 //!   for unauthorized writes, so a guessed board id is not an existence
 //!   oracle. Rate limiting is applied before the CAS transaction is opened.
-//! - **Moderation ops don't touch the head projection**: archive/unarchive/
-//!   freeze/unfreeze update `lab_board_heads.status` (+ audit columns) but
-//!   deliberately do not re-sign a new kind:30623 (content/revision are
-//!   unchanged by a pure status flip). A live "is this board frozen"
-//!   Nostr-visible signal — e.g. echoing `status` in kind:30623 on every
-//!   transition — is a reasonable follow-up once a read API exists to make
-//!   that distinction observable to a client at all.
+//! - **Moderation ops DO re-sign the head projection**: archive/unarchive/
+//!   freeze/unfreeze leave content and `revision` untouched, but they update
+//!   `lab_board_heads.status` (+ audit columns) *and* publish a fresh
+//!   kind:30623 carrying the new `status` tag, reusing the current head
+//!   revision's Markdown and revision number. That tag is the only
+//!   Nostr-visible "is this board archived/frozen" signal a client has, so
+//!   leaving the old projection in place would keep announcing `active` while
+//!   the database said `archived`. Verified end to end against Postgres by
+//!   `postgres_tests::archive_and_unarchive_round_trip_and_resign_the_head_projection`;
+//!   see also the doc on [`handle_moderation_op`].
 
 use std::sync::Arc;
 
@@ -1280,5 +1284,803 @@ mod tests {
         assert_eq!(normalize_lab_tag("  Sprint / Plano  "), "sprint-plano");
         assert_eq!(normalize_lab_tag("Café\u{00a0}Ação"), "café-ação");
         assert_eq!(normalize_lab_tag("---_Roadmap_---"), "roadmap");
+    }
+}
+
+/// End-to-end moderation-op tests against a real PostgreSQL.
+///
+/// Why these are not unit tests: `handle_moderation_op` reads the head
+/// revision's content back out of `events` inside the CAS transaction, re-signs
+/// a kind:30623 projection, and replaces the previous projection row — three
+/// steps whose interaction with the schema (partitioned `events`,
+/// `lab_board_heads`' FK onto it, the `SELECT ... FOR UPDATE` gate) only
+/// exists against Postgres. The sibling precedent is the comment above
+/// `record_board_revision_tx`: a `lab_board_revisions` FK ordering bug once
+/// survived the whole unit suite and every review, because nothing but a real
+/// database can raise it.
+///
+/// These tests drive the *production* entry point
+/// ([`handle_lab_board_revision_event`]) with the exact events a client signs,
+/// so a change to the parser, the authorization order, or the projection step
+/// fails here.
+///
+/// Run with a throwaway database — never the live relay's:
+/// ```text
+/// docker compose -p buzz-modtest -f compose.modtest.yml up -d   # postgres:17-alpine on 127.0.0.1:55433
+/// BUZZ_TEST_DATABASE_URL=postgres://buzz:buzz_modtest@127.0.0.1:55433/buzz \
+///   cargo test -p buzz-relay --lib handlers::lab::postgres_tests -- --ignored --test-threads=1 --nocapture
+/// ```
+#[cfg(test)]
+mod postgres_tests {
+    use super::*;
+    use crate::handlers::ingest::{IngestAuth, IngestError};
+    use buzz_auth::Scope;
+    use nostr::Keys;
+
+    /// Test-only database URL. Deliberately has **no default**: this repo's
+    /// relay runs in production on the same host as some developer machines,
+    /// and a default of `postgres://…@localhost:5432/buzz` (the convention the
+    /// older Postgres tests use) is one port-forward away from writing board
+    /// rows into a live community. An unset variable skips the test instead.
+    fn test_database_url() -> Option<String> {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+    }
+
+    /// A relay state wired to `url`, with a deliberately dead Redis
+    /// (`127.0.0.1:1`): `dispatch_persistent_event` runs after commit and only
+    /// logs a publish failure, so fan-out cannot mask a persistence bug — and
+    /// the test needs no broker. Mirrors
+    /// `handlers::event::tests::test_state_with_redis_url`.
+    ///
+    /// Returns `None` when Postgres is unreachable so the test skips rather
+    /// than failing for an absent dependency.
+    async fn lab_test_state(
+        url: &str,
+        require_relay_membership: bool,
+    ) -> Option<(Arc<AppState>, sqlx::PgPool)> {
+        lab_test_state_with(url, require_relay_membership, false).await
+    }
+
+    async fn lab_test_state_with(
+        url: &str,
+        require_relay_membership: bool,
+        allow_nip_oa_auth: bool,
+    ) -> Option<(Arc<AppState>, sqlx::PgPool)> {
+        let mut config = crate::config::Config::from_env().ok()?;
+        config.database_url = url.to_string();
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.require_relay_membership = require_relay_membership;
+        config.allow_nip_oa_auth = allow_nip_oa_auth;
+
+        let pool = sqlx::PgPool::connect(url).await.ok()?;
+        let db = buzz_db::Db::from_pool(pool.clone());
+        db.migrate().await.expect("apply migrations to test DB");
+
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+        Some((Arc::new(state), pool))
+    }
+
+    /// A fresh community plus its tenant context. Each test gets its own host
+    /// so runs never collide on `lab_board_heads`' `(community_id, board_id)`.
+    async fn fresh_community(state: &Arc<AppState>) -> TenantContext {
+        let host = format!("lab-modtest-{}.example", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        TenantContext::resolved(community, host)
+    }
+
+    async fn grant_role(state: &Arc<AppState>, tenant: &TenantContext, keys: &Keys, role: &str) {
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &keys.public_key().to_hex(),
+                role,
+                Some("modtest"),
+            )
+            .await
+            .expect("add relay member");
+    }
+
+    /// The WS-authenticated principal shape Lab writes arrive under.
+    fn nip42_auth(keys: &Keys) -> IngestAuth {
+        IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: Scope::all_known(),
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        }
+    }
+
+    fn signed(keys: &Keys, content: &str, tags: Vec<Vec<&str>>) -> Event {
+        let tags = tags
+            .into_iter()
+            .map(|t| Tag::parse(t).expect("tag"))
+            .collect::<Vec<_>>();
+        EventBuilder::new(Kind::Custom(KIND_LAB_BOARD_REVISION as u16), content)
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign lab board event")
+    }
+
+    /// **The exact bytes the desktop client emits** for archive/unarchive:
+    /// empty content, `d` + `op` and nothing else. Written as one helper so a
+    /// future edit to the client contract has a single place to break.
+    fn moderation_event(keys: &Keys, board_id: Uuid, op: &str) -> Event {
+        signed(
+            keys,
+            "",
+            vec![vec!["d", &board_id.to_string()], vec!["op", op]],
+        )
+    }
+
+    /// Create a board through the real handler, returning its id and the
+    /// accepted create event.
+    async fn create_board(
+        state: &Arc<AppState>,
+        tenant: &TenantContext,
+        keys: &Keys,
+        title: &str,
+        content: &str,
+    ) -> (Uuid, Event) {
+        let board_id = Uuid::new_v4();
+        let event = signed(
+            keys,
+            content,
+            vec![
+                vec!["d", &board_id.to_string()],
+                vec!["op", "create"],
+                vec!["title", title],
+            ],
+        );
+        let result =
+            handle_lab_board_revision_event(tenant, state, event.clone(), &nip42_auth(keys))
+                .await
+                .expect("create board");
+        assert!(result.accepted, "create must be accepted");
+        (board_id, event)
+    }
+
+    /// Read a stored kind:30623 projection back out of `events` and return its
+    /// `status` tag — the single value the desktop's archived/active filter
+    /// depends on.
+    async fn projection_status(pool: &sqlx::PgPool, event_id: &[u8]) -> String {
+        let tags: serde_json::Value = sqlx::query_scalar("SELECT tags FROM events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(pool)
+            .await
+            .expect("read projection event");
+        tags.as_array()
+            .expect("tags array")
+            .iter()
+            .find_map(|t| {
+                let t = t.as_array()?;
+                (t.first()?.as_str()? == "status").then(|| t.get(1)?.as_str().map(str::to_owned))?
+            })
+            .expect("projection carries a status tag")
+    }
+
+    fn err_message(e: &IngestError) -> String {
+        match e {
+            IngestError::Rejected(m) | IngestError::AuthFailed(m) | IngestError::Internal(m) => {
+                m.clone()
+            }
+        }
+    }
+
+    /// `Result::expect_err` needs `IngestResult: Debug`, which the production
+    /// type does not derive — and a test is no reason to widen a production
+    /// type. This does the same job and prints the accepted outcome's fields
+    /// when a write that must be refused is instead accepted.
+    fn expect_refusal(
+        outcome: Result<crate::handlers::ingest::IngestResult, IngestError>,
+        what: &str,
+    ) -> IngestError {
+        match outcome {
+            Ok(r) => panic!(
+                "{what}: expected a refusal, but the relay ACCEPTED it \
+                 (accepted={}, message={:?}, event_id={})",
+                r.accepted, r.message, r.event_id
+            ),
+            Err(e) => e,
+        }
+    }
+
+    /// Items 1-3: the client's exact wire shape archives a board, the head
+    /// projection is re-signed with the new status, and unarchive round-trips.
+    ///
+    /// This is also the test for the `prev` claim: the events below carry **no
+    /// `prev` tag**. If `prev` were required for moderation ops, the create
+    /// would succeed and the archive would be rejected by
+    /// `parse_lab_board_envelope` before any database work happened.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn archive_and_unarchive_round_trip_and_resign_the_head_projection() {
+        let Some(url) = test_database_url() else {
+            eprintln!("SKIP: set BUZZ_TEST_DATABASE_URL to a throwaway database");
+            return;
+        };
+        let Some((state, pool)) = lab_test_state(&url, true).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let tenant = fresh_community(&state).await;
+        let owner = Keys::generate();
+        grant_role(&state, &tenant, &owner, "owner").await;
+
+        let (board_id, _create) =
+            create_board(&state, &tenant, &owner, "Quadro de teste", "# corpo\n").await;
+
+        let before = buzz_db::lab::get_board_head(&pool, tenant.community(), board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(before.status, "active");
+        assert!(before.archived_at.is_none() && before.archived_by.is_none());
+        let projection_before = before
+            .head_projection_event_id
+            .clone()
+            .expect("create publishes a projection");
+        assert_eq!(
+            projection_status(&pool, &projection_before).await,
+            "active",
+            "a fresh board must publish status=active"
+        );
+
+        // --- 1. archive, with the client's exact event -------------------
+        let archive = moderation_event(&owner, board_id, "archive");
+        assert!(
+            archive.content.is_empty(),
+            "the client sends empty content for a moderation op"
+        );
+        assert_eq!(archive.tags.len(), 2, "the client sends only `d` and `op`");
+        let result = handle_lab_board_revision_event(&tenant, &state, archive, &nip42_auth(&owner))
+            .await
+            .expect("archive must be accepted");
+        assert!(result.accepted);
+        assert_eq!(result.message, "", "a first archive is not a duplicate");
+
+        let archived = buzz_db::lab::get_board_head(&pool, tenant.community(), board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(archived.status, "archived");
+        assert!(
+            archived.archived_at.is_some(),
+            "archived_at must be stamped"
+        );
+        assert_eq!(
+            archived.archived_by.as_deref(),
+            Some(owner.public_key().to_bytes().as_slice()),
+            "archived_by must record the moderator"
+        );
+        assert_eq!(
+            archived.revision, before.revision,
+            "a status flip does not consume a revision number"
+        );
+        assert_eq!(
+            archived.head_revision_event_id, before.head_revision_event_id,
+            "a status flip does not move the content head"
+        );
+
+        // --- 2. the projection IS re-signed ------------------------------
+        // The module doc used to claim moderation ops "don't touch the head
+        // projection". They do, and the desktop's archived filter depends on
+        // it: without a new kind:30623 the client would keep reading
+        // status=active forever.
+        let projection_archived = archived
+            .head_projection_event_id
+            .clone()
+            .expect("archive must leave a projection in place");
+        eprintln!(
+            "projection before archive: {} (status=active)\nprojection after  archive: {} (status={})",
+            hex::encode(&projection_before),
+            hex::encode(&projection_archived),
+            projection_status(&pool, &projection_archived).await,
+        );
+        assert_ne!(
+            projection_archived, projection_before,
+            "archive must publish a NEW projection, not keep the old one"
+        );
+        assert_eq!(
+            projection_status(&pool, &projection_archived).await,
+            "archived",
+            "the re-signed projection must announce the new status"
+        );
+        let (kind, author): (i32, Vec<u8>) =
+            sqlx::query_as("SELECT kind, pubkey FROM events WHERE id = $1")
+                .bind(&projection_archived)
+                .fetch_one(&pool)
+                .await
+                .expect("read projection row");
+        assert_eq!(kind, KIND_LAB_BOARD_HEAD as i32);
+        assert_eq!(
+            author,
+            state.relay_keypair.public_key().to_bytes().to_vec(),
+            "the projection must be signed by the relay, not the client"
+        );
+        let content: String = sqlx::query_scalar("SELECT content FROM events WHERE id = $1")
+            .bind(&projection_archived)
+            .fetch_one(&pool)
+            .await
+            .expect("read projection content");
+        assert_eq!(
+            content, "# corpo\n",
+            "the re-signed projection mirrors the head revision's Markdown, \
+             not the moderation event's empty body"
+        );
+
+        // --- 3. unarchive round-trips ------------------------------------
+        let unarchive = moderation_event(&owner, board_id, "unarchive");
+        handle_lab_board_revision_event(&tenant, &state, unarchive, &nip42_auth(&owner))
+            .await
+            .expect("unarchive must be accepted");
+
+        let restored = buzz_db::lab::get_board_head(&pool, tenant.community(), board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        eprintln!(
+            "head after archive:   status={} archived_at={:?} archived_by={}",
+            archived.status,
+            archived.archived_at,
+            hex::encode(archived.archived_by.as_deref().unwrap_or_default()),
+        );
+        eprintln!("head after unarchive: status={}", restored.status);
+        assert_eq!(restored.status, "active");
+        assert!(
+            restored.archived_at.is_some(),
+            "archived_at is a breadcrumb and is never cleared (see BoardHead docs)"
+        );
+        let projection_restored = restored
+            .head_projection_event_id
+            .clone()
+            .expect("unarchive must leave a projection in place");
+        assert_ne!(projection_restored, projection_archived);
+        assert_eq!(
+            projection_status(&pool, &projection_restored).await,
+            "active",
+            "unarchive must re-announce status=active"
+        );
+
+        // A second archive of an already-active board is legal again.
+        handle_lab_board_revision_event(
+            &tenant,
+            &state,
+            moderation_event(&owner, board_id, "archive"),
+            &nip42_auth(&owner),
+        )
+        .await
+        .expect("re-archive after unarchive");
+    }
+
+    /// Item 4a — closed relay: an actor with **no `relay_members` row** is
+    /// refused with `restricted: not a relay member`.
+    ///
+    /// This is the case for every NIP-OA managed agent: an agent's own pubkey
+    /// is never materialized in `relay_members`, only its owner's. The desktop
+    /// matches this string in `isBoardModerationDeniedError`; if the wording
+    /// here changes, the UI silently degrades to a raw relay error.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn non_member_moderation_is_denied_on_a_closed_relay() {
+        let Some(url) = test_database_url() else {
+            eprintln!("SKIP: set BUZZ_TEST_DATABASE_URL to a throwaway database");
+            return;
+        };
+        let Some((state, pool)) = lab_test_state(&url, true).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let tenant = fresh_community(&state).await;
+        let owner = Keys::generate();
+        grant_role(&state, &tenant, &owner, "owner").await;
+        let (board_id, _) = create_board(&state, &tenant, &owner, "Board", "body").await;
+
+        let stranger = Keys::generate();
+        let err = expect_refusal(
+            handle_lab_board_revision_event(
+                &tenant,
+                &state,
+                moderation_event(&stranger, board_id, "archive"),
+                &nip42_auth(&stranger),
+            )
+            .await,
+            "a non-member must not archive a board",
+        );
+        let message = err_message(&err);
+        eprintln!("DENIAL (closed relay, no relay_members row): {message}");
+        assert!(
+            matches!(err, IngestError::AuthFailed(_)),
+            "denial must be an auth failure, got {err:?}"
+        );
+        assert_eq!(message, "restricted: not a relay member");
+        assert!(
+            message.to_lowercase().contains("not a relay member"),
+            "desktop `isBoardModerationDeniedError` matches this substring"
+        );
+
+        let head = buzz_db::lab::get_board_head(&pool, tenant.community(), board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(head.status, "active", "the refused write must not land");
+    }
+
+    /// Item 4b — open relay (`require_relay_membership = false`): the
+    /// membership gate short-circuits to `Ok`, so the refusal comes from
+    /// `authorize_moderation_action` instead, with a *different* string. Both
+    /// strings are load-bearing for the desktop helper, which is why both are
+    /// pinned. A plain `member` is refused the same way on a closed relay.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn moderation_without_owner_or_admin_role_is_denied() {
+        let Some(url) = test_database_url() else {
+            eprintln!("SKIP: set BUZZ_TEST_DATABASE_URL to a throwaway database");
+            return;
+        };
+
+        // Open relay, no relay_members row at all.
+        let Some((open_state, _)) = lab_test_state(&url, false).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let open_tenant = fresh_community(&open_state).await;
+        let author = Keys::generate();
+        let (open_board, _) = create_board(&open_state, &open_tenant, &author, "B", "b").await;
+        let err = expect_refusal(
+            handle_lab_board_revision_event(
+                &open_tenant,
+                &open_state,
+                moderation_event(&author, open_board, "archive"),
+                &nip42_auth(&author),
+            )
+            .await,
+            "an actor with no community role must not archive a board",
+        );
+        let message = err_message(&err);
+        eprintln!("DENIAL (open relay, no role): {message}");
+        assert!(matches!(err, IngestError::AuthFailed(_)));
+        assert_eq!(message, "restricted: moderator access required");
+
+        // Closed relay, a real `member` row — membership passes, role does not.
+        let Some((state, _)) = lab_test_state(&url, true).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let tenant = fresh_community(&state).await;
+        let owner = Keys::generate();
+        grant_role(&state, &tenant, &owner, "owner").await;
+        let member = Keys::generate();
+        grant_role(&state, &tenant, &member, "member").await;
+        let (board_id, _) = create_board(&state, &tenant, &owner, "B", "b").await;
+
+        let err = expect_refusal(
+            handle_lab_board_revision_event(
+                &tenant,
+                &state,
+                moderation_event(&member, board_id, "archive"),
+                &nip42_auth(&member),
+            )
+            .await,
+            "a plain member must not archive a board",
+        );
+        let message = err_message(&err);
+        eprintln!("DENIAL (closed relay, role=member): {message}");
+        assert_eq!(message, "restricted: moderator access required");
+
+        // An `admin` may, so the denial above is about role and not about
+        // "anyone other than the creator".
+        let admin = Keys::generate();
+        grant_role(&state, &tenant, &admin, "admin").await;
+        handle_lab_board_revision_event(
+            &tenant,
+            &state,
+            moderation_event(&admin, board_id, "archive"),
+            &nip42_auth(&admin),
+        )
+        .await
+        .expect("a community admin may archive");
+    }
+
+    /// Item 4c — the population the desktop's denial copy actually names: a
+    /// **NIP-OA managed agent whose owner IS a community owner**.
+    ///
+    /// This is the asymmetry worth pinning. [`is_lab_board_member`] resolves
+    /// the agent through `users.agent_owner_pubkey`, so the agent passes the
+    /// membership gate — it may create and edit boards. But
+    /// `moderation_authz::authorize_moderation_action` looks up
+    /// `relay_members` for the **actor's own pubkey** with no owner fallback,
+    /// so the same agent is refused every moderation op. Delegation carries
+    /// write authority and does not carry moderator authority.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn a_managed_agent_inherits_membership_but_never_moderator_authority() {
+        let Some(url) = test_database_url() else {
+            eprintln!("SKIP: set BUZZ_TEST_DATABASE_URL to a throwaway database");
+            return;
+        };
+        let Some((state, pool)) = lab_test_state_with(&url, true, true).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let tenant = fresh_community(&state).await;
+        let community = tenant.community();
+
+        let human_owner = Keys::generate();
+        grant_role(&state, &tenant, &human_owner, "owner").await;
+
+        // The durable NIP-OA mapping the AUTH handshake would have persisted.
+        let agent = Keys::generate();
+        state
+            .db
+            .ensure_user(community, &agent.public_key().to_bytes())
+            .await
+            .expect("ensure agent user");
+        state
+            .db
+            .ensure_user(community, &human_owner.public_key().to_bytes())
+            .await
+            .expect("ensure owner user");
+        assert!(
+            state
+                .db
+                .set_agent_owner(
+                    community,
+                    &agent.public_key().to_bytes(),
+                    &human_owner.public_key().to_bytes(),
+                )
+                .await
+                .expect("set agent owner"),
+            "the agent must be durably owned by the community owner"
+        );
+        assert!(
+            !state
+                .db
+                .is_relay_member(community, &agent.public_key().to_hex())
+                .await
+                .expect("membership lookup"),
+            "an agent's own pubkey is never materialized in relay_members"
+        );
+
+        // Membership: inherited. The agent can create a board.
+        let (board_id, _) = create_board(&state, &tenant, &agent, "Agent board", "body").await;
+
+        // Moderation: NOT inherited.
+        let err = expect_refusal(
+            handle_lab_board_revision_event(
+                &tenant,
+                &state,
+                moderation_event(&agent, board_id, "archive"),
+                &nip42_auth(&agent),
+            )
+            .await,
+            "a managed agent must not archive a board even when its owner is a community owner",
+        );
+        let message = err_message(&err);
+        eprintln!("DENIAL (NIP-OA agent, owner is community owner): {message}");
+        assert!(matches!(err, IngestError::AuthFailed(_)));
+        assert_eq!(
+            message, "restricted: moderator access required",
+            "the agent passes the membership gate (so not the `not a relay member` \
+             wording) and is stopped by the role gate"
+        );
+
+        // The owner itself may archive the agent's board, isolating the
+        // refusal above to the actor's identity.
+        handle_lab_board_revision_event(
+            &tenant,
+            &state,
+            moderation_event(&human_owner, board_id, "archive"),
+            &nip42_auth(&human_owner),
+        )
+        .await
+        .expect("the human community owner may archive");
+        let head = buzz_db::lab::get_board_head(&pool, community, board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(head.status, "archived");
+    }
+
+    /// Item 5 — the shapes the desktop asserts it never emits really are
+    /// refused, so "we don't send them" is a guarantee and not a preference.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn moderation_ops_reject_content_only_tags() {
+        let Some(url) = test_database_url() else {
+            eprintln!("SKIP: set BUZZ_TEST_DATABASE_URL to a throwaway database");
+            return;
+        };
+        let Some((state, pool)) = lab_test_state(&url, true).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let tenant = fresh_community(&state).await;
+        let owner = Keys::generate();
+        grant_role(&state, &tenant, &owner, "owner").await;
+        let (board_id, _) = create_board(&state, &tenant, &owner, "Board", "body").await;
+        let d = board_id.to_string();
+
+        let cases: Vec<(&str, Vec<Vec<&str>>, &str)> = vec![
+            (
+                "access_scope",
+                vec![
+                    vec!["d", &d],
+                    vec!["op", "archive"],
+                    vec!["access_scope", "private"],
+                ],
+                "create_v2/update_v2",
+            ),
+            (
+                "t (topic tag)",
+                vec![vec!["d", &d], vec!["op", "archive"], vec!["t", "sprint"]],
+                "create_v2/update_v2",
+            ),
+            (
+                "restored_from",
+                vec![
+                    vec!["d", &d],
+                    vec!["op", "archive"],
+                    vec!["restored_from", "1"],
+                ],
+                "only valid on `restore`",
+            ),
+        ];
+
+        for (label, tags, expected_fragment) in cases {
+            let outcome = handle_lab_board_revision_event(
+                &tenant,
+                &state,
+                signed(&owner, "", tags),
+                &nip42_auth(&owner),
+            )
+            .await;
+            let err = expect_refusal(outcome, &format!("a moderation op carrying `{label}`"));
+            let message = err_message(&err);
+            eprintln!("REJECTED `{label}` on a moderation op: {message}");
+            assert!(
+                matches!(err, IngestError::Rejected(_)),
+                "`{label}` must be a client-side rejection, got {err:?}"
+            );
+            assert!(
+                message.contains(expected_fragment),
+                "`{label}` rejection should name the rule ({expected_fragment:?}), got {message:?}"
+            );
+        }
+
+        // None of the refused shapes may have moved the board.
+        let head = buzz_db::lab::get_board_head(&pool, tenant.community(), board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(head.status, "active");
+        assert_eq!(head.revision, 1);
+    }
+
+    /// Item 6 — **documents current relay behavior, does not endorse it.**
+    ///
+    /// `handle_content_mutation` gates edits on `status == "frozen"` only, so a
+    /// content update to an *archived* board is accepted. The desktop blocks
+    /// this client-side; the CLI and any agent speaking the wire protocol are
+    /// not blocked. If that is ever changed to refuse archived boards too, this
+    /// test fails — which is the point: the change should be deliberate, not a
+    /// side effect.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn archived_boards_still_accept_content_edits_today() {
+        let Some(url) = test_database_url() else {
+            eprintln!("SKIP: set BUZZ_TEST_DATABASE_URL to a throwaway database");
+            return;
+        };
+        let Some((state, pool)) = lab_test_state(&url, true).await else {
+            panic!("test Postgres unreachable at {url}");
+        };
+        let tenant = fresh_community(&state).await;
+        let owner = Keys::generate();
+        grant_role(&state, &tenant, &owner, "owner").await;
+        let (board_id, create) = create_board(&state, &tenant, &owner, "Board", "v1").await;
+
+        handle_lab_board_revision_event(
+            &tenant,
+            &state,
+            moderation_event(&owner, board_id, "archive"),
+            &nip42_auth(&owner),
+        )
+        .await
+        .expect("archive");
+
+        let d = board_id.to_string();
+        let prev = create.id.to_hex();
+        let update = signed(
+            &owner,
+            "v2 written while archived",
+            vec![vec!["d", &d], vec!["op", "update"], vec!["prev", &prev]],
+        );
+        let result =
+            handle_lab_board_revision_event(&tenant, &state, update, &nip42_auth(&owner)).await;
+        match &result {
+            Ok(r) => eprintln!(
+                "content edit on an ARCHIVED board -> ACCEPTED (message={:?})",
+                r.message
+            ),
+            Err(e) => eprintln!(
+                "content edit on an ARCHIVED board -> REFUSED ({})",
+                err_message(e)
+            ),
+        }
+        assert!(
+            result.is_ok(),
+            "CURRENT behavior: only `frozen` blocks content edits, `archived` does not. \
+             If this now fails, the relay gained an archived-write gate — update the \
+             desktop/CLI notes and this test together."
+        );
+
+        let head = buzz_db::lab::get_board_head(&pool, tenant.community(), board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(head.revision, 2, "the edit really landed");
+        assert_eq!(
+            head.status, "archived",
+            "and the board is still archived afterwards"
+        );
+
+        // The contrast case: `frozen` IS enforced.
+        let (frozen_board, frozen_create) =
+            create_board(&state, &tenant, &owner, "Frozen", "v1").await;
+        handle_lab_board_revision_event(
+            &tenant,
+            &state,
+            moderation_event(&owner, frozen_board, "freeze"),
+            &nip42_auth(&owner),
+        )
+        .await
+        .expect("freeze");
+        let fd = frozen_board.to_string();
+        let fprev = frozen_create.id.to_hex();
+        let err = expect_refusal(
+            handle_lab_board_revision_event(
+                &tenant,
+                &state,
+                signed(
+                    &owner,
+                    "v2",
+                    vec![vec!["d", &fd], vec!["op", "update"], vec!["prev", &fprev]],
+                ),
+                &nip42_auth(&owner),
+            )
+            .await,
+            "a frozen board must refuse content edits",
+        );
+        eprintln!("content edit on a FROZEN board -> {}", err_message(&err));
+        assert!(err_message(&err).contains("frozen"));
     }
 }
