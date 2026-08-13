@@ -893,7 +893,11 @@ mod postgres_tests {
             .await
             .expect("approve");
         let claim = store
-            .claim_specific(request.id, "test-executor", crate::deletion::DEFAULT_LEASE_DURATION)
+            .claim_specific(
+                request.id,
+                "test-executor",
+                crate::deletion::DEFAULT_LEASE_DURATION,
+            )
             .await
             .expect("claim")
             .expect("won claim");
@@ -930,7 +934,10 @@ mod postgres_tests {
         );
         let _ = update_tx.rollback().await;
 
-        let mut create2_tx = db.begin_transaction().await.expect("begin second create tx");
+        let mut create2_tx = db
+            .begin_transaction()
+            .await
+            .expect("begin second create tx");
         let create_result = create_board_head_tx(
             &mut create2_tx,
             community,

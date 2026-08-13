@@ -4777,13 +4777,12 @@ mod postgres_tests {
                 .fetch_one(&db.pool)
                 .await
                 .expect("count lab_board_heads before purge");
-        let lab_revisions_before: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM lab_board_revisions WHERE community_id = $1",
-        )
-        .bind(community.as_uuid())
-        .fetch_one(&db.pool)
-        .await
-        .expect("count lab_board_revisions before purge");
+        let lab_revisions_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM lab_board_revisions WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count lab_board_revisions before purge");
         assert_eq!(lab_heads_before, 1);
         assert_eq!(lab_revisions_before, 1);
 
@@ -4835,13 +4834,12 @@ mod postgres_tests {
                 .fetch_one(&db.pool)
                 .await
                 .expect("count lab_board_heads after purge");
-        let lab_revisions_after: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM lab_board_revisions WHERE community_id = $1",
-        )
-        .bind(community.as_uuid())
-        .fetch_one(&db.pool)
-        .await
-        .expect("count lab_board_revisions after purge");
+        let lab_revisions_after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM lab_board_revisions WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count lab_board_revisions after purge");
         assert_eq!(lab_heads_after, 0, "lab_board_heads must be purged");
         assert_eq!(lab_revisions_after, 0, "lab_board_revisions must be purged");
 
