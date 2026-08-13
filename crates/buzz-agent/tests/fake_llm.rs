@@ -74,14 +74,59 @@ async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<V
     .await
 }
 
+/// A release valve the fake LLM waits on before answering one chosen request,
+/// so a test can pin an event to a point *inside* a turn instead of racing it.
+///
+/// A `watch` rather than a `Notify`: the test may well open the gate before the
+/// server task reaches its wait, and a `watch` receiver reads the current value
+/// first, so an early open is remembered instead of lost.
+struct ResponseGate(tokio::sync::watch::Sender<bool>);
+
+impl ResponseGate {
+    /// Let the withheld response through. Idempotent.
+    fn open(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// Like [`spawn_capturing_fake_llm`], but the response to request `gate_index`
+/// (0-based) is withheld until the returned [`ResponseGate`] is opened. The
+/// request itself is still captured immediately, so the agent is parked
+/// mid-turn — exactly where a test needs the turn to sit still.
+async fn spawn_capturing_fake_llm_gated(
+    responses: Vec<Value>,
+    gate_index: usize,
+) -> (String, Arc<Mutex<Vec<Value>>>, ResponseGate) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (url, captures) = spawn_capturing_fake_llm_with_statuses_gated(
+        responses
+            .into_iter()
+            .map(|body| CannedResponse { status: 200, body })
+            .collect(),
+        Some((gate_index, rx)),
+    )
+    .await;
+    (url, captures, ResponseGate(tx))
+}
+
 async fn spawn_capturing_fake_llm_with_statuses(
     responses: Vec<CannedResponse>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_capturing_fake_llm_with_statuses_gated(responses, None).await
+}
+
+async fn spawn_capturing_fake_llm_with_statuses_gated(
+    responses: Vec<CannedResponse>,
+    gate: Option<(usize, tokio::sync::watch::Receiver<bool>)>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
     let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let captures_clone = captures.clone();
+    // The agent issues one request at a time, so a plain counter is enough to
+    // name "the Nth request of the turn".
+    let seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let (mut sock, _) = match listener.accept().await {
@@ -90,6 +135,8 @@ async fn spawn_capturing_fake_llm_with_statuses(
             };
             let queue = queue.clone();
             let captures = captures_clone.clone();
+            let gate = gate.clone();
+            let seq = seq.clone();
             tokio::spawn(async move {
                 // Read headers.
                 let mut buf = Vec::new();
@@ -136,6 +183,19 @@ async fn spawn_capturing_fake_llm_with_statuses(
                     serde_json::from_slice::<Value>(&body_buf[..content_length.min(body_buf.len())])
                 {
                     captures.lock().await.push(parsed);
+                }
+
+                // Hold this response if it is the gated one, so the turn parks
+                // here until the test says to let it go.
+                let idx = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some((gate_index, mut open)) = gate {
+                    if idx == gate_index {
+                        while !*open.borrow() {
+                            if open.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // Send canned response.
@@ -779,10 +839,36 @@ async fn steer_folds_into_active_turn_without_cancelling() {
     // A two-round turn (tool call → text). A steer sent once the run is live
     // must (a) be accepted with the matching runId, (b) NOT cancel the turn —
     // it still ends with end_turn — and (c) reach the provider as a user turn.
-    let (url, captures) = spawn_capturing_fake_llm(vec![
-        openai_tool_call("call_steer", "fake__noop", json!({})),
-        openai_text("acknowledged the steer"),
-    ])
+    //
+    // Round 1's response is withheld until that steer has been accepted.
+    //
+    // Steers are folded in by `drain_steers()` at a *round boundary*, so a
+    // steer reaches the provider only if it is queued before the turn's last
+    // one. Nothing in the wire protocol makes that true: this test learns
+    // `activeRunId` and writes its steer while the agent, on a wholly separate
+    // path, finishes round 1 and enters round 2. Both paths are tiny here —
+    // two loopback HTTP calls with an unknown-tool failure between them, the
+    // whole turn well under a millisecond — so the turn routinely outran the
+    // steer. 12 of 40 runs under load, in two flavours: 5 where the steer
+    // landed after the final drain but before teardown (accepted, then
+    // silently dropped — `saw_steer` fails) and 7 where it landed after
+    // teardown (rejected — the runId assertion fails).
+    //
+    // Parking the turn inside round 1's provider call retires the race rather
+    // than lengthening the odds. `steer_session` queues the blocks *before* it
+    // replies, so once the reply that opens this gate has been read, the steer
+    // is already sitting in the queue that round 2's `drain_steers()` reads.
+    // Nothing below is relaxed: the turn is genuinely mid-flight when the
+    // steer arrives, which is the precondition the test always meant to state,
+    // and the only regime in which "folds instead of cancelling" is a claim
+    // worth making.
+    let (url, captures, round1) = spawn_capturing_fake_llm_gated(
+        vec![
+            openai_tool_call("call_steer", "fake__noop", json!({})),
+            openai_text("acknowledged the steer"),
+        ],
+        0,
+    )
     .await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
@@ -829,6 +915,8 @@ async fn steer_folds_into_active_turn_without_cancelling() {
                 "steer reply carries a messageId"
             );
             steer_ok = true;
+            // Queued for sure now — let round 1 finish so round 2 folds it in.
+            round1.open();
         } else if v["id"] == json!(p_id) {
             // The turn was NOT cancelled — it completed normally.
             assert_eq!(v["result"]["stopReason"], "end_turn");
@@ -887,10 +975,25 @@ async fn steer_rejected_when_no_active_run() {
 async fn steer_rejected_on_run_id_mismatch() {
     // A live run, but the caller targets a stale/wrong run id → invalid_params,
     // so the client falls back to cancel+merge instead of injecting blind.
-    let (url, _captures) = spawn_capturing_fake_llm(vec![
-        openai_tool_call("call_x", "fake__noop", json!({})),
-        openai_text("done"),
-    ])
+    //
+    // Round 1's response is withheld until the steer has been answered, for the
+    // same reason as `steer_folds_into_active_turn_without_cancelling`: the
+    // turn is two loopback calls long and the loop below stops at the prompt
+    // response, so a turn that got there first ended the loop before the steer
+    // reply was ever read — reporting "run-id mismatch was not rejected" for a
+    // steer that had in fact been rejected.
+    //
+    // Parking the turn also preserves the precondition this test is named for.
+    // `steer_session` rejects a stale id and a finished run with the same
+    // -32602, so a turn that ends first makes the code assertion pass down the
+    // wrong branch. The message assertion pins which branch answered.
+    let (url, _captures, round1) = spawn_capturing_fake_llm_gated(
+        vec![
+            openai_tool_call("call_x", "fake__noop", json!({})),
+            openai_text("done"),
+        ],
+        0,
+    )
     .await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
@@ -922,7 +1025,16 @@ async fn steer_rejected_on_run_id_mismatch() {
                 v["error"]["code"], -32602,
                 "mismatched runId must be rejected"
             );
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("expected active run id")),
+                "the rejection must come from the id not matching a LIVE run, \
+                 not from the run having already finished; got: {v}"
+            );
             saw_reject = true;
+            // Answered — let the turn finish normally.
+            round1.open();
         } else if v["id"] == json!(p_id) {
             // Turn finishes normally regardless of the rejected steer.
             break;
@@ -1250,9 +1362,9 @@ async fn mid_turn_usage_includes_earlier_turns() {
 ///
 /// Setup: round 1 is a tool call WITH usage (tokens are captured). After the
 /// tool_call_update notification (proving round 1 is fully processed), we gate
-/// the round-2 LLM response behind a `oneshot` barrier that only releases after
-/// cancel is sent. This guarantees the turn exits with `stopReason: "cancelled"`
-/// deterministically, even on a slow CI worker.
+/// the round-2 LLM response behind a `oneshot` barrier that only releases once
+/// the agent has *acknowledged* the cancel. This guarantees the turn exits with
+/// `stopReason: "cancelled"` deterministically, even on a slow CI worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_turn_with_usage_emits_notification_before_response() {
     use tokio::sync::oneshot;
@@ -1265,8 +1377,8 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     // Round 2: gated — blocked until cancel fires, then released so the
     // in-flight TCP request can resolve. The queue is empty for round 2, so the
     // agent receives the fallback "no canned response" body which it treats as
-    // an LLM error; the cancel check at the round boundary fires first because
-    // the gate is only released after cancel is enqueued.
+    // an LLM error; the cancel arm of the turn's `select!` fires first because
+    // the gate is only released after the agent has acknowledged the cancel.
     let responses = vec![openai_tool_call_with_usage(
         "call_cancel_test",
         "fake__noop",
@@ -1346,10 +1458,27 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     })
     .await;
 
-    // Now send cancel and release the round-2 gate. Cancel is enqueued before
-    // round 2 can respond, so the turn exits with stopReason: cancelled.
+    // Now cancel. The round-2 gate is released in the loop below, when the
+    // agent acknowledges it — not here.
+    //
+    // Writing `session/cancel` does not cancel anything: `cancel_session` sets
+    // the cancel watch, and the reply is sent immediately after, so the reply
+    // is the first observable proof the watch is set. Until the agent's wire
+    // loop reads that line the turn's `select!` still sees a live provider call
+    // and no cancel to prefer, so opening the gate here raced round 2's
+    // response against the agent noticing the cancel at all. Round 2 won 11 of
+    // 40 runs: its body is the fallback "no canned response", the agent turns
+    // that into an LLM error, and the turn ends as an error object instead of
+    // `stopReason: cancelled` — the assertion below then reports `left: Null`,
+    // because there is no `result` to read a stopReason out of.
+    //
+    // Gating on the acknowledgement makes the ordering real rather than
+    // likely. It is also strictly stronger than the old
+    // `assert!(saw_cancel_ok)` it replaces: the turn cannot proceed at all
+    // until the ack arrives, so a missing ack now stalls into a loud `recv`
+    // timeout instead of being reported at the end.
     let c_id = h.send("session/cancel", json!({"sessionId": sid})).await;
-    let _ = gate_tx.send(()); // unblock round 2
+    let mut gate_tx = Some(gate_tx);
 
     let mut saw_usage_before_prompt_response = false;
     let mut saw_usage = false;
@@ -1359,6 +1488,10 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
         let v = h.recv().await;
         if v["id"] == json!(c_id) {
             saw_cancel_ok = true;
+            // Cancel is applied now — let round 2 resolve.
+            if let Some(tx) = gate_tx.take() {
+                let _ = tx.send(());
+            }
         } else if is_usage_update(&v) {
             saw_usage = true;
             if !saw_prompt_response {
@@ -1421,10 +1554,22 @@ fn openai_tool_call_with_usage(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_rejected_on_empty_prompt() {
-    let (url, _captures) = spawn_capturing_fake_llm(vec![
-        openai_tool_call("call_x", "fake__noop", json!({})),
-        openai_text("done"),
-    ])
+    // Round 1's response is withheld until the steer has been answered — the
+    // same early-break race as `steer_rejected_on_run_id_mismatch`: the loop
+    // below stops at the prompt response, so a turn that finished first ended
+    // it before the steer reply was read, and an empty prompt that *had* been
+    // rejected was reported as "not rejected".
+    //
+    // The emptiness check runs before `steer_session` looks up the run at all,
+    // so unlike the mismatch case nothing here depends on the run being live.
+    // The gate is for ordering only.
+    let (url, _captures, round1) = spawn_capturing_fake_llm_gated(
+        vec![
+            openai_tool_call("call_x", "fake__noop", json!({})),
+            openai_text("done"),
+        ],
+        0,
+    )
     .await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
@@ -1447,6 +1592,8 @@ async fn steer_rejected_on_empty_prompt() {
         if v["id"] == json!(s_id) {
             assert_eq!(v["error"]["code"], -32602, "empty prompt must be rejected");
             saw_reject = true;
+            // Answered — let the turn finish normally.
+            round1.open();
         } else if v["id"] == json!(p_id) {
             break;
         }

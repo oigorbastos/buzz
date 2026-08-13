@@ -24,15 +24,58 @@ async fn spawn_capturing_llm(responses: Vec<Value>) -> CapturingLlm {
     spawn_capturing_llm_with_status(responses.into_iter().map(|v| (200u16, v)).collect()).await
 }
 
+/// A release valve the fake provider waits on before answering one chosen
+/// request, so a test can pin an event to a point *inside* a turn rather than
+/// racing it.
+///
+/// A `watch` rather than a `Notify`: the test may open the gate before the
+/// server task reaches its wait, and a `watch` receiver reads the current value
+/// first, so an early open is remembered instead of lost.
+struct ResponseGate(tokio::sync::watch::Sender<bool>);
+
+impl ResponseGate {
+    /// Let the withheld response through. Idempotent.
+    fn open(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// Like `spawn_capturing_llm`, but the response to request `gate_index`
+/// (0-based, counted across the whole session) is withheld until the returned
+/// [`ResponseGate`] is opened. The request is still captured immediately, so
+/// the agent parks mid-turn — exactly where a test needs the turn to sit still.
+async fn spawn_capturing_llm_gated(
+    responses: Vec<Value>,
+    gate_index: usize,
+) -> (CapturingLlm, ResponseGate) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let llm = spawn_capturing_llm_with_status_gated(
+        responses.into_iter().map(|v| (200u16, v)).collect(),
+        Some((gate_index, rx)),
+    )
+    .await;
+    (llm, ResponseGate(tx))
+}
+
 /// Like `spawn_capturing_llm` but each canned response carries its own HTTP
 /// status, so a test can serve a real provider rejection (e.g. a context-window
 /// 400) instead of only success bodies.
 async fn spawn_capturing_llm_with_status(responses: Vec<(u16, Value)>) -> CapturingLlm {
+    spawn_capturing_llm_with_status_gated(responses, None).await
+}
+
+async fn spawn_capturing_llm_with_status_gated(
+    responses: Vec<(u16, Value)>,
+    gate: Option<(usize, tokio::sync::watch::Receiver<bool>)>,
+) -> CapturingLlm {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
     let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let cap2 = captured.clone();
+    // The agent issues one request at a time, so a plain counter is enough to
+    // name "the Nth request of the session".
+    let seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let (mut sock, _) = match listener.accept().await {
@@ -41,6 +84,8 @@ async fn spawn_capturing_llm_with_status(responses: Vec<(u16, Value)>) -> Captur
             };
             let queue = queue.clone();
             let captured = cap2.clone();
+            let gate = gate.clone();
+            let seq = seq.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 8192];
@@ -72,6 +117,18 @@ async fn spawn_capturing_llm_with_status(responses: Vec<(u16, Value)>) -> Captur
                 }
                 if let Ok(req) = serde_json::from_slice::<Value>(&buf[header_end..]) {
                     captured.lock().await.push(req);
+                }
+                // Hold this response if it is the gated one, so the turn parks
+                // here until the test says to let it go.
+                let idx = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some((gate_index, mut open)) = gate {
+                    if idx == gate_index {
+                        while !*open.borrow() {
+                            if open.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
                 let (status, body) = queue
                     .lock()
@@ -3398,12 +3455,32 @@ async fn handoff_cap_binds_within_a_single_turn() {
         });
         v
     };
-    let llm = spawn_capturing_llm(vec![
-        openai_text_with_usage("seed", 950), // turn 1: seed high usage
-        openai_text("handoff-summary"),      // turn 2 round 0: summarize
-        tool_call_with_usage,                // turn 2 round 0: tool call + usage (re-arms)
-        openai_text_with_usage("end_turn_text", 10), // turn 2 round 1: final answer
-    ])
+    // Turn 2 round 0's tool-call response — request index 2, counting turn 1's
+    // seed — is withheld until the steer below has been accepted.
+    //
+    // The same race as `steer_folds_into_active_turn_without_cancelling` in
+    // fake_llm.rs, an order of magnitude slower. The steer has to be queued
+    // before round 1's `drain_steers()`, and nothing made that true except
+    // this turn being long: a summarize call, then a tool call. Long is not
+    // ordered, and under load the turn still won — 4 of 40 runs finished turn
+    // 2 before the steer was processed at all, so the loop below broke on the
+    // prompt result with `steer_accepted` still false.
+    //
+    // Parking the turn inside round 0's provider call fixes the order rather
+    // than lengthening the odds. `steer_session` queues the blocks *before* it
+    // replies, so once the reply that opens this gate has been read, the steer
+    // is already in the queue round 1 drains. Nothing the test proves changes:
+    // the steer still lands before round 1, which is exactly where it has to
+    // be for the cap — not the steer path — to be what blocks the handoff.
+    let (llm, round0_tool_call) = spawn_capturing_llm_gated(
+        vec![
+            openai_text_with_usage("seed", 950), // turn 1: seed high usage
+            openai_text("handoff-summary"),      // turn 2 round 0: summarize
+            tool_call_with_usage,                // turn 2 round 0: tool call + usage (re-arms)
+            openai_text_with_usage("end_turn_text", 10), // turn 2 round 1: final answer
+        ],
+        2,
+    )
     .await;
 
     let mut h = Harness::spawn_with_env(
@@ -3505,6 +3582,8 @@ async fn handoff_cap_binds_within_a_single_turn() {
                 "steer must reference the live run id"
             );
             steer_accepted = true;
+            // Queued for sure now — let round 0 finish so round 1 folds it in.
+            round0_tool_call.open();
             continue;
         }
 
