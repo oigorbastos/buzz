@@ -706,3 +706,266 @@ pub async fn list_board_revisions(
 
     rows.iter().map(row_to_board_revision).collect()
 }
+
+// This module (and crates/buzz-relay/src/handlers/lab.rs) shipped with the
+// Lab Boards V1 foundation round with zero unit tests — a known, previously
+// flagged gap. These two tests are minimal coverage added alongside the
+// whole-community deletion port (see crates/buzz-db/src/deletion.rs), not a
+// general backfill of Lab Boards test coverage: (1) the pre-existing
+// create-race CAS-conflict path this module's own doc comments already
+// describe (see [`create_board_head_tx`]), and (2) the new interaction the
+// deletion port introduces — a Lab board write against a community the
+// deletion pipeline has fenced must be rejected cleanly by the
+// `enforce_community_write_fence` trigger (attached to `lab_board_heads` /
+// `lab_board_revisions` via EXPECTED_SCOPED_TABLES / PURGE_SCOPED_TABLES in
+// `deletion.rs`), not silently accepted and not a panic.
+#[cfg(test)]
+mod postgres_tests {
+    use super::*;
+    use crate::deletion::{FrozenInventory, KeyStreamDigest, PrefixManifest, StorageManifest};
+    use crate::error::DbError;
+    use crate::{Db, DbConfig};
+
+    async fn db() -> Db {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let db = Db::new(&DbConfig {
+            database_url,
+            max_connections: 5,
+            min_connections: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect lab test DB");
+        db.migrate().await.expect("migrate lab test DB");
+        db
+    }
+
+    async fn seed_community(db: &Db) -> CommunityId {
+        let host = format!("lab-test-{}.example", Uuid::new_v4().simple());
+        db.ensure_configured_community(&host)
+            .await
+            .expect("create community")
+            .id
+    }
+
+    async fn seed_community_with_host(db: &Db) -> (CommunityId, String) {
+        let host = format!("lab-test-{}.example", Uuid::new_v4().simple());
+        let record = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("create community");
+        (record.id, record.host)
+    }
+
+    /// Two callers racing the same fresh `board_id` past the advisory lock
+    /// window — or a caller bug that skips the `get_board_head_for_update_tx`
+    /// existence check before calling this — must not silently let the
+    /// second "create" clobber the first board. [`create_board_head_tx`]'s
+    /// own doc comment states the contract: the `lab_board_heads` primary
+    /// key `(community_id, board_id)` is the backstop, and a violation must
+    /// surface as a typed, rejected CAS conflict, never a panic and never a
+    /// second board silently coexisting.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn create_board_head_rejects_a_racing_duplicate_as_a_cas_conflict() {
+        let db = db().await;
+        let community = seed_community(&db).await;
+        let board_id = Uuid::new_v4();
+        let actor = [7_u8; 32];
+
+        let mut tx = db.begin_transaction().await.expect("begin tx 1");
+        create_board_head_tx(
+            &mut tx,
+            community,
+            board_id,
+            &[1_u8; 32],
+            &[2_u8; 32],
+            "First writer wins",
+            None,
+            &actor,
+        )
+        .await
+        .expect("first create commits");
+        tx.commit().await.expect("commit first create");
+
+        let mut tx2 = db.begin_transaction().await.expect("begin tx 2");
+        let second = create_board_head_tx(
+            &mut tx2,
+            community,
+            board_id,
+            &[3_u8; 32],
+            &[4_u8; 32],
+            "Second writer loses",
+            None,
+            &actor,
+        )
+        .await;
+        assert!(
+            matches!(second, Err(DbError::Sqlx(_))),
+            "racing duplicate create must surface as a rejected CAS conflict, not {second:?}"
+        );
+        let _ = tx2.rollback().await;
+
+        let head = get_board_head(&db.pool, community, board_id)
+            .await
+            .expect("read head")
+            .expect("head exists");
+        assert_eq!(
+            head.title, "First writer wins",
+            "the losing racer must not have clobbered the winning board"
+        );
+        assert_eq!(head.revision, 1);
+    }
+
+    /// Drive a community through submit -> inventory -> approve -> claim ->
+    /// quiesce -> fence (mirrors `deletion::postgres_tests::inventoried_request`
+    /// plus the fencing steps in
+    /// `destructive_stages_serialize_with_migrations_and_fail_closed_on_new_scoped_tables`),
+    /// then attempt ordinary Lab Board writes with no executor/serving-lease
+    /// context. Both a fresh "create" (INSERT) and a content "update"
+    /// (UPDATE) against the board created before fencing must be rejected by
+    /// the universal write fence, not silently accepted and not a panic.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn lab_board_writes_are_rejected_once_the_community_is_fenced_for_deletion() {
+        let db = db().await;
+        let store = db.deletion_store();
+        let (community, host) = seed_community_with_host(&db).await;
+        let actor = [9_u8; 32];
+
+        let board_id = Uuid::new_v4();
+        let mut create_tx = db.begin_transaction().await.expect("begin create tx");
+        create_board_head_tx(
+            &mut create_tx,
+            community,
+            board_id,
+            &[10_u8; 32],
+            &[11_u8; 32],
+            "Board created before fencing",
+            None,
+            &actor,
+        )
+        .await
+        .expect("create board before fencing");
+        create_tx.commit().await.expect("commit board create");
+
+        let submitted = store
+            .submit(&host, "test-operator", Some("lab fence test"))
+            .await
+            .expect("submit deletion request");
+        let inventory = FrozenInventory {
+            schema: store
+                .inventory_schema(community)
+                .await
+                .expect("schema inventory"),
+            storage: StorageManifest {
+                version: 4,
+                prefixes: vec![
+                    PrefixManifest {
+                        prefix: format!("_meta/{community}/"),
+                        object_count: 0,
+                        total_bytes: 0,
+                        keys_digest: KeyStreamDigest::new().finish().0,
+                    },
+                    PrefixManifest {
+                        prefix: format!("_uploads/{community}/"),
+                        object_count: 0,
+                        total_bytes: 0,
+                        keys_digest: KeyStreamDigest::new().finish().0,
+                    },
+                    PrefixManifest {
+                        prefix: format!("repos/{community}/"),
+                        object_count: 0,
+                        total_bytes: 0,
+                        keys_digest: KeyStreamDigest::new().finish().0,
+                    },
+                ],
+            },
+        };
+        let request = store
+            .freeze_inventory(submitted.id, &inventory)
+            .await
+            .expect("freeze inventory");
+        store
+            .approve(request.id, "test-approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(
+                request.id,
+                "test-executor",
+                crate::deletion::DEFAULT_LEASE_DURATION,
+            )
+            .await
+            .expect("claim")
+            .expect("won claim");
+        store
+            .begin_quiescing(&claim.lease)
+            .await
+            .expect("begin quiescing");
+        store.fence(&claim.lease).await.expect("fence community");
+
+        // Ordinary write, no executor/serving-lease GUCs set — exactly the
+        // shape of a Lab Board write reaching the CAS transaction after the
+        // community has been fenced but before the deletion pipeline's own
+        // purge has run.
+        let mut update_tx = db.begin_transaction().await.expect("begin update tx");
+        let update_result = update_board_content_head_tx(
+            &mut update_tx,
+            community,
+            board_id,
+            2,
+            &[12_u8; 32],
+            &[13_u8; 32],
+            "Attempted update while fenced",
+            None,
+            &actor,
+        )
+        .await;
+        assert!(
+            matches!(&update_result, Err(DbError::Sqlx(_))),
+            "content update against a fenced community must be rejected cleanly, not {update_result:?}"
+        );
+        assert!(
+            update_result.unwrap_err().to_string().contains("fenced"),
+            "rejection should be the community write fence, not some other failure"
+        );
+        let _ = update_tx.rollback().await;
+
+        let mut create2_tx = db
+            .begin_transaction()
+            .await
+            .expect("begin second create tx");
+        let create_result = create_board_head_tx(
+            &mut create2_tx,
+            community,
+            Uuid::new_v4(),
+            &[14_u8; 32],
+            &[15_u8; 32],
+            "New board attempted while fenced",
+            None,
+            &actor,
+        )
+        .await;
+        assert!(
+            matches!(&create_result, Err(DbError::Sqlx(_))),
+            "a fresh board create against a fenced community must be rejected cleanly, not {create_result:?}"
+        );
+        assert!(
+            create_result.unwrap_err().to_string().contains("fenced"),
+            "rejection should be the community write fence, not some other failure"
+        );
+        let _ = create2_tx.rollback().await;
+
+        // The pre-fencing board content must be untouched by the rejected
+        // update attempt.
+        let head = get_board_head(&db.pool, community, board_id)
+            .await
+            .expect("read head")
+            .expect("head still exists");
+        assert_eq!(head.title, "Board created before fencing");
+        assert_eq!(head.revision, 1);
+    }
+}
