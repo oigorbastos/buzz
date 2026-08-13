@@ -10992,6 +10992,22 @@ export function maybeInstallE2eTauriMocks() {
         mockMeshState.nodeMode = null;
         mockMeshState.activeModel = null;
         return meshNodeStatus("off", null);
+      // The Lab screen reads this to decide whether to offer board
+      // archive/unarchive (a `relay_members`-gated moderation op). Without a
+      // mock the invoke throws "Unsupported mocked Tauri command".
+      //
+      // Deliberately a plain `member`: that is what every consumer of this
+      // query already saw when the command threw, so mocking it grants no new
+      // capability anywhere (members sidebar, moderation menus, settings).
+      // A preview that needs to exercise archiving should make this role
+      // configurable rather than promoting the default.
+      case "get_my_relay_membership":
+        return {
+          pubkey: getMockMemberPubkey(activeConfig),
+          role: "member",
+          added_by: null,
+          created_at: 0,
+        };
       case "get_identity": {
         const isLost =
           !mockIdentityLostCleared && activeConfig?.mock?.identityLost === true;

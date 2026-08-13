@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  BOARD_MODERATION_DENIED_MESSAGE,
+  boardModerationTags,
   boardReference,
+  describeBoardModerationError,
   eventMatchesBoard,
   isBoardConflictError,
+  isBoardModerationDeniedError,
   MAX_MARKDOWN_BYTES,
   MAX_SUMMARY_CHARS,
   MAX_TITLE_CHARS,
@@ -387,5 +391,103 @@ describe("boardReference", () => {
 
   it("treats revision 0 as a real revision, not as absent", () => {
     assert.match(boardReference(BOARD, 0), /revision=0$/);
+  });
+});
+
+describe("board moderation wire shape", () => {
+  it("sends only `d` and `op`", () => {
+    // Read off `parse_lab_board_envelope`: a moderation op needs no `prev`
+    // (that is a content-mutation requirement) and no `revision` (the head
+    // keeps its number across a status flip). Anything extra is either
+    // ignored or, for access_scope/tags/t/restored_from, outright rejected.
+    assert.deepEqual(boardModerationTags({ boardId: BOARD, archived: true }), [
+      ["d", BOARD],
+      ["op", "archive"],
+    ]);
+    assert.deepEqual(boardModerationTags({ boardId: BOARD, archived: false }), [
+      ["d", BOARD],
+      ["op", "unarchive"],
+    ]);
+  });
+
+  it("never emits a tag the relay rejects outside its own op", () => {
+    const forbidden = new Set([
+      "prev",
+      "revision",
+      "access_scope",
+      "tags",
+      "t",
+      "restored_from",
+      "owner",
+    ]);
+    for (const archived of [true, false]) {
+      for (const [name] of boardModerationTags({ boardId: BOARD, archived })) {
+        assert.equal(forbidden.has(name), false, `must not send \`${name}\``);
+      }
+    }
+  });
+});
+
+describe("board moderation errors", () => {
+  it("recognises the relay's role refusal", () => {
+    assert.equal(
+      isBoardModerationDeniedError(
+        new Error("restricted: moderator access required"),
+      ),
+      true,
+    );
+    assert.equal(
+      isBoardModerationDeniedError(new Error("restricted: not a relay member")),
+      true,
+    );
+    assert.equal(
+      isBoardModerationDeniedError(new Error("invalid: BOARD_HEAD_MISMATCH")),
+      false,
+    );
+    assert.equal(isBoardModerationDeniedError("not an error"), false);
+  });
+
+  it("turns a role refusal into an explanation, not a raw dump", () => {
+    const message = describeBoardModerationError(
+      new Error("restricted: moderator access required"),
+      "archive",
+    );
+    assert.equal(message, BOARD_MODERATION_DENIED_MESSAGE);
+    assert.equal(message.includes("restricted:"), false);
+  });
+
+  it("explains a status that moved under the user", () => {
+    assert.equal(
+      describeBoardModerationError(
+        new Error(
+          "invalid: cannot archive a lab board with status 'frozen' (expected 'active')",
+        ),
+        "archive",
+      ),
+      "This board's status changed since the page loaded. Reopen it and try again.",
+    );
+  });
+
+  it("keeps an unrecognised rejection readable and intent-specific", () => {
+    const message = describeBoardModerationError(
+      new Error("invalid: lab board 0f2b does not exist"),
+      "unarchive",
+    );
+    // Machine prefix stripped, but the detail is not swallowed.
+    assert.equal(
+      message,
+      "Failed to unarchive this board. lab board 0f2b does not exist",
+    );
+  });
+
+  it("falls back cleanly when there is no message at all", () => {
+    assert.equal(
+      describeBoardModerationError(new Error(""), "archive"),
+      "Failed to archive this board.",
+    );
+    assert.equal(
+      describeBoardModerationError(undefined, "unarchive"),
+      "Failed to unarchive this board.",
+    );
   });
 });

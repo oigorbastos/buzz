@@ -8,6 +8,9 @@ type FilterableBoard = {
   access: LabBoardAccess;
   ownerPubkey: string | null;
   tags: string[];
+  /** `lab_board_heads.status`. Optional so callers that only reason about
+   * access (e.g. tag discovery) need not carry it; absent reads as active. */
+  status?: string;
 };
 
 function normalizeTag(raw: string): string {
@@ -79,16 +82,26 @@ export function availableBoardTags(
   );
 }
 
+/**
+ * `includeArchived` is a *visibility* switch, not an authorization one: an
+ * archived board is still fully readable, it is just filed away. It defaults
+ * to hiding them, which is the entire point of archiving — V1 has no hard
+ * delete, so this filter is the only way a retired board leaves the list.
+ */
 export function filterLabBoards<T extends FilterableBoard>(input: {
   boards: readonly T[];
   filter: LabBoardListFilter;
   tag: string | null;
   currentPubkey: string | null | undefined;
   currentOwnerPubkey?: string | null;
+  includeArchived?: boolean;
 }): T[] {
   return input.boards.filter((board) => {
     if (!canReadBoard(board, input.currentPubkey, input.currentOwnerPubkey))
       return false;
+    if (board.status === "archived" && input.includeArchived !== true) {
+      return false;
+    }
     if (input.tag && !board.tags.includes(input.tag)) return false;
     if (input.filter === "community") {
       return board.access === "community";
