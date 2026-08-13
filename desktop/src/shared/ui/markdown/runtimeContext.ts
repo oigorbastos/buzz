@@ -16,6 +16,7 @@ const INERT_MARKDOWN_RUNTIME: MarkdownRuntime = {
   channels: [],
   onOpenChannel: () => {},
   onOpenEntityLink: () => {},
+  onOpenLabLink: () => {},
   onOpenMessageLink: () => {},
   relayOrigin: null,
 };

@@ -14,7 +14,6 @@ import { toast } from "sonner";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { requestOpenSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
 import {
-  parseMessageLink,
   resolveMessageLinkRenderTarget,
   type ParsedMessageLink,
 } from "@/features/messages/lib/messageLink";
@@ -66,6 +65,11 @@ import {
 import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
 import { FileCard } from "./markdown/FileCard";
 import { InlineEmojiPopover } from "./markdown/InlineEmojiPopover";
+import {
+  createMarkdownLabLinkComponent,
+  renderLabLinkAnchor,
+  useOpenLabLink,
+} from "./markdown/labLinks";
 import { MarkdownInput } from "./markdown/MarkdownInput";
 import {
   MediaContextMenu,
@@ -114,7 +118,10 @@ import {
 } from "./markdown/imageLightbox";
 import { MarkdownTable } from "./markdown/MarkdownTable";
 import { ProgressiveImage } from "./markdown/ProgressiveImage";
-import { MessageLinkPill } from "./markdown/MessageLinkPill";
+import {
+  createMarkdownMessageLinkComponent,
+  MessageLinkPill,
+} from "./markdown/MessageLinkPill";
 import { renderCachedMarkdown } from "./markdown/nodeCache";
 import {
   MarkdownRuntimeContext,
@@ -1292,6 +1299,7 @@ function createMarkdownComponents(
       channels,
       imetaByUrl,
       onOpenEntityLink,
+      onOpenLabLink,
       onOpenMessageLink,
       onImportSnapshotFromUrl,
       relayOrigin,
@@ -1402,6 +1410,16 @@ function createMarkdownComponents(
       relayOrigin,
     });
     if (entityAnchor) return entityAnchor;
+
+    // `buzz://lab?board=…` Lab Board links navigate in-app; malformed ones
+    // fall through to the default anchor.
+    const labAnchor = renderLabLinkAnchor({
+      anchorProps: props,
+      children,
+      href,
+      onOpenLabLink,
+    });
+    if (labAnchor) return labAnchor;
 
     const supportedLinkPreview = href
       ? parseSupportedLinkPreview(href, relayOrigin)
@@ -1707,30 +1725,8 @@ function createMarkdownComponents(
         </span>
       );
     },
-    "message-link": function MarkdownMessageLink({
-      children,
-    }: {
-      children?: React.ReactNode;
-    }) {
-      const { channels, onOpenMessageLink } = useMarkdownRuntime();
-      const href = String(children ?? "");
-      const parsed = parseMessageLink(href);
-      if (!parsed.ok) {
-        // Malformed `buzz://message?…` — render the raw URL as plain text
-        // rather than a misleading clickable pill.
-        return <span data-message-link="">{href}</span>;
-      }
-
-      return (
-        <MessageLinkPill
-          channels={channels}
-          href={href}
-          interactive={interactive}
-          link={parsed.value}
-          onOpenMessageLink={onOpenMessageLink}
-        />
-      );
-    },
+    "message-link": createMarkdownMessageLinkComponent(interactive),
+    "lab-link": createMarkdownLabLinkComponent(interactive),
   } as Components;
 }
 
@@ -1739,7 +1735,7 @@ function createMarkdownComponents(
  * four instances ever exist. Module-stable maps mean cached markdown element
  * trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "5";
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "6";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };
@@ -1793,6 +1789,7 @@ function MarkdownInner({
     [goChannel],
   );
   const onOpenEntityLink = useOpenEntityLink();
+  const onOpenLabLink = useOpenLabLink();
   const onOpenMessageLink = React.useCallback(
     (link: ParsedMessageLink) => {
       // Always route through `goChannel` with `messageId` set: the channel
@@ -1827,6 +1824,7 @@ function MarkdownInner({
       mentionPubkeysByName,
       onOpenChannel,
       onOpenEntityLink,
+      onOpenLabLink,
       onOpenMessageLink,
       relayOrigin,
       snapshotSharedBy,
@@ -1846,6 +1844,7 @@ function MarkdownInner({
       mentionPubkeysByName,
       onOpenChannel,
       onOpenEntityLink,
+      onOpenLabLink,
       onOpenMessageLink,
       relayOrigin,
       snapshotSharedBy,

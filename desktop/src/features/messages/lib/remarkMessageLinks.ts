@@ -19,27 +19,13 @@
 // `markdown.tsx` and by `markdown.test.mjs` running under `node --test
 // --experimental-strip-types`. `tsconfig.json` enables `allowImportingTsExtensions`.
 import { createRemarkPrefixPlugin } from "../../../shared/lib/createRemarkPrefixPlugin.ts";
+import { trimTrailingUrlPunctuation } from "../../../shared/lib/urlMatchTrim.ts";
 
 const MESSAGE_URL_PATTERN = /(?:buzz|buzz):\/\/message\?[^\s<>"')\]]+/g;
-const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
-
-function trimMessageLinkMatch(matchText: string) {
-  let value = matchText.replace(TRAILING_PUNCTUATION_PATTERN, "");
-  while (/[)\]]$/.test(value) && isUnmatchedClosing(value)) {
-    value = value.slice(0, -1).replace(TRAILING_PUNCTUATION_PATTERN, "");
-  }
-  return { value, trailing: matchText.slice(value.length) };
-}
-
-function isUnmatchedClosing(value: string): boolean {
-  const closing = value[value.length - 1];
-  const opening = closing === ")" ? "(" : "[";
-  return value.split(closing).length > value.split(opening).length;
-}
 
 export default function remarkMessageLinks() {
   return createRemarkPrefixPlugin(MESSAGE_URL_PATTERN, (matchText) => {
-    const { value, trailing } = trimMessageLinkMatch(matchText);
+    const { value, trailing } = trimTrailingUrlPunctuation(matchText);
 
     return {
       node: {

@@ -26,7 +26,12 @@ export function useAppNavigation() {
       next: {
         to: string;
         params?: Record<string, string>;
-        search?: Record<string, string | undefined>;
+        // Numbers are allowed alongside strings so a purely-numeric value
+        // (e.g. `goLabBoard`'s `revision`) round-trips through the router's
+        // default JSON-ish search codec as `?revision=5` instead of the
+        // double-encoded `?revision=%225%22` a numeric-looking *string*
+        // produces (JSON.parse("5") succeeds, so the codec re-quotes it).
+        search?: Record<string, string | number | undefined>;
       },
       behavior: NavigationBehavior = {},
     ) => {
@@ -96,6 +101,30 @@ export function useAppNavigation() {
       commitNavigation(
         {
           to: "/lab",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goLabBoard = React.useCallback(
+    (
+      boardId: string,
+      behavior?: NavigationBehavior & {
+        /** Open this specific historical revision, read-only, instead of
+         * the live head — see the route's `revision` search param. */
+        revision?: number;
+      },
+    ) =>
+      commitNavigation(
+        {
+          to: "/lab/boards/$boardId",
+          params: { boardId },
+          search: {
+            ...(behavior?.revision !== undefined
+              ? { revision: behavior.revision }
+              : {}),
+          },
         },
         behavior,
       ),
@@ -330,6 +359,7 @@ export function useAppNavigation() {
     goForumPost,
     goHome,
     goLab,
+    goLabBoard,
     goNewMessage,
     goProject,
     goProjects,

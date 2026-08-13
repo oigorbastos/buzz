@@ -1,6 +1,7 @@
 import * as React from "react";
 import { defaultUrlTransform } from "react-markdown";
 
+import { parseLabLink } from "@/features/lab/lib/labLink";
 import { isMessageLink } from "@/features/messages/lib/messageLink";
 import { parseEntityLink } from "@/shared/lib/entityLink";
 
@@ -168,22 +169,24 @@ export function isInsideHiddenSpoiler(element: Element): boolean {
 
 /**
  * `urlTransform` for `<ReactMarkdown>` that preserves `buzz://` deep links
- * used by Buzz — both `buzz://message?…` links and `buzz://pr|issue|repo?…`
- * entity links. The default transform strips unknown schemes (returns `""`)
- * before the `a` component override can see them, which would break copy →
- * paste → click end-to-end.
+ * used by Buzz — `buzz://message?…` links, `buzz://pr|issue|repo?…` entity
+ * links, and `buzz://lab?board=…` Lab Board links. The default transform
+ * strips unknown schemes (returns `""`) before the `a` component override can
+ * see them, which would break copy → paste → click end-to-end.
  *
  * Policy:
  * - `buzz://message` hrefs — preserved unconditionally (handled by the
  *   message-link pill renderer).
  * - `buzz://pr|issue|repo` hrefs — preserved only when `parseEntityLink`
  *   succeeds, keeping the sanitizer active against arbitrary `buzz://` URIs.
+ * - `buzz://lab` hrefs — preserved only when `parseLabLink` succeeds.
  * - Everything else delegates to `defaultUrlTransform`.
  */
 export function buzzDeepLinkUrlTransform(value: string, key: string): string {
   if (key !== "href") return defaultUrlTransform(value);
   if (isMessageLink(value)) return value;
   if (parseEntityLink(value).ok) return value;
+  if (parseLabLink(value).ok) return value;
   return defaultUrlTransform(value);
 }
 

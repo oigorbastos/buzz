@@ -1,3 +1,4 @@
+import type { ParsedLabLink } from "@/features/lab/lib/labLink";
 import type { ParsedMessageLink } from "@/features/messages/lib/messageLink";
 import type { ParsedEntityLink } from "@/shared/lib/entityLink";
 import type { Channel } from "@/shared/api/types";
@@ -26,6 +27,13 @@ export type MessageLinkPillProps = {
   onOpenMessageLink: (link: ParsedMessageLink) => void;
 };
 
+export type LabLinkPillProps = {
+  href: string;
+  interactive: boolean;
+  link: ParsedLabLink;
+  onOpenLabLink: (link: ParsedLabLink) => void;
+};
+
 export type MarkdownRuntime = {
   agentMentionPubkeysByName?: Record<string, string>;
   channels: Channel[];
@@ -34,6 +42,8 @@ export type MarkdownRuntime = {
   onOpenChannel: (channelId: string) => void;
   /** Navigate to a Buzz git entity (`buzz://pr|issue|repo` deep link). */
   onOpenEntityLink: (link: ParsedEntityLink) => void;
+  /** Navigate to a Lab Board (`buzz://lab?board=…` deep link). */
+  onOpenLabLink: (link: ParsedLabLink) => void;
   onOpenMessageLink: (link: ParsedMessageLink) => void;
   /**
    * The resolved relay origin (e.g. `https://buzz.block.builderlab.xyz`),

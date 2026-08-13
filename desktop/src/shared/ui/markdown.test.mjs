@@ -535,6 +535,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 
 import { isMessageLink } from "../../features/messages/lib/messageLink.ts";
+import { parseLabLink } from "../../features/lab/lib/labLink.ts";
 import { parseEntityLink } from "../lib/entityLink.ts";
 import remarkSpoilers from "../lib/remarkSpoilers.ts";
 
@@ -542,11 +543,15 @@ const OWNER_HEX =
   "71d67180ba17e749ee825fc8819c9c6ee7003617e1c126504f9b658070ab9224";
 const EVENT_HEX =
   "c3b589fa5713ba25bad6dc095e2de00a4ac8f50050fdea00fc6444e603be1dd1";
+const BOARD_UUID = "0f2b8a1c-1111-4222-8333-444455556666";
 
+// Mirrors `buzzDeepLinkUrlTransform` in ./markdown/utils.ts — keep in sync
+// if either changes.
 function buzzDeepLinkUrlTransform(value, key) {
   if (key !== "href") return defaultUrlTransform(value);
   if (isMessageLink(value)) return value;
   if (parseEntityLink(value).ok) return value;
+  if (parseLabLink(value).ok) return value;
   return defaultUrlTransform(value);
 }
 
@@ -646,6 +651,29 @@ test("buzzDeepLinkUrlTransform: strips malformed buzz://pr (unknown param)", () 
   assert.match(html, /href=""/);
 });
 
+test("buzzDeepLinkUrlTransform: preserves buzz://lab href with no revision", () => {
+  const html = renderMarkdown(`[Board](buzz://lab?board=${BOARD_UUID})`);
+  assert.match(html, /href="buzz:\/\/lab\?board=/);
+  assert.doesNotMatch(html, /href=""/);
+});
+
+test("buzzDeepLinkUrlTransform: preserves buzz://lab href with a revision", () => {
+  const html = renderMarkdown(
+    `[Board](buzz://lab?board=${BOARD_UUID}&revision=7)`,
+  );
+  assert.match(html, /href="buzz:\/\/lab\?[^"]*revision=7"/);
+});
+
+test("buzzDeepLinkUrlTransform: preserves buzz://lab autolink href", () => {
+  const html = renderMarkdown(`<buzz://lab?board=${BOARD_UUID}>`);
+  assert.match(html, /href="buzz:\/\/lab\?board=/);
+});
+
+test("buzzDeepLinkUrlTransform: strips malformed buzz://lab (bad board id)", () => {
+  const html = renderMarkdown("[Board](buzz://lab?board=not-a-uuid)");
+  assert.match(html, /href=""/);
+});
+
 // ── renderEntityLinkAnchor: clone-URL anchor origin gating ───────────────────
 //
 // `renderEntityLinkAnchor` now accepts `relayOrigin` and passes it to
@@ -728,6 +756,58 @@ test("renderEntityLinkAnchor_directEntityLink_returnsAnchorRegardlessOfOrigin", 
     null,
     "direct buzz://pr link must produce an entity anchor regardless of origin",
   );
+});
+
+// ── renderLabLinkAnchor ──────────────────────────────────────────────────
+
+import { renderLabLinkAnchor } from "../ui/markdown/labLinks.tsx";
+
+test("renderLabLinkAnchor_validLabLink_returnsAnchor", () => {
+  const el = renderLabLinkAnchor({
+    anchorProps: {},
+    children: React.createElement("span", null, "Board"),
+    href: `buzz://lab?board=${BOARD_UUID}`,
+    onOpenLabLink: () => {},
+  });
+  assert.notEqual(el, null, "a valid buzz://lab link must produce an anchor");
+  const html = renderToStaticMarkup(el);
+  assert.match(html, /cursor-pointer/);
+});
+
+test("renderLabLinkAnchor_callsOnOpenLabLinkWithParsedValue", () => {
+  let opened = null;
+  const el = renderLabLinkAnchor({
+    anchorProps: {},
+    children: React.createElement("span", null, "Board"),
+    href: `buzz://lab?board=${BOARD_UUID}&revision=3`,
+    onOpenLabLink: (link) => {
+      opened = link;
+    },
+  });
+  // Simulate the click handler directly — no DOM event dispatch needed to
+  // verify the parsed value that reaches the callback.
+  el.props.onClick({ preventDefault: () => {} });
+  assert.deepEqual(opened, { boardId: BOARD_UUID, revision: 3 });
+});
+
+test("renderLabLinkAnchor_malformedLabLink_returnsNull", () => {
+  const el = renderLabLinkAnchor({
+    anchorProps: {},
+    children: React.createElement("span", null, "Board"),
+    href: "buzz://lab?board=not-a-uuid",
+    onOpenLabLink: () => {},
+  });
+  assert.equal(el, null, "a malformed buzz://lab link must fall through");
+});
+
+test("renderLabLinkAnchor_nonLabHref_returnsNull", () => {
+  const el = renderLabLinkAnchor({
+    anchorProps: {},
+    children: React.createElement("span", null, "Elsewhere"),
+    href: "https://example.com",
+    onOpenLabLink: () => {},
+  });
+  assert.equal(el, null);
 });
 
 test("remarkSpoilers: block delimiter spoilers expose a block prop to React", () => {

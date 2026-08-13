@@ -3,6 +3,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
+import remarkLabLinks from "@/features/lab/lib/remarkLabLinks";
 import remarkMessageLinks from "@/features/messages/lib/remarkMessageLinks";
 import rehypeImageGallery from "@/shared/lib/rehypeImageGallery";
 import rehypeSearchHighlight from "@/shared/lib/rehypeSearchHighlight";
@@ -99,6 +100,7 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
       remarkBreaks,
       remarkSpoilers,
       remarkMessageLinks,
+      remarkLabLinks,
       [remarkMentions, { mentionNames: input.mentionNames }],
       [remarkChannelLinks, { channelNames: input.channelNames }],
       [remarkCustomEmoji, { customEmoji: input.customEmoji }],
