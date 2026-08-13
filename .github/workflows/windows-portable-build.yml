@@ -1,0 +1,426 @@
+name: Windows Portable Build (buzz-alis-1.3)
+
+# Builds an unsigned, portable Windows distribution of the six Buzz
+# executables from codex/buzz-alis-1.3-integration (Lab boards desktop UI +
+# community-deletion backend port). This is a genuinely new workflow file
+# (never existed on any branch tip before this commit), which is what makes
+# GitHub auto-register it on push without a manual "I understand my
+# workflows" click in this fork's Actions settings.
+#
+# Structural reference: the retired one-shot recovery workflow
+# windows-lab-preview.yml (GitHub workflow id 329525697, file no longer
+# present on any branch). That workflow hard-pinned FEATURE_SHA/
+# LAB_BASE_SHA/PROVEN_LINUX_RUN_ID to one specific historical recovery
+# scenario and reused an already-proven Linux run instead of compiling.
+# This workflow drops all of that: it runs both the Linux gate and the
+# Windows build for real, against whatever commit is checked out, because
+# this is fresh code (including a large new Rust feature — the deletion
+# backend port) rather than a replay of prior, already-proven work.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/buzz-alis-1.3-integration
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buzz-alis-1.3-windows-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  linux-preflight:
+    name: Linux full-stack preflight
+    if: github.repository == 'oigorbastos/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace, all targets)
+        # Deliberately no `-D warnings`: this large fork carries pre-existing
+        # clippy debt across crates this feature branch never touches, and
+        # gating on it would drag unrelated code into scope. This still
+        # fails on real clippy/compile errors, which is the actual gate we
+        # want for a feature-branch preflight.
+        run: cargo clippy --workspace --all-targets
+
+      - name: Run workspace test suite
+        run: |
+          set -euo pipefail
+          # Default (non-ignored) test run across the whole workspace. This
+          # is a deliberate scope decision, not a silent skip:
+          #
+          # - It DOES compile and run buzz-db, buzz-deletion, and buzz-relay
+          #   in full — the three crates this feature (community-deletion
+          #   backend port) touches most.
+          # - Every Postgres/Redis/MinIO-touching test in those three crates
+          #   is individually marked `#[ignore = "requires Postgres"]` /
+          #   "...and MinIO" / "...requires Redis" (verified by direct
+          #   inspection: no non-ignored test anywhere in the three crates
+          #   dials out to a real database or object store — the couple of
+          #   lines that look like they do either use connect_lazy() which
+          #   never touches the network, or are test-helper functions only
+          #   ever called from #[ignore]d tests). So this run never silently
+          #   skips DB-backed coverage; it just doesn't include the
+          #   infra-gated subset, which is the same docker-compose-backed
+          #   suite ci.yml runs separately (postgres+redis+minio via
+          #   `docker compose up`) and is out of scope for a CI-authoring
+          #   task whose deliverable is the Windows build, not re-proving
+          #   already-reviewed backend logic against live infra.
+          # - Note for future maintainers: crates/buzz-relay/src/tenant.rs
+          #   has two pre-existing, unrelated #[ignore]d RED tests
+          #   (mod tests::redteam_attack2) documenting a known, not-yet-fixed
+          #   tenant host-binding fence bug. They are unrelated to this
+          #   feature branch and intentionally excluded here too — do not
+          #   sweep them in with a blanket `-- --ignored` on buzz-relay.
+          cargo test --workspace
+
+  windows-portable:
+    name: Windows unsigned portable ZIP
+    needs: linux-preflight
+    if: github.repository == 'oigorbastos/buzz'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # No Hermit, no `just` here on purpose: those are Linux/macOS-only
+      # hermetic tooling with no business on windows-latest, and a prior
+      # iteration of this build broke when Hermit leaked into the Windows
+      # job. Everything below is plain cargo/pnpm/PowerShell/bash.
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ env.TARGET }}
+          # rustfmt is required explicitly: a prior iteration of this exact
+          # build failed without it — the Windows toolchain doesn't ship it
+          # by default even when the channel version matches.
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.14.1
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.4.0
+
+      - name: Verify pinned toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          node --version
+          pnpm --version
+          [[ "$(rustc --version)" == rustc\ 1.95.0* ]] || exit 1
+          [[ "$(node --version)" == "v24.14.1" ]] || exit 1
+          [[ "$(pnpm --version)" == "11.4.0" ]] || exit 1
+
+      - name: Install frozen JavaScript dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Rust formatting
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Run targeted Rust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p buzz-acp
+          cargo test -p buzz-cli lab --lib
+
+      - name: Run desktop checks and unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -C desktop check
+          pnpm -C desktop typecheck
+          pnpm -C desktop test
+
+      - name: Build desktop E2E and production frontends
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm -C desktop build:e2e
+          pnpm -C desktop build
+
+      - name: Build and bundle Windows sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET" \
+            -p buzz-acp \
+            -p buzz-agent \
+            -p buzz-dev-mcp \
+            -p git-credential-nostr \
+            -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+          for sidecar in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+            test -f "target/$TARGET/release/$sidecar.exe"
+            test -f "desktop/src-tauri/binaries/$sidecar-$TARGET.exe"
+          done
+
+      - name: Run managed-agent Nest test
+        shell: bash
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+
+      - name: Generate temporary non-updating Tauri config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > desktop/src-tauri/tauri.canary.conf.json <<'JSON'
+          {
+            "bundle": { "createUpdaterArtifacts": false },
+            "plugins": { "updater": { "endpoints": [] } }
+          }
+          JSON
+
+      - name: Build Windows desktop executable without bundle or signing
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          set -euo pipefail
+          rm -rf "desktop/src-tauri/target/$TARGET/release/bundle"
+          pnpm -C desktop tauri build \
+            --target x86_64-pc-windows-msvc \
+            --no-bundle \
+            --no-sign \
+            --ci \
+            --config src-tauri/tauri.canary.conf.json
+
+      - name: Package, reextract, and audit one portable ZIP
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_ROOT="desktop/src-tauri/target/$TARGET/release"
+          APP_EXE="$TARGET_ROOT/buzz-desktop.exe"
+          [[ -f "$APP_EXE" ]] || {
+            echo "::error::Desktop executable not found at $APP_EXE" >&2
+            exit 1
+          }
+          for sidecar in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+            [[ -f "target/$TARGET/release/$sidecar.exe" ]] || {
+              echo "::error::Missing sidecar: $sidecar.exe" >&2
+              exit 1
+            }
+          done
+          [[ ! -d "$TARGET_ROOT/bundle" ]] || {
+            echo "::error::Tauri bundle directory exists after --no-bundle" >&2
+            exit 1
+          }
+          if find "$TARGET_ROOT" -type f \( -iname '*.msi' -o -iname '*.nsis' -o -iname '*.appinstaller' -o -iname '*.sig' \) -print -quit | grep -q .; then
+            echo "::error::Installer, updater, or signature output found" >&2
+            exit 1
+          fi
+
+          PORTABLE_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-root"
+          EXTRACT_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-reextract"
+          RELEASE_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-release"
+          rm -rf "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
+          mkdir -p "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
+          cp "$APP_EXE" "$PORTABLE_ROOT/buzz-desktop.exe"
+          cp "target/$TARGET/release/buzz-acp.exe" "$PORTABLE_ROOT/buzz-acp.exe"
+          cp "target/$TARGET/release/buzz-agent.exe" "$PORTABLE_ROOT/buzz-agent.exe"
+          cp "target/$TARGET/release/buzz-dev-mcp.exe" "$PORTABLE_ROOT/buzz-dev-mcp.exe"
+          cp "target/$TARGET/release/git-credential-nostr.exe" "$PORTABLE_ROOT/git-credential-nostr.exe"
+          cp "target/$TARGET/release/buzz.exe" "$PORTABLE_ROOT/buzz.exe"
+
+          VERSION=$(node -p "require('./desktop/package.json').version")
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          RUST_VERSION=$(rustc --version)
+          NODE_VERSION=$(node --version)
+          PNPM_VERSION=$(pnpm --version)
+          cat > "$PORTABLE_ROOT/BUILD-MANIFEST.txt" <<EOF
+          SOURCE_SHA=$GITHUB_SHA
+          BUILD_WORKFLOW_FILE=.github/workflows/windows-portable-build.yml
+          GITHUB_REPOSITORY=$GITHUB_REPOSITORY
+          GITHUB_REF=$GITHUB_REF
+          GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME
+          GITHUB_RUN_ID=$GITHUB_RUN_ID
+          GITHUB_RUN_URL=$RUN_URL
+          VERSION=$VERSION
+          TARGET=$TARGET
+          RUNNER=windows-latest
+          RUNNER_OS=$RUNNER_OS
+          RUNNER_ARCH=$RUNNER_ARCH
+          RUST=$RUST_VERSION
+          NODE=$NODE_VERSION
+          PNPM=$PNPM_VERSION
+          LINUX_PREFLIGHT_GATE_01=cargo fmt --all -- --check
+          LINUX_PREFLIGHT_GATE_02=cargo clippy --workspace --all-targets
+          LINUX_PREFLIGHT_GATE_03=cargo test --workspace
+          WINDOWS_GATE_01=cargo fmt --all -- --check
+          WINDOWS_GATE_02=cargo test -p buzz-acp
+          WINDOWS_GATE_03=cargo test -p buzz-cli lab --lib
+          WINDOWS_GATE_04=pnpm -C desktop check
+          WINDOWS_GATE_05=pnpm -C desktop typecheck
+          WINDOWS_GATE_06=pnpm -C desktop test
+          WINDOWS_GATE_07=pnpm -C desktop build:e2e
+          WINDOWS_GATE_08=pnpm -C desktop build
+          SIDECAR_BUILD=cargo build --release --target x86_64-pc-windows-msvc -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh x86_64-pc-windows-msvc
+          NEST_TEST=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+          TAURI_COMMAND=pnpm -C desktop tauri build --target x86_64-pc-windows-msvc --no-bundle --no-sign --ci --config src-tauri/tauri.canary.conf.json
+          TAURI_BUNDLE=none
+          TAURI_SIGNING=disabled
+          CREATE_UPDATER_ARTIFACTS=false
+          UPDATER_ENDPOINTS=[]
+          INSTALLERS=none
+          NSIS=disabled
+          MSI=disabled
+          AUTHENTICODE=NotSigned
+          REAL_CREDENTIALS_INCLUDED=false
+          PRODUCTION_CONTACTED=false
+          STAGING_CONTACTED=false
+          INCLUDED_FILES=buzz-desktop.exe,buzz-acp.exe,buzz-agent.exe,buzz-dev-mcp.exe,git-credential-nostr.exe,buzz.exe,BUILD-MANIFEST.txt,SHA256SUMS.txt
+          INTERNAL_SHA256_SCOPE=six executables plus BUILD-MANIFEST.txt; SHA256SUMS.txt excluded
+          EXECUTED_SMOKES=buzz --help; buzz lab --help; buzz lab get --help; buzz lab update --help; buzz-acp --help
+          ARTIFACT_RETENTION_DAYS=7
+          EOF
+
+          (
+            cd "$PORTABLE_ROOT"
+            sha256sum \
+              buzz-desktop.exe \
+              buzz-acp.exe \
+              buzz-agent.exe \
+              buzz-dev-mcp.exe \
+              git-credential-nostr.exe \
+              buzz.exe \
+              BUILD-MANIFEST.txt > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+
+          ZIP_NAME="buzz-alis-1.3-windows-portable-x64.zip"
+          ZIP_PATH="$RELEASE_ROOT/$ZIP_NAME"
+          (
+            cd "$PORTABLE_ROOT"
+            7z a -tzip -mx=9 "$ZIP_PATH" ./* >/dev/null
+          )
+          7z t "$ZIP_PATH" >/dev/null
+          ZIP_SHA=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          ZIP_SIZE=$(stat -c '%s' "$ZIP_PATH")
+          cat > "$RELEASE_ROOT/ZIP-SHA256.txt" <<EOF
+          SHA256=$ZIP_SHA
+          SIZE_BYTES=$ZIP_SIZE
+          ZIP=$ZIP_NAME
+          SOURCE_SHA=$GITHUB_SHA
+          GITHUB_RUN_ID=$GITHUB_RUN_ID
+          GITHUB_RUN_URL=$RUN_URL
+          EOF
+
+          7z x -y "$ZIP_PATH" -o"$EXTRACT_ROOT" >/dev/null
+          EXPECTED_LIST="$RUNNER_TEMP/expected-portable-files.txt"
+          printf '%s\n' \
+            BUILD-MANIFEST.txt \
+            SHA256SUMS.txt \
+            buzz-acp.exe \
+            buzz-agent.exe \
+            buzz-desktop.exe \
+            buzz-dev-mcp.exe \
+            buzz.exe \
+            git-credential-nostr.exe | sort > "$EXPECTED_LIST"
+          diff -u "$EXPECTED_LIST" <(find "$EXTRACT_ROOT" -mindepth 1 -printf '%P\n' | sort)
+          (
+            cd "$EXTRACT_ROOT"
+            sha256sum -c SHA256SUMS.txt
+          )
+          if find "$EXTRACT_ROOT" -type f \( -iname '*.msi' -o -iname '*.nsis' -o -iname '*.appinstaller' -o -iname '*.sig' \) -print -quit | grep -q .; then
+            echo "::error::Forbidden installer, updater, or signature found in ZIP" >&2
+            exit 1
+          fi
+
+          export EXTRACT_ROOT
+          powershell -NoProfile -NonInteractive -Command '
+            $ErrorActionPreference = "Stop"
+            $root = $env:EXTRACT_ROOT
+            $files = @(
+              "buzz-desktop.exe",
+              "buzz-acp.exe",
+              "buzz-agent.exe",
+              "buzz-dev-mcp.exe",
+              "git-credential-nostr.exe",
+              "buzz.exe"
+            )
+            foreach ($name in $files) {
+              $path = Join-Path $root $name
+              $stream = [System.IO.File]::OpenRead($path)
+              try {
+                if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+                  throw "$name is not a PE executable"
+                }
+              } finally {
+                $stream.Dispose()
+              }
+              $signature = Get-AuthenticodeSignature -LiteralPath $path
+              if ($signature.Status -ne "NotSigned") {
+                throw "$name has Authenticode status $($signature.Status)"
+              }
+            }
+          '
+
+          "$EXTRACT_ROOT/buzz.exe" --help
+          "$EXTRACT_ROOT/buzz.exe" lab --help
+          "$EXTRACT_ROOT/buzz.exe" lab get --help
+          update_help=$("$EXTRACT_ROOT/buzz.exe" lab update --help)
+          printf '%s\n' "$update_help"
+          grep -F -- '--base <BASE>' <<<"$update_help"
+          "$EXTRACT_ROOT/buzz-acp.exe" --help
+
+          echo "portable_zip=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "zip_sha=$ZIP_SHA" >> "$GITHUB_OUTPUT"
+          echo "zip_size=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
+          echo "release_root=$RELEASE_ROOT" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          stat -c '%n %s bytes' "$ZIP_PATH"
+          sha256sum "$ZIP_PATH"
+          cat "$PORTABLE_ROOT/BUILD-MANIFEST.txt"
+          cat "$PORTABLE_ROOT/SHA256SUMS.txt"
+          cat "$RELEASE_ROOT/ZIP-SHA256.txt"
+
+      - name: Upload the only build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-alis-1.3-windows-portable-x64
+          path: |
+            ${{ steps.package.outputs.portable_zip }}
+            ${{ steps.package.outputs.release_root }}/ZIP-SHA256.txt
+          if-no-files-found: error
+          retention-days: 7
