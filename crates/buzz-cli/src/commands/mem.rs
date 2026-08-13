@@ -28,11 +28,25 @@ use nostr::PublicKey;
 use crate::client::BuzzClient;
 use crate::error::CliError;
 
+/// Parse a 64-hex pubkey and confirm it is a valid BIP-340 x-only curve point.
+///
+/// Since the nostr 0.36 → 0.44 migration `PublicKey` is a lazy 32-byte
+/// newtype: `from_hex` only hex-decodes and no longer runs `lift_x` (it does
+/// not even range-check the field element — `ffff…ffff` parses). The curve
+/// check moved to `PublicKey::xonly()`. Without it a bad `--owner`/`--agent`
+/// passes argument validation and only fails much later, inside the NIP-44
+/// conversation-key derivation.
+fn parse_pubkey(raw: &str) -> Result<PublicKey, String> {
+    let pk = PublicKey::from_hex(raw).map_err(|e| e.to_string())?;
+    pk.xonly().map_err(|e| e.to_string())?;
+    Ok(pk)
+}
+
 /// Resolve the agent's owner pubkey: explicit `--owner` flag wins, otherwise
 /// fall back to the NIP-OA `auth_tag` (which carries owner pubkey in slot 1).
 fn resolve_owner(client: &BuzzClient, owner_flag: Option<&str>) -> Result<PublicKey, CliError> {
     if let Some(s) = owner_flag {
-        return PublicKey::from_hex(s)
+        return parse_pubkey(s)
             .map_err(|e| CliError::Usage(format!("--owner must be a 64-hex pubkey: {e}")));
     }
     let tag = client.auth_tag_owner_hex().ok_or_else(|| {
@@ -41,8 +55,8 @@ fn resolve_owner(client: &BuzzClient, owner_flag: Option<&str>) -> Result<Public
                 .into(),
         )
     })?;
-    PublicKey::from_hex(&tag)
-        .map_err(|e| CliError::Other(format!("auth_tag owner pubkey is not valid hex: {e}")))
+    parse_pubkey(&tag)
+        .map_err(|e| CliError::Other(format!("auth_tag owner pubkey is not a valid pubkey: {e}")))
 }
 
 /// Resolve the read perspective for `mem ls/get/hash`.
@@ -62,7 +76,7 @@ fn resolve_reader(
                 "--owner and --agent are mutually exclusive for read commands".into(),
             ));
         }
-        let agent = PublicKey::from_hex(agent)
+        let agent = parse_pubkey(agent)
             .map_err(|e| CliError::Usage(format!("--agent must be a 64-hex pubkey: {e}")))?;
         if agent == client.keys().public_key() {
             return Err(CliError::Usage(
@@ -144,7 +158,11 @@ async fn fetch_head(
     } else {
         agent
     };
-    let k_c = conversation_key(client.keys().secret_key(), their_pubkey);
+    // `resolve_reader`/`resolve_owner` curve-check every pubkey they hand out,
+    // so this should be unreachable; surface it as a usage error rather than
+    // panicking if some future caller skips that validation.
+    let k_c = conversation_key(client.keys().secret_key(), their_pubkey)
+        .map_err(|e| CliError::Usage(e.to_string()))?;
     let d = d_tag(&k_c, slug);
 
     let filter = serde_json::json!({
@@ -787,6 +805,71 @@ mod tests {
 
     fn test_client(keys: nostr::Keys) -> BuzzClient {
         BuzzClient::new("http://127.0.0.1:9".into(), keys, None, None).unwrap()
+    }
+
+    /// x = 0 has no curve point (0³ + 7 = 7 is not a quadratic residue mod p).
+    const OFF_CURVE_PUBKEY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    /// Off-curve *and* above the field prime — `from_hex` still accepts it.
+    const ABOVE_FIELD_PRIME: &str =
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    /// Regression: on nostr 0.44 `PublicKey::from_hex` no longer runs the
+    /// BIP-340 curve check, so `--owner 0000…0000` used to pass argument
+    /// validation and panic later inside `conversation_key`. It must produce
+    /// the `CliError::Usage` message this call site was written to emit.
+    #[test]
+    fn resolve_owner_rejects_off_curve_flag() {
+        let client = test_client(nostr::Keys::generate());
+        for bad in [OFF_CURVE_PUBKEY, ABOVE_FIELD_PRIME] {
+            // The premise: bare `from_hex` accepts these.
+            assert!(PublicKey::from_hex(bad).is_ok(), "{bad} should hex-decode");
+
+            let err = match resolve_owner(&client, Some(bad)) {
+                Ok(pk) => panic!("{bad} must be rejected, got Ok({pk})"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, CliError::Usage(_)),
+                "expected Usage for {bad}, got: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("--owner must be a 64-hex pubkey"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_reader_rejects_off_curve_agent_flag() {
+        let client = test_client(nostr::Keys::generate());
+        let err = resolve_reader(&client, None, Some(OFF_CURVE_PUBKEY))
+            .expect_err("off-curve --agent must be rejected");
+        assert!(
+            matches!(err, CliError::Usage(_)),
+            "expected Usage, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("--agent must be a 64-hex pubkey"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_owner_rejects_off_curve_auth_tag_owner() {
+        let tag = nostr::Tag::parse(["auth", OFF_CURVE_PUBKEY, "", ""]).expect("tag parses");
+        let client = BuzzClient::new(
+            "http://127.0.0.1:9".into(),
+            nostr::Keys::generate(),
+            Some(tag),
+            None,
+        )
+        .unwrap();
+        let err = resolve_owner(&client, None).expect_err("off-curve auth_tag owner is unusable");
+        assert!(
+            matches!(err, CliError::Other(_)),
+            "expected Other, got: {err:?}"
+        );
     }
 
     #[test]

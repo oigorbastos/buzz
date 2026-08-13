@@ -139,7 +139,116 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
     }
 
     // Fall back to --agent-owner config.
-    config.agent_owner.clone()
+    //
+    // Unlike the BUZZ_AUTH_TAG branch above — which runs the value through
+    // `verify_auth_tag` (`.xonly()` + `verify_schnorr`) — `config.agent_owner`
+    // is an operator-supplied string that config parsing only trims and
+    // lowercases. Validate it here, at the single point where the flag enters
+    // the process, so a malformed value degrades to "no owner" instead of
+    // reaching the NIP-44 ECDH later. See `parse_owner_pubkey`.
+    let configured = config.agent_owner.clone()?;
+    if parse_owner_pubkey(&configured).is_none() {
+        tracing::warn!(
+            "--agent-owner / BUZZ_ACP_AGENT_OWNER is not a valid 64-hex BIP-340 pubkey \
+             ({configured}) — ignoring it and starting with no owner. NIP-AE core memory \
+             stays disabled and owner-gated respond-to modes will drop every event."
+        );
+        return None;
+    }
+    Some(configured)
+}
+
+/// Parse an owner pubkey from hex, rejecting anything that is not a valid
+/// BIP-340 x-only curve point.
+///
+/// Since the nostr 0.36 → 0.44 migration, `PublicKey` is a lazy 32-byte
+/// newtype: `from_hex` only hex-decodes and no longer runs `lift_x` (0.36's
+/// `PublicKey` wrapped `XOnlyPublicKey`, so parsing implied a curve check).
+/// It does not even range-check the field element — `ffff…ffff` parses. The
+/// curve check now lives in `PublicKey::xonly()`, so an unvalidated pubkey
+/// surfaces only much later, when NIP-44 tries to derive a conversation key
+/// from it. Every owner pubkey entering this process goes through here.
+fn parse_owner_pubkey(hex: &str) -> Option<PublicKey> {
+    let pk = PublicKey::from_hex(hex).ok()?;
+    pk.xonly().ok()?;
+    Some(pk)
+}
+
+#[cfg(test)]
+mod owner_pubkey_validation_tests {
+    use super::*;
+    use crate::config::CliArgs;
+    use clap::Parser;
+
+    /// secp256k1 scalar = 1; a valid private key for `Config::from_args`.
+    const TEST_PRIVATE_KEY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000001";
+    /// x = 0 has no curve point (0³ + 7 = 7 is not a quadratic residue mod p).
+    const OFF_CURVE_PUBKEY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    /// Off-curve *and* larger than the field prime — `from_hex` still accepts it.
+    const ABOVE_FIELD_PRIME: &str =
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    fn config_with_owner(owner: &str) -> Config {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-owner",
+            owner,
+        ])
+        .expect("clap should parse args");
+        Config::from_args(args).expect("config should build")
+    }
+
+    #[test]
+    fn parse_owner_pubkey_accepts_real_key() {
+        let hex = nostr::Keys::generate().public_key().to_hex();
+        assert!(parse_owner_pubkey(&hex).is_some());
+    }
+
+    #[test]
+    fn parse_owner_pubkey_rejects_off_curve_and_malformed() {
+        // The premise: `from_hex` alone accepts both of these on nostr 0.44.
+        assert!(PublicKey::from_hex(OFF_CURVE_PUBKEY).is_ok());
+        assert!(PublicKey::from_hex(ABOVE_FIELD_PRIME).is_ok());
+        // …and `parse_owner_pubkey` is what actually rejects them.
+        assert!(parse_owner_pubkey(OFF_CURVE_PUBKEY).is_none());
+        assert!(parse_owner_pubkey(ABOVE_FIELD_PRIME).is_none());
+        assert!(parse_owner_pubkey("not-hex").is_none());
+        assert!(parse_owner_pubkey("").is_none());
+    }
+
+    /// Regression: before the fix, a malformed `--agent-owner` survived
+    /// `resolve_agent_owner`, parsed into a `PublicKey` at startup, and then
+    /// panicked inside `conversation_key` on the first message in the first
+    /// memory-enabled channel. It must instead resolve to "no owner", which
+    /// routes into the existing "no agent owner configured" degradation:
+    /// memory is skipped and owner-gated modes warn.
+    #[test]
+    fn resolve_agent_owner_drops_off_curve_flag_value() {
+        assert_eq!(
+            resolve_agent_owner(&config_with_owner(OFF_CURVE_PUBKEY)),
+            None
+        );
+        assert_eq!(
+            resolve_agent_owner(&config_with_owner(ABOVE_FIELD_PRIME)),
+            None
+        );
+        assert_eq!(resolve_agent_owner(&config_with_owner("deadbeef")), None);
+    }
+
+    #[test]
+    fn resolve_agent_owner_keeps_valid_flag_value() {
+        let hex = nostr::Keys::generate().public_key().to_hex();
+        assert_eq!(
+            resolve_agent_owner(&config_with_owner(&hex)),
+            Some(hex.clone())
+        );
+        // And the value survives the second parse at pool-context build time.
+        assert!(parse_owner_pubkey(&hex).is_some());
+    }
 }
 
 /// Cache for the agent's owner pubkey.
@@ -1837,9 +1946,10 @@ async fn tokio_main() -> Result<()> {
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
-        agent_owner_pubkey: startup_owner
-            .as_deref()
-            .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
+        // `resolve_agent_owner` already rejects non-curve values, but the
+        // `String` carries no proof of that — re-validate rather than let a
+        // future producer of `startup_owner` reintroduce the hazard.
+        agent_owner_pubkey: startup_owner.as_deref().and_then(parse_owner_pubkey),
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),

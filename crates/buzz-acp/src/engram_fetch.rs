@@ -67,7 +67,12 @@ async fn fetch_core_body(
     agent_keys: &Keys,
     owner: &PublicKey,
 ) -> Result<Option<String>, String> {
-    let k_c = conversation_key(agent_keys.secret_key(), owner);
+    // Owners are curve-validated on the way in (`resolve_agent_owner` /
+    // `parse_owner_pubkey`), so this should be unreachable. Treat it as a
+    // fetch error anyway: an unusable key means we cannot tell whether a core
+    // exists, and `build_core_section` maps that to "inject no section".
+    let k_c = conversation_key(agent_keys.secret_key(), owner)
+        .map_err(|e| format!("conversation key derivation failed: {e}"))?;
     let d = d_tag(&k_c, buzz_core::engram::CORE_SLUG);
 
     let filter = nostr::Filter::new()

@@ -57,6 +57,10 @@ pub enum EngramError {
     /// Signing error.
     #[error("sign failed: {0}")]
     Sign(String),
+    /// A pubkey is not a valid BIP-340 x-only curve point, so no NIP-44
+    /// conversation key can be derived from it.
+    #[error("invalid pubkey: {0}")]
+    InvalidPubkey(String),
 }
 
 /// Validate a slug against the *Slugs* grammar.
@@ -133,8 +137,25 @@ pub fn normalize_slug(raw: &str) -> Result<String, EngramError> {
 /// Derive the conversation key `K_c` for the agent ↔ owner pair (NIP-44 v2).
 ///
 /// `K_c` is symmetric: `derive(seckey_a, pubkey_o) == derive(seckey_o, pubkey_a)`.
-pub fn conversation_key(my_seckey: &SecretKey, their_pubkey: &PublicKey) -> ConversationKey {
-    ConversationKey::derive(my_seckey, their_pubkey).expect("valid keys produce conversation key")
+///
+/// Returns [`EngramError::InvalidPubkey`] when `their_pubkey` is not a valid
+/// BIP-340 x-only curve point. This is reachable from user input: since the
+/// nostr 0.36 → 0.44 migration, `PublicKey` is a lazy 32-byte newtype and
+/// `PublicKey::from_hex` only hex-decodes — it does not run `lift_x` (nor even
+/// a field-range check, so `ffff…ffff` parses). The curve check now lives in
+/// `PublicKey::xonly()`, which the ECDH inside `ConversationKey::derive`
+/// performs. Callers that accept a pubkey from a flag, env var, or the wire
+/// MUST therefore handle this error rather than assume it cannot happen.
+pub fn conversation_key(
+    my_seckey: &SecretKey,
+    their_pubkey: &PublicKey,
+) -> Result<ConversationKey, EngramError> {
+    ConversationKey::derive(my_seckey, their_pubkey).map_err(|e| {
+        EngramError::InvalidPubkey(format!(
+            "{} is not a valid BIP-340 curve point: {e}",
+            their_pubkey.to_hex()
+        ))
+    })
 }
 
 /// Compute the `d` tag for a slug under a conversation key.
@@ -449,7 +470,7 @@ pub fn build_event(
     let plaintext_str = std::str::from_utf8(&plaintext)
         .map_err(|e| EngramError::Encrypt(format!("body JSON not UTF-8: {e}")))?;
 
-    let k_c = conversation_key(agent_keys.secret_key(), owner_pubkey);
+    let k_c = conversation_key(agent_keys.secret_key(), owner_pubkey)?;
     let ciphertext = nip44::encrypt(
         agent_keys.secret_key(),
         owner_pubkey,
@@ -546,7 +567,7 @@ pub fn validate_and_decrypt(
     let body = Body::from_json_bytes(plaintext.as_bytes())?;
 
     // Rule (4): body slug re-derives to the event's d tag.
-    let k_c = conversation_key(my_seckey, their_pubkey);
+    let k_c = conversation_key(my_seckey, their_pubkey)?;
     let derived = d_tag(&k_c, body.slug());
     if derived != d_value {
         return Err(EngramError::InvalidEnvelope(
@@ -636,17 +657,67 @@ mod tests {
     fn conversation_key_matches_spec() {
         let a = keys_from_hex(SECKEY_A);
         let o = keys_from_hex(SECKEY_O);
-        let k_c_ao = conversation_key(a.secret_key(), &o.public_key());
-        let k_c_oa = conversation_key(o.secret_key(), &a.public_key());
+        let k_c_ao = conversation_key(a.secret_key(), &o.public_key()).expect("agent-side K_c");
+        let k_c_oa = conversation_key(o.secret_key(), &a.public_key()).expect("owner-side K_c");
         assert_eq!(hex::encode(k_c_ao.as_bytes()), K_C_HEX, "agent-side K_c");
         assert_eq!(hex::encode(k_c_oa.as_bytes()), K_C_HEX, "owner-side K_c");
+    }
+
+    /// Regression for the nostr 0.36 → 0.44 migration (commit a65b7fc06).
+    ///
+    /// On 0.36 `PublicKey` wrapped `XOnlyPublicKey` and `from_hex` ran the
+    /// full BIP-340 `lift_x`, so every `PublicKey` value was a curve point by
+    /// construction. On 0.44 `from_hex` only hex-decodes, so an off-curve —
+    /// or even out-of-field — value reaches `conversation_key`. It MUST come
+    /// back as an error; the old `.expect()` turned it into a process crash.
+    #[test]
+    fn conversation_key_rejects_off_curve_pubkey() {
+        let a = keys_from_hex(SECKEY_A);
+
+        // x = 0: 0³ + 7 = 7 is not a quadratic residue mod p, so no curve
+        // point has this x coordinate.
+        let all_zero =
+            PublicKey::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
+                .expect("nostr 0.44 from_hex only hex-decodes — that is the premise of this test");
+        let err = conversation_key(a.secret_key(), &all_zero)
+            .expect_err("all-zero x is off-curve and must not yield a conversation key");
+        assert!(
+            matches!(err, EngramError::InvalidPubkey(_)),
+            "expected InvalidPubkey, got: {err:?}"
+        );
+
+        // All-ones additionally exceeds the field prime p, and still parses.
+        let above_field_prime =
+            PublicKey::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("from_hex does not range-check the field element either");
+        assert!(conversation_key(a.secret_key(), &above_field_prime).is_err());
+    }
+
+    /// The same off-curve pubkey must fall out of the public entry points as
+    /// an error rather than a panic — `build_event` is the write path the CLI
+    /// and the ACP harness both reach.
+    #[test]
+    fn build_event_rejects_off_curve_owner() {
+        let a = keys_from_hex(SECKEY_A);
+        let off_curve =
+            PublicKey::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
+                .expect("hex decodes");
+        let body = Body::Core {
+            profile: "x".into(),
+        };
+        let err = build_event(&a, &off_curve, &body, 1_700_000_000)
+            .expect_err("off-curve owner must not build an event");
+        assert!(
+            matches!(err, EngramError::InvalidPubkey(_)),
+            "expected InvalidPubkey, got: {err:?}"
+        );
     }
 
     #[test]
     fn d_tags_match_spec() {
         let a = keys_from_hex(SECKEY_A);
         let o = keys_from_hex(SECKEY_O);
-        let k_c = conversation_key(a.secret_key(), &o.public_key());
+        let k_c = conversation_key(a.secret_key(), &o.public_key()).expect("K_c");
         assert_eq!(d_tag(&k_c, "core"), D_CORE);
         assert_eq!(d_tag(&k_c, "mem/example"), D_EXAMPLE);
         assert_eq!(d_tag(&k_c, "mem/notes/2026-05-12"), D_NOTES);
