@@ -838,6 +838,9 @@ mod postgres_tests {
             &[2_u8; 32],
             "First writer wins",
             None,
+            "community",
+            None,
+            &[],
             &actor,
         )
         .await
@@ -853,6 +856,9 @@ mod postgres_tests {
             &[4_u8; 32],
             "Second writer loses",
             None,
+            "community",
+            None,
+            &[],
             &actor,
         )
         .await;
@@ -899,6 +905,9 @@ mod postgres_tests {
             &[11_u8; 32],
             "Board created before fencing",
             None,
+            "community",
+            None,
+            &[],
             &actor,
         )
         .await
@@ -975,6 +984,7 @@ mod postgres_tests {
             &[13_u8; 32],
             "Attempted update while fenced",
             None,
+            &[],
             &actor,
         )
         .await;
@@ -1000,6 +1010,9 @@ mod postgres_tests {
             &[15_u8; 32],
             "New board attempted while fenced",
             None,
+            "community",
+            None,
+            &[],
             &actor,
         )
         .await;
