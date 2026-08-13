@@ -37,14 +37,21 @@ Exit code 5 is a stale-base conflict: read again, reapply the intention to the
 new snapshot, and retry with its new `--base`. Never repeat the stale command
 blindly.
 
-For multiline Markdown, use stdin with a quoted heredoc delimiter. This keeps
-`$()`, backticks, and variables in the document literal:
+For multiline Markdown, write the complete document to a file and redirect it
+into stdin. Do not build the document inline with a heredoc: a heredoc puts the
+whole snapshot on the command line, and Windows caps that near 8 KB, so any
+board past roughly 7 KB becomes impossible to update — the failure looks like a
+broken heredoc rather than a length limit.
 
 ```bash
-buzz lab update <board-id> --base <base> --content - <<'BUZZ_LAB_MARKDOWN'
-<complete Markdown document>
-BUZZ_LAB_MARKDOWN
+buzz lab update <board-id> --base <base> --content - < <path-to-snapshot>.md
 ```
+
+Redirection keeps the command itself short regardless of document size, and the
+file content is never shell-evaluated, so `$()`, backticks and variables stay
+literal. Keep `buzz lab update` as the first word of the command: a pipeline
+like `cat file.md | buzz lab update …` starts with a different program and is
+refused by the command-prefix allowlist.
 
 ## Conversational Agent Management
 

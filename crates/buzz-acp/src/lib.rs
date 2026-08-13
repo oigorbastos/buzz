@@ -4094,7 +4094,13 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("complete Markdown snapshot, never a diff"));
         assert!(prompt.contains("Exit code 5 means the base is stale"));
         assert!(prompt.contains("`buzz lab get --content-only` omits `base`"));
-        assert!(prompt.contains("<<'BUZZ_LAB_MARKDOWN'"));
+        // Large snapshots must go in by redirection, not a heredoc: a heredoc
+        // puts the whole document on the command line, which Windows caps near
+        // 8 KB, making any board past ~7 KB unupdatable by an agent. Assert the
+        // heredoc is GONE so it cannot be reintroduced as a "simplification".
+        assert!(prompt.contains("--content - < <path-to-snapshot>.md"));
+        assert!(!prompt.contains("<<'BUZZ_LAB_MARKDOWN'"));
+        assert!(prompt.contains("Windows caps that near 8 KB"));
     }
 }
 
