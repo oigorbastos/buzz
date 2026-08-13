@@ -1519,7 +1519,7 @@ mod tests {
         for column in &migration.communities_added_columns {
             assert!(
                 column_names.contains(column),
-                "schema.sql communities table is missing 0028 column {column}"
+                "schema.sql communities table is missing 0032 column {column}"
             );
         }
         assert!(!migration.communities_added_columns.is_empty());
