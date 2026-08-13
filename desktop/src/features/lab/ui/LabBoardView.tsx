@@ -1,9 +1,11 @@
 import {
   ArrowLeft,
+  Eye,
   History,
   Link2,
   Pencil,
   Save,
+  LockKeyhole,
   Users,
   X,
 } from "lucide-react";
@@ -17,6 +19,7 @@ import {
   type LabBoardRevision,
   validateBoardInput,
 } from "@/features/lab/api";
+import { canEditBoard, canReadBoard } from "@/features/lab/model";
 import {
   useLabBoardHistoryQuery,
   useLabBoardQuery,
@@ -24,12 +27,19 @@ import {
   useUpdateLabBoardMutation,
 } from "@/features/lab/hooks";
 import { LabBoardHistory } from "@/features/lab/ui/LabBoardHistory";
+import { LabBoardCopyIdButton } from "@/features/lab/ui/LabBoardCopyIdButton";
 import { LabMarkdownEditor } from "@/features/lab/ui/LabMarkdownEditor";
+import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
+import { LabTagInput } from "@/features/lab/ui/LabTagInput";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { useUserProfileQuery } from "@/features/profile/hooks";
 import {
   isRelayUnreachableError,
   RELAY_UNREACHABLE_SHORT,
 } from "@/shared/lib/relayError";
 import { Button } from "@/shared/ui/button";
+import { Badge } from "@/shared/ui/badge";
+import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { Markdown } from "@/shared/ui/markdown";
 
 type LabBoardViewProps = {
@@ -59,12 +69,15 @@ export function LabBoardView({
   );
   const updateMutation = useUpdateLabBoardMutation(boardId);
   const restoreMutation = useRestoreLabBoardMutation(boardId);
+  const identityQuery = useIdentityQuery();
+  const currentProfileQuery = useUserProfileQuery(identityQuery.data?.pubkey);
 
   const [isEditing, setIsEditing] = React.useState(false);
   // Poll only while editing — that is the only window where another writer's
   // revision changes what this user should do next.
   const boardQuery = useLabBoardQuery(boardId, isEditing);
   const [draft, setDraft] = React.useState("");
+  const [draftTags, setDraftTags] = React.useState<string[]>([]);
   /**
    * The head this draft was started from. Captured once when editing begins
    * and never refreshed — it is the `prev` sent to the relay, i.e. the claim
@@ -81,6 +94,7 @@ export function LabBoardView({
 
   function handleStartEditing(head: LabBoardHead) {
     setDraft(head.content);
+    setDraftTags(head.tags);
     // Freeze the revision this draft is derived from. Everything below depends
     // on this value never being refreshed — see `handleSave`.
     setEditBase(head);
@@ -91,13 +105,17 @@ export function LabBoardView({
   function handleCancelEditing() {
     setIsEditing(false);
     setDraft("");
+    setDraftTags([]);
     setEditBase(null);
     setErrorMessage(null);
   }
 
   async function handleSave() {
     if (!editBase) return;
-    const validationError = validateBoardInput({ content: draft });
+    const validationError = validateBoardInput({
+      content: draft,
+      tags: draftTags,
+    });
     if (validationError) {
       setErrorMessage(validationError);
       return;
@@ -113,9 +131,14 @@ export function LabBoardView({
       // published while the editor was open. The CAS transaction, the advisory
       // lock and BOARD_HEAD_MISMATCH all exist to catch exactly that, and are
       // dead weight unless this base stays frozen.
-      await updateMutation.mutateAsync({ head: editBase, content: draft });
+      await updateMutation.mutateAsync({
+        head: editBase,
+        content: draft,
+        tags: draftTags,
+      });
       setIsEditing(false);
       setDraft("");
+      setDraftTags([]);
       setEditBase(null);
     } catch (error) {
       // The draft is deliberately NOT cleared on failure — losing someone's
@@ -166,7 +189,14 @@ export function LabBoardView({
     );
   }
 
-  if (!board) {
+  if (
+    !board ||
+    !canReadBoard(
+      board,
+      identityQuery.data?.pubkey,
+      currentProfileQuery.data?.ownerPubkey,
+    )
+  ) {
     return (
       <div className="p-4">
         <Button onClick={onBack} size="sm" type="button" variant="outline">
@@ -174,13 +204,18 @@ export function LabBoardView({
           Back
         </Button>
         <p className="mt-4 text-sm text-muted-foreground">
-          This board no longer exists on the relay.
+          This board is not available.
         </p>
       </div>
     );
   }
 
   const isFrozen = board.status === "frozen";
+  const canWrite = canEditBoard(
+    board,
+    identityQuery.data?.pubkey,
+    currentProfileQuery.data?.ownerPubkey,
+  );
   const isSaving = updateMutation.isPending;
   // The polled head has moved past the revision this draft was started from,
   // so saving will (correctly) be refused. Say so now rather than letting the
@@ -221,9 +256,10 @@ export function LabBoardView({
         <Button
           data-testid="lab-board-copy-reference"
           onClick={() => {
-            void navigator.clipboard
-              .writeText(boardReference(board.boardId))
-              .catch(() => setErrorMessage("Could not copy the reference."));
+            copyTextToClipboard(
+              boardReference(board.boardId),
+              "Board reference copied",
+            );
           }}
           size="sm"
           type="button"
@@ -232,6 +268,10 @@ export function LabBoardView({
           <Link2 className="h-4 w-4" />
           Copy link
         </Button>
+        <LabBoardCopyIdButton
+          boardId={board.boardId}
+          boardTitle={board.title}
+        />
         <Button
           data-testid="lab-board-history-toggle"
           onClick={() => setShowHistory((value) => !value)}
@@ -242,7 +282,9 @@ export function LabBoardView({
           <History className="h-4 w-4" />
           {showHistory ? "Hide history" : "History"}
         </Button>
-        {!isEditing && !isFrozen && viewingRevision === null ? (
+        {/* Editing requires write access (ACL), a live head (not a pinned
+            revision deep link), and an unfrozen board. */}
+        {!isEditing && !isFrozen && canWrite && viewingRevision === null ? (
           <Button
             data-testid="lab-board-edit"
             onClick={() => handleStartEditing(board)}
@@ -256,11 +298,51 @@ export function LabBoardView({
         ) : null}
       </div>
 
-      <p className="flex items-center gap-2 border-b border-border/60 bg-muted/20 px-4 py-2 text-xs text-muted-foreground">
-        <Users className="h-3.5 w-3.5 shrink-0" />
-        Everyone in this community can edit this board.
-        {isFrozen ? " It is frozen, so edits are disabled." : ""}
-      </p>
+      <LabPreviewBanner />
+
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/20 px-4 py-2 text-xs text-muted-foreground">
+        {board.access === "private" ? (
+          <LockKeyhole className="h-3.5 w-3.5 shrink-0" />
+        ) : board.access === "community_readonly" ? (
+          <Eye className="h-3.5 w-3.5 shrink-0" />
+        ) : (
+          <Users className="h-3.5 w-3.5 shrink-0" />
+        )}
+        <span>
+          {board.access === "community"
+            ? "Everyone in this community can read and edit this board."
+            : board.access === "community_readonly"
+              ? canWrite
+                ? "Everyone in this community can find and read. Only you and your agents can edit."
+                : "Everyone in this community can find and read. Only the owner and their agents can edit."
+              : "Only you and your agents can find, read, and edit this board."}
+          {isFrozen ? " It is frozen, so edits are disabled." : ""}
+        </span>
+        <Badge
+          className="normal-case tracking-normal"
+          variant={
+            board.access === "community"
+              ? "secondary"
+              : board.access === "community_readonly"
+                ? "outline"
+                : "info"
+          }
+        >
+          {board.access === "community"
+            ? "Community"
+            : board.access === "community_readonly"
+              ? "Read-only"
+              : "Private"}
+        </Badge>
+        {board.tags.map((tag) => (
+          <span
+            className="rounded-full border border-border/60 bg-background/70 px-2 py-0.5"
+            key={tag}
+          >
+            #{tag}
+          </span>
+        ))}
+      </div>
 
       {errorMessage ? (
         <p
@@ -314,6 +396,7 @@ export function LabBoardView({
             </p>
           ) : (
             <LabBoardHistory
+              canRestore={canWrite && !isFrozen}
               currentRevision={board.revision}
               isRestoring={restoreMutation.isPending}
               onRestore={(revision) => handleRestore(board, revision)}
@@ -347,6 +430,20 @@ export function LabBoardView({
               your text, cancel, and reapply it on the new version.
             </p>
           ) : null}
+          <div className="space-y-1.5">
+            <label
+              className="text-sm font-medium text-foreground"
+              htmlFor="edit-lab-board-tags"
+            >
+              Tags
+            </label>
+            <LabTagInput
+              disabled={isSaving}
+              id="edit-lab-board-tags"
+              onChange={setDraftTags}
+              tags={draftTags}
+            />
+          </div>
           <LabMarkdownEditor
             aria-label="Board content"
             data-testid="lab-board-editor"

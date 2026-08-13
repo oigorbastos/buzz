@@ -58,6 +58,112 @@ describe("parseBoardHead", () => {
     assert.equal(head.headEventId, EVENT_ID);
     assert.equal(head.status, "active");
     assert.equal(head.content, "# hello");
+    assert.equal(head.access, "community");
+    assert.equal(head.ownerPubkey, null);
+    assert.deepEqual(head.tags, []);
+  });
+
+  it("reads private access metadata and canonical tags", () => {
+    const head = parseBoardHead(
+      headEvent([
+        ["d", BOARD],
+        ["revision", "2"],
+        ["head", EVENT_ID],
+        ["access_scope", "private"],
+        ["owner", PUBKEY],
+        ["t", "Prompts"],
+        ["t", "operação"],
+        ["t", "prompts"],
+      ]),
+    );
+
+    assert.equal(head.access, "private");
+    assert.equal(head.ownerPubkey, PUBKEY);
+    assert.deepEqual(head.tags, ["prompts", "operação"]);
+  });
+
+  it("reads canonical and legacy read-only metadata", () => {
+    const canonical = parseBoardHead(
+      headEvent([
+        ["d", BOARD],
+        ["revision", "2"],
+        ["head", EVENT_ID],
+        ["access_scope", "community_readonly"],
+        ["owner", PUBKEY],
+      ]),
+    );
+    const legacy = parseBoardHead(
+      headEvent([
+        ["d", BOARD],
+        ["revision", "2"],
+        ["head", EVENT_ID],
+        ["edit_policy", "owner_agents"],
+        ["owner", PUBKEY],
+      ]),
+    );
+    const dualTagged = parseBoardHead(
+      headEvent([
+        ["d", BOARD],
+        ["revision", "2"],
+        ["head", EVENT_ID],
+        ["access_scope", "community_readonly"],
+        ["edit_policy", "owner_agents"],
+        ["owner", PUBKEY],
+      ]),
+    );
+
+    assert.equal(canonical.access, "community_readonly");
+    assert.equal(legacy.access, "community_readonly");
+    assert.equal(dualTagged.access, "community_readonly");
+  });
+
+  it("fails closed for malformed or ambiguous restricted metadata", () => {
+    const baseTags = [
+      ["d", BOARD],
+      ["revision", "2"],
+      ["head", EVENT_ID],
+    ];
+    assert.equal(
+      parseBoardHead(headEvent([...baseTags, ["access_scope", "private"]])),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(
+        headEvent([
+          ...baseTags,
+          ["access_scope", "private"],
+          ["owner", "not-a-pubkey"],
+        ]),
+      ),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(
+        headEvent([...baseTags, ["access_scope", "community_readonly"]]),
+      ),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(headEvent([...baseTags, ["access_scope", "future-mode"]])),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(
+        headEvent([
+          ...baseTags,
+          ["access_scope", "private"],
+          ["edit_policy", "owner_agents"],
+          ["owner", PUBKEY],
+        ]),
+      ),
+      null,
+    );
+    assert.equal(
+      parseBoardHead(
+        headEvent([...baseTags, ["edit_policy", "future-policy"]]),
+      ),
+      null,
+    );
   });
 
   it("rejects an event of the wrong kind", () => {

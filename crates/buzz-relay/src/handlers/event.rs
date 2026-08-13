@@ -8,7 +8,8 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, AUTHOR_ONLY_KINDS,
-    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_LAB_BOARD_HEAD, KIND_LAB_BOARD_REVISION,
+    KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -173,6 +174,58 @@ pub async fn filter_fanout_by_access(
     } else {
         matches
     };
+
+    // Lab Boards are global events, so they never pass through the channel
+    // membership branch below. Apply membership plus the durable board ACL at
+    // this chokepoint for both local ingest fan-out and Redis cross-node
+    // delivery. Unknown/malformed board coordinates fail closed.
+    if matches!(
+        event_kind_u32(&stored_event.event),
+        KIND_LAB_BOARD_REVISION | KIND_LAB_BOARD_HEAD
+    ) {
+        let board_id = stored_event
+            .event
+            .tags
+            .iter()
+            .find(|tag| tag.as_slice().first().map(String::as_str) == Some("d"))
+            .and_then(|tag| tag.as_slice().get(1))
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+        let Some(board_id) = board_id else {
+            return Vec::new();
+        };
+        let mut allowed = Vec::with_capacity(matches.len());
+        for (conn_id, sub_id) in matches {
+            let Some(pubkey) = state.conn_manager.pubkey_for_conn(conn_id) else {
+                continue;
+            };
+            match super::lab::is_lab_board_member(state, community_id, &pubkey).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!("Lab fan-out membership lookup failed: {e}");
+                    continue;
+                }
+            }
+            let principals =
+                match super::lab::lab_reader_principals(state, community_id, &pubkey).await {
+                    Ok(principals) => principals,
+                    Err(e) => {
+                        warn!("Lab fan-out ACL lookup failed: {e}");
+                        continue;
+                    }
+                };
+            match state
+                .db
+                .lab_board_can_read(community_id, board_id, &principals)
+                .await
+            {
+                Ok(true) => allowed.push((conn_id, sub_id)),
+                Ok(false) => {}
+                Err(e) => warn!("Lab fan-out ACL check failed: {e}"),
+            }
+        }
+        return allowed;
+    }
 
     let Some(channel_id) = stored_event.channel_id else {
         return matches;

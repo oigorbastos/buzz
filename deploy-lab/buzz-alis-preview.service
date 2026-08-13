@@ -1,0 +1,54 @@
+[Unit]
+Description=Buzz Alis Lab UX preview (fictional data only)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=buzz-preview
+Group=buzz-preview
+WorkingDirectory=/srv/buzz-alis-preview/current
+Environment=NODE_ENV=production
+Environment=NO_UPDATE_NOTIFIER=1
+Environment=BUZZ_PREVIEW_ALLOWED_HOST=hermes-vps.taild6a99a.ts.net
+Environment=BUZZ_PREVIEW_PROXY_HOST=localhost
+Environment=BUZZ_PREVIEW_ROOT=/srv/buzz-alis-preview/current
+Environment=BUZZ_PREVIEW_SOCKET=/run/buzz-alis-preview/http.sock
+ExecStart=/usr/local/bin/node /srv/buzz-alis-preview/server/static-preview-server.mjs
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+RuntimeDirectory=buzz-alis-preview
+RuntimeDirectoryMode=0750
+
+# The process has no IP sockets at all. Tailscale Serve reaches it through the
+# filesystem Unix socket created under RuntimeDirectory.
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=true
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+UMask=0077
+TasksMax=128
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

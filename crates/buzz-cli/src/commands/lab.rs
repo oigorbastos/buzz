@@ -20,13 +20,14 @@
 //!   caller having to track it across invocations.
 //!
 //! ## Verbs (create/update/history/restore/list/get/ref)
-//! - `lab create --title T [--summary S] --content -` — mints a fresh
-//!   `board_id` (UUID v4 — matches `channels create`/`workflows create`'s
-//!   convention; the workspace `uuid` crate here only has the `v4` feature
-//!   enabled, so v7 was never an option), publishes op=create/revision=1.
-//! - `lab update <board-id> --base <event-id> [--title T] [--summary S]
-//!   --content -` — CAS'd against the explicit token captured by the caller
-//!   from the same `lab get`. `--title`/
+//! - `lab create --access SCOPE --tag TAG ... --title T [--summary S]
+//!   --content -` — mints a fresh board_id (UUID v4) and publishes `create_v2`
+//!   with immutable access scope and an atomic topic-tag replacement.
+//! - `lab update <board-id> --base <event-id> [--tag TAG ...|--clear-tags]
+//!   [--title T] [--summary S] --content -` — CAS'd against the explicit
+//!   token captured by the caller from the same `lab get`. Omitting all tag
+//!   flags preserves the current tag set; either explicit form emits
+//!   `update_v2`. `--title`/
 //!   `--summary` omitted means "the relay carries the current value
 //!   forward"; there is no explicit-clear form (unlike `notes set`) because
 //!   the Lab Board wire protocol has no empty-tag-means-clear convention —
@@ -56,11 +57,8 @@
 //! because other boards are active in the community.
 //!
 //! ## Still out of scope
-//! `archive`/`unarchive`/`freeze`/`unfreeze` (moderation ops — no `--tag`/
-//! topic-tag support either: `parse_lab_board_envelope` in
-//! `buzz-relay/src/handlers/lab.rs` does not recognize a `t` tag at all, so
-//! the CLI does not offer one — a flag that silently no-ops on the wire
-//! would be worse than no flag) and `diff`.
+//! `archive`/`unarchive`/`freeze`/`unfreeze` (moderation ops — topic tags are
+//! intentionally limited to content mutations) and `diff`.
 //!
 //! ## Open design decisions (not dictated by the relay's wire contract)
 //! - `restore` always carries the *current head's* title/summary forward
@@ -80,6 +78,7 @@
 //!   address, not a scan.
 
 use nostr::{Event, EventBuilder, EventId, Kind, Tag};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use buzz_core::kind::{KIND_LAB_BOARD_HEAD, KIND_LAB_BOARD_REVISION};
@@ -104,6 +103,56 @@ const MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 /// this is deliberately larger than `notes ls`'s 50/200.
 const HISTORY_DEFAULT_LIMIT: u32 = 100;
 const HISTORY_MAX_LIMIT: u32 = 1000;
+
+fn normalize_lab_tag(raw: &str) -> String {
+    let normalized: String = raw.nfkc().collect();
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in normalized.trim().to_lowercase().chars() {
+        if ch.is_whitespace() {
+            pending_dash = true;
+        } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            if pending_dash && !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    out.trim_matches(['-', '_']).to_owned()
+}
+
+fn canonicalize_lab_tags(raw: &[String]) -> Result<Vec<String>, CliError> {
+    if raw.len() > 12 {
+        return Err(CliError::Usage("--tag accepts at most 12 values".into()));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for value in raw {
+        let normalized = normalize_lab_tag(value);
+        if normalized.is_empty() || normalized.chars().count() > 32 {
+            return Err(CliError::Usage(
+                "each --tag must normalize to 1..32 characters".into(),
+            ));
+        }
+        if out.iter().any(|existing| existing == &normalized) {
+            return Err(CliError::Usage(format!("duplicate --tag `{normalized}`")));
+        }
+        out.push(normalized);
+    }
+    Ok(out)
+}
+
+fn validate_access_scope(access: &str) -> Result<(), CliError> {
+    if matches!(access, "community" | "community_readonly" | "private") {
+        Ok(())
+    } else {
+        Err(CliError::Usage(
+            "--access must be community, community_readonly, or private".into(),
+        ))
+    }
+}
 
 fn tag_err(e: impl std::fmt::Display) -> CliError {
     CliError::Other(format!("failed to build tag: {e}"))
@@ -194,6 +243,9 @@ struct BoardHead {
     /// projection reflects — the CAS token for the next `prev` tag.
     head_event_id: EventId,
     status: String,
+    access_scope: String,
+    owner: Option<String>,
+    tags: Vec<String>,
 }
 
 impl BoardHead {
@@ -219,6 +271,22 @@ impl BoardHead {
             ))
         })?;
         let status = tag_value(event, "status").unwrap_or("active").to_string();
+        let access_scope = tag_value(event, "access_scope")
+            .unwrap_or("community")
+            .to_string();
+        validate_access_scope(&access_scope)?;
+        let owner = tag_value(event, "owner").map(str::to_owned);
+        if access_scope != "community" && owner.is_none() {
+            return Err(CliError::Other(
+                "restricted lab board head is missing its owner tag".into(),
+            ));
+        }
+        let tags = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("t"))
+            .filter_map(|tag| tag.as_slice().get(1).cloned())
+            .collect();
         let board_id_raw = tag_value(event, "d")
             .ok_or_else(|| CliError::Other("lab board head event is missing the `d` tag".into()))?;
         let board_id = Uuid::parse_str(board_id_raw).map_err(|e| {
@@ -232,6 +300,9 @@ impl BoardHead {
             content: event.content.clone(),
             head_event_id,
             status,
+            access_scope,
+            owner,
+            tags,
         })
     }
 }
@@ -296,6 +367,8 @@ fn build_create_event(
     title: &str,
     summary: Option<&str>,
     content: &str,
+    access_scope: &str,
+    topic_tags: &[String],
 ) -> Result<EventBuilder, CliError> {
     let title = title.trim();
     if title.is_empty() {
@@ -306,15 +379,21 @@ fn build_create_event(
         validate_summary_len(s)?;
     }
     validate_markdown_size(content)?;
+    validate_access_scope(access_scope)?;
 
     let mut tags: Vec<Tag> = vec![
         Tag::parse(["d", &board_id.to_string()]).map_err(tag_err)?,
-        Tag::parse(["op", "create"]).map_err(tag_err)?,
+        Tag::parse(["op", "create_v2"]).map_err(tag_err)?,
         Tag::parse(["revision", "1"]).map_err(tag_err)?,
         Tag::parse(["title", title]).map_err(tag_err)?,
+        Tag::parse(["access_scope", access_scope]).map_err(tag_err)?,
+        Tag::parse(["tags", "replace"]).map_err(tag_err)?,
     ];
     if let Some(s) = summary {
         tags.push(Tag::parse(["summary", s]).map_err(tag_err)?);
+    }
+    for topic_tag in topic_tags {
+        tags.push(Tag::parse(["t", topic_tag]).map_err(tag_err)?);
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_LAB_BOARD_REVISION as u16), content).tags(tags))
 }
@@ -327,6 +406,7 @@ fn build_update_event(
     title: Option<&str>,
     summary: Option<&str>,
     content: &str,
+    topic_tags: Option<&[String]>,
 ) -> Result<EventBuilder, CliError> {
     if let Some(t) = title {
         validate_title_len(t)?;
@@ -338,7 +418,15 @@ fn build_update_event(
 
     let mut tags: Vec<Tag> = vec![
         Tag::parse(["d", &board_id.to_string()]).map_err(tag_err)?,
-        Tag::parse(["op", "update"]).map_err(tag_err)?,
+        Tag::parse([
+            "op",
+            if topic_tags.is_some() {
+                "update_v2"
+            } else {
+                "update"
+            },
+        ])
+        .map_err(tag_err)?,
         Tag::parse(["prev", &prev.to_hex()]).map_err(tag_err)?,
         Tag::parse(["revision", &revision.to_string()]).map_err(tag_err)?,
     ];
@@ -347,6 +435,12 @@ fn build_update_event(
     }
     if let Some(s) = summary {
         tags.push(Tag::parse(["summary", s]).map_err(tag_err)?);
+    }
+    if let Some(topic_tags) = topic_tags {
+        tags.push(Tag::parse(["tags", "replace"]).map_err(tag_err)?);
+        for topic_tag in topic_tags {
+            tags.push(Tag::parse(["t", topic_tag]).map_err(tag_err)?);
+        }
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_LAB_BOARD_REVISION as u16), content).tags(tags))
 }
@@ -510,11 +604,14 @@ pub async fn cmd_create(
     title: &str,
     summary: Option<&str>,
     content: &str,
+    access_scope: &str,
+    tags: &[String],
 ) -> Result<(), CliError> {
     let body = read_or_stdin(content)?;
     let board_id = Uuid::new_v4();
+    let topic_tags = canonicalize_lab_tags(tags)?;
 
-    let builder = build_create_event(board_id, title, summary, &body)?;
+    let builder = build_create_event(board_id, title, summary, &body, access_scope, &topic_tags)?;
     let event = client.sign_event(builder)?;
     let event_id = event.id;
 
@@ -541,6 +638,7 @@ pub async fn cmd_update(
     title: Option<&str>,
     summary: Option<&str>,
     content: &str,
+    tags: Option<&[String]>,
 ) -> Result<(), CliError> {
     let board_id = parse_uuid(board_id_raw)?;
     let body = read_or_stdin(content)?;
@@ -554,7 +652,16 @@ pub async fn cmd_update(
     let prev = parse_event_id(base)?;
     let next_revision = head.revision + 1;
 
-    let builder = build_update_event(board_id, prev, next_revision, title, summary, &body)?;
+    let topic_tags = tags.map(canonicalize_lab_tags).transpose()?;
+    let builder = build_update_event(
+        board_id,
+        prev,
+        next_revision,
+        title,
+        summary,
+        &body,
+        topic_tags.as_deref(),
+    )?;
     let event = client.sign_event(builder)?;
     let event_id = event.id;
 
@@ -708,6 +815,9 @@ struct BoardSummary {
     status: String,
     updated_at: u64,
     reference: String,
+    access_scope: String,
+    owner: Option<String>,
+    tags: Vec<String>,
 }
 
 const LIST_DEFAULT_LIMIT: u32 = 200;
@@ -746,6 +856,9 @@ pub async fn cmd_list(client: &BuzzClient, limit: Option<u32>) -> Result<(), Cli
             revision: head.revision,
             status: head.status.clone(),
             updated_at: event.created_at.as_secs(),
+            access_scope: head.access_scope.clone(),
+            owner: head.owner.clone(),
+            tags: head.tags.clone(),
         })
         .collect();
     heads.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
@@ -779,6 +892,11 @@ pub async fn cmd_get(
     println!("title      {}", head.title);
     println!("revision   {}", head.revision);
     println!("status     {}", head.status);
+    println!("access     {}", head.access_scope);
+    if let Some(owner) = &head.owner {
+        println!("owner      {owner}");
+    }
+    println!("tags       {}", head.tags.join(","));
     println!("base       {}", head.head_event_id.to_hex());
     println!("reference  {}", board_reference(board_id, None));
     println!();
@@ -804,14 +922,30 @@ pub async fn dispatch(cmd: crate::LabCmd, client: &BuzzClient) -> Result<(), Cli
             title,
             summary,
             content,
-        } => cmd_create(client, &title, summary.as_deref(), &content).await,
+            access,
+            tags,
+        } => cmd_create(client, &title, summary.as_deref(), &content, &access, &tags).await,
         LabCmd::Update {
             board_id,
             base,
             title,
             summary,
             content,
+            tags,
+            clear_tags,
         } => {
+            if clear_tags && !tags.is_empty() {
+                return Err(CliError::Usage(
+                    "--clear-tags is mutually exclusive with --tag".into(),
+                ));
+            }
+            let tags = if clear_tags {
+                Some(tags.as_slice())
+            } else if tags.is_empty() {
+                None
+            } else {
+                Some(tags.as_slice())
+            };
             cmd_update(
                 client,
                 &board_id,
@@ -819,6 +953,7 @@ pub async fn dispatch(cmd: crate::LabCmd, client: &BuzzClient) -> Result<(), Cli
                 title.as_deref(),
                 summary.as_deref(),
                 &content,
+                tags,
             )
             .await
         }
@@ -851,11 +986,22 @@ mod tests {
     #[test]
     fn create_event_has_expected_tags_and_no_prev() {
         let board_id = Uuid::new_v4();
-        let event =
-            sign(build_create_event(board_id, "My Board", Some("a summary"), "# hello").unwrap());
+        let event = sign(
+            build_create_event(
+                board_id,
+                "My Board",
+                Some("a summary"),
+                "# hello",
+                "community",
+                &[],
+            )
+            .unwrap(),
+        );
         assert_eq!(event.kind, Kind::Custom(KIND_LAB_BOARD_REVISION as u16));
         assert_eq!(tag_value(&event, "d"), Some(board_id.to_string().as_str()));
-        assert_eq!(tag_value(&event, "op"), Some("create"));
+        assert_eq!(tag_value(&event, "op"), Some("create_v2"));
+        assert_eq!(tag_value(&event, "access_scope"), Some("community"));
+        assert_eq!(tag_value(&event, "tags"), Some("replace"));
         assert_eq!(tag_value(&event, "revision"), Some("1"));
         assert_eq!(tag_value(&event, "title"), Some("My Board"));
         assert_eq!(tag_value(&event, "summary"), Some("a summary"));
@@ -865,41 +1011,46 @@ mod tests {
 
     #[test]
     fn create_event_omits_summary_tag_when_none() {
-        let event = sign(build_create_event(Uuid::new_v4(), "T", None, "").unwrap());
+        let event =
+            sign(build_create_event(Uuid::new_v4(), "T", None, "", "community", &[]).unwrap());
         assert!(tag_value(&event, "summary").is_none());
     }
 
     #[test]
     fn create_event_rejects_empty_title() {
-        let err = build_create_event(Uuid::new_v4(), "  ", None, "x").unwrap_err();
+        let err =
+            build_create_event(Uuid::new_v4(), "  ", None, "x", "community", &[]).unwrap_err();
         assert!(matches!(err, CliError::Usage(m) if m.contains("--title cannot be empty")));
     }
 
     #[test]
     fn create_event_rejects_overlong_title() {
         let title = "a".repeat(MAX_TITLE_CHARS + 1);
-        let err = build_create_event(Uuid::new_v4(), &title, None, "x").unwrap_err();
+        let err =
+            build_create_event(Uuid::new_v4(), &title, None, "x", "community", &[]).unwrap_err();
         assert!(matches!(err, CliError::Usage(m) if m.contains("--title exceeds")));
     }
 
     #[test]
     fn create_event_rejects_overlong_summary() {
         let summary = "a".repeat(MAX_SUMMARY_CHARS + 1);
-        let err = build_create_event(Uuid::new_v4(), "T", Some(&summary), "x").unwrap_err();
+        let err = build_create_event(Uuid::new_v4(), "T", Some(&summary), "x", "community", &[])
+            .unwrap_err();
         assert!(matches!(err, CliError::Usage(m) if m.contains("--summary exceeds")));
     }
 
     #[test]
     fn create_event_rejects_oversized_markdown() {
         let content = "x".repeat(MAX_MARKDOWN_BYTES + 1);
-        let err = build_create_event(Uuid::new_v4(), "T", None, &content).unwrap_err();
+        let err =
+            build_create_event(Uuid::new_v4(), "T", None, &content, "community", &[]).unwrap_err();
         assert!(matches!(err, CliError::Usage(m) if m.contains("exceeds the relay's")));
     }
 
     #[test]
     fn create_event_accepts_markdown_at_exact_limit() {
         let content = "x".repeat(MAX_MARKDOWN_BYTES);
-        assert!(build_create_event(Uuid::new_v4(), "T", None, &content).is_ok());
+        assert!(build_create_event(Uuid::new_v4(), "T", None, &content, "community", &[]).is_ok());
     }
 
     // -- build_update_event --
@@ -908,8 +1059,9 @@ mod tests {
     fn update_event_has_expected_tags() {
         let board_id = Uuid::new_v4();
         let prev = sign(EventBuilder::new(Kind::TextNote, "")).id;
-        let event =
-            sign(build_update_event(board_id, prev, 4, Some("New Title"), None, "body").unwrap());
+        let event = sign(
+            build_update_event(board_id, prev, 4, Some("New Title"), None, "body", None).unwrap(),
+        );
         assert_eq!(tag_value(&event, "d"), Some(board_id.to_string().as_str()));
         assert_eq!(tag_value(&event, "op"), Some("update"));
         assert_eq!(tag_value(&event, "prev"), Some(prev.to_hex().as_str()));
@@ -921,7 +1073,8 @@ mod tests {
     #[test]
     fn update_event_omits_title_and_summary_when_both_none() {
         let prev = sign(EventBuilder::new(Kind::TextNote, "")).id;
-        let event = sign(build_update_event(Uuid::new_v4(), prev, 2, None, None, "").unwrap());
+        let event =
+            sign(build_update_event(Uuid::new_v4(), prev, 2, None, None, "", None).unwrap());
         assert!(tag_value(&event, "title").is_none());
         assert!(tag_value(&event, "summary").is_none());
     }
@@ -930,7 +1083,8 @@ mod tests {
     fn update_event_rejects_overlong_title() {
         let prev = sign(EventBuilder::new(Kind::TextNote, "")).id;
         let title = "a".repeat(MAX_TITLE_CHARS + 1);
-        let err = build_update_event(Uuid::new_v4(), prev, 2, Some(&title), None, "").unwrap_err();
+        let err =
+            build_update_event(Uuid::new_v4(), prev, 2, Some(&title), None, "", None).unwrap_err();
         assert!(matches!(err, CliError::Usage(m) if m.contains("--title exceeds")));
     }
 

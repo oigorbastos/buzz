@@ -103,6 +103,7 @@ export function useUpdateLabBoardMutation(boardId: string | null) {
       content: string;
       title?: string;
       summary?: string;
+      tags?: string[];
     }) => updateBoard(input),
     onSuccess: () => invalidateBoard(queryClient, boardId),
   });

@@ -2315,6 +2315,16 @@ impl Db {
         lab::get_board_head(&self.pool, community_id, board_id).await
     }
 
+    /// Returns whether a reader principal set may read a Lab Board.
+    pub async fn lab_board_can_read(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+        principals: &[Vec<u8>],
+    ) -> Result<bool> {
+        lab::board_can_read(&self.pool, community_id, board_id, principals).await
+    }
+
     /// Lists a Lab Board's revision history, newest first.
     pub async fn list_lab_board_revisions(
         &self,

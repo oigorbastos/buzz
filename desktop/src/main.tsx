@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
+import { isLabV2Preview } from "@/features/lab/previewMode";
 import "@fontsource-variable/inter/wght.css";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/700.css";
@@ -28,7 +29,7 @@ const ONBOARDING_COMPLETION_STORAGE_KEY_PREFIX = "buzz-onboarding-complete.v1:";
 const DEV_STATE_RESET_PARAM = "resetDevState";
 
 function resetDevWebviewStateFromUrl() {
-  if (!import.meta.env.DEV) {
+  if (!(import.meta.env.DEV || import.meta.env.MODE === "e2e")) {
     return;
   }
 
@@ -46,27 +47,45 @@ function resetDevWebviewStateFromUrl() {
   window.history.replaceState(window.history.state, "", url);
 }
 
-function configureDevE2eBridgeFromUrl() {
-  if (!import.meta.env.DEV) {
+function configureE2eBridgeFromUrl() {
+  if (!(import.meta.env.DEV || import.meta.env.MODE === "e2e")) {
     return;
   }
 
   const url = new URL(window.location.href);
-  if (url.searchParams.get("e2e") !== "mock") {
+  const isLabPreview = isLabV2Preview();
+  if (url.searchParams.get("e2e") !== "mock" && !isLabPreview) {
     return;
   }
 
   const e2eWindow = window as E2eWindow;
-  e2eWindow.__BUZZ_E2E__ ??= { mode: "mock" };
+  if (isLabPreview) {
+    // URL preview mode is intentionally mock-only. Overwrite any pre-bootstrap
+    // global so the hosted review cannot be pointed at a real relay from
+    // DevTools or a crafted page.
+    e2eWindow.__BUZZ_E2E__ = {
+      mode: "mock",
+      mock: { labPreview: true },
+    };
+  } else {
+    // Preserve the existing E2E bootstrap contract outside this preview.
+    e2eWindow.__BUZZ_E2E__ ??= { mode: "mock" };
+  }
 
   const community = {
     addedAt: new Date().toISOString(),
     id: E2E_COMMUNITY_ID,
-    name: "E2E Test",
+    name: isLabPreview ? "Buzz · Alis Preview" : "E2E Test",
     relayUrl: "ws://localhost:3000",
   };
   window.localStorage.setItem("buzz-communities", JSON.stringify([community]));
   window.localStorage.setItem("buzz-active-community-id", E2E_COMMUNITY_ID);
+  if (isLabPreview) {
+    window.localStorage.setItem(
+      "buzz-feature-overrides-v1",
+      JSON.stringify({ lab: true }),
+    );
+  }
   window.localStorage.setItem(
     `${ONBOARDING_COMPLETION_STORAGE_KEY_PREFIX}${E2E_DEFAULT_PUBKEY}`,
     "true",
@@ -113,7 +132,7 @@ async function installE2eBridgeIfConfigured() {
 
 async function bootstrap() {
   resetDevWebviewStateFromUrl();
-  configureDevE2eBridgeFromUrl();
+  configureE2eBridgeFromUrl();
   recoverLocalStorageQuotaOnStartup();
   await installE2eBridgeIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();

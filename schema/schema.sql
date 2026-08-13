@@ -1126,7 +1126,7 @@ INSERT INTO replica_heartbeat (id) VALUES (1);
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('replica_heartbeat', 'single-row replication freshness token; describes deployment topology, never tenant data');
 
--- ── Lab Boards (migrations 0029/0030) — community-wide, multi-writer ────────
+-- ── Lab Boards (migrations 0029/0030/0031) — community-scoped, multi-writer ─
 -- Markdown documents ("Quadros") with compare-and-swap (CAS) concurrency and
 -- full, append-only revision history. See migrations/0029_lab_boards.sql for
 -- the full design note (kind:40101 revisions, kind:30623 relay-signed heads)
@@ -1155,11 +1155,28 @@ CREATE TABLE lab_board_heads (
     archived_by               BYTEA CHECK (archived_by IS NULL OR length(archived_by) = 32),
     frozen_at                 TIMESTAMPTZ,
     frozen_by                 BYTEA CHECK (frozen_by IS NULL OR length(frozen_by) = 32),
-    PRIMARY KEY (community_id, board_id)
+    -- V2 read/write scope and canonical topic tags (migration 0031).
+    -- Mirrored here — and declared last, matching the ALTER TABLE append
+    -- order of that migration — so a schema.sql bootstrap, which never
+    -- replays migrations, is not silently born without private/read-only
+    -- boards or board tags. Keep in lockstep with
+    -- migrations/0031_lab_board_acl_tags.sql.
+    access_scope              TEXT NOT NULL DEFAULT 'community'
+                                   CHECK (access_scope IN ('community', 'community_readonly', 'private')),
+    owner_pubkey              BYTEA CHECK (owner_pubkey IS NULL OR length(owner_pubkey) = 32),
+    tags                      TEXT[] NOT NULL DEFAULT '{}'::TEXT[]
+                                   CHECK (cardinality(tags) <= 12),
+    PRIMARY KEY (community_id, board_id),
+    CONSTRAINT lab_board_heads_restricted_owner_ck
+        CHECK (access_scope = 'community' OR owner_pubkey IS NOT NULL)
 );
 
 CREATE INDEX idx_lab_board_heads_status ON lab_board_heads (community_id, status);
 CREATE INDEX idx_lab_board_heads_updated_at ON lab_board_heads (community_id, updated_at DESC);
+CREATE INDEX idx_lab_board_heads_acl
+    ON lab_board_heads (community_id, access_scope, owner_pubkey);
+CREATE INDEX idx_lab_board_heads_tags
+    ON lab_board_heads USING GIN (tags);
 
 CREATE TABLE lab_board_revisions (
     community_id   UUID NOT NULL REFERENCES communities(id),
@@ -1190,7 +1207,7 @@ CREATE INDEX idx_lab_board_revisions_board_history
 CREATE INDEX idx_lab_board_revisions_author
     ON lab_board_revisions (community_id, author_pubkey, accepted_at DESC);
 
--- ── Whole-community deletion control plane (migration 0031, ported from ────
+-- ── Whole-community deletion control plane (migration 0032, ported from ────
 -- ── upstream's 0029_community_deletion.sql; renumbered on this fork ─────────
 -- ── because 0029/0030 are this fork's own Lab boards migrations) ────────────
 CREATE TABLE community_deletion_requests (

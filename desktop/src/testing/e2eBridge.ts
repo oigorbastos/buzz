@@ -9,6 +9,12 @@ import {
   handleSaveCustomHarness,
   handleDeleteCustomHarness,
 } from "./e2eBridgeCustomHarnesses.ts";
+import {
+  isMockLabQuery,
+  publishMockLabRevision,
+  queryMockLabBoards,
+  resetMockLabBoards,
+} from "./mockLabBoards.ts";
 
 import { relayClient } from "@/shared/api/relayClient";
 import { activateRateLimit } from "@/shared/api/relayRateLimitGate";
@@ -169,6 +175,8 @@ type MockHuddleSeed = {
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
+    /** Enables the isolated Lab v2 UX review store in browser previews. */
+    labPreview?: boolean;
     /** Tauri window label exposed to the app. Defaults to the main window. */
     windowLabel?: string;
     ttsSettings?: {
@@ -9616,6 +9624,14 @@ function sendToMockSocket(args: {
       return;
     }
 
+    if (isMockLabQuery(filters)) {
+      for (const event of queryMockLabBoards(filters)) {
+        sendWsText(socket.handler, ["EVENT", subId, event]);
+      }
+      sendWsText(socket.handler, ["EOSE", subId]);
+      return;
+    }
+
     if (filter.kinds?.includes(KIND_EMOJI_SET)) {
       // Honor `authors` so `fetchOwnEmoji` (authors:[me]) sees only the
       // caller's set, while the union fetch (no authors) sees every member's —
@@ -9841,6 +9857,20 @@ function sendToMockSocket(args: {
       return;
     }
 
+    const labPublish = publishMockLabRevision(
+      event,
+      getMockMemberPubkey(getConfig()),
+    );
+    if (labPublish) {
+      sendWsText(socket.handler, [
+        "OK",
+        event.id,
+        labPublish.accepted,
+        labPublish.message,
+      ]);
+      return;
+    }
+
     if (isMockProjectScopedEvent(event)) {
       if (event.pubkey !== DEFAULT_MOCK_IDENTITY.pubkey) {
         sendWsText(socket.handler, [
@@ -9972,6 +10002,10 @@ export function maybeInstallE2eTauriMocks() {
   resetMockUserStatuses();
   resetMockPersonaCatalogEvents(config);
   resetMockSaveSubscriptions(config);
+  resetMockLabBoards({
+    enabled: config.mock?.labPreview === true,
+    viewerPubkey: getMockMemberPubkey(config),
+  });
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;

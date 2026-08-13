@@ -1,3 +1,4 @@
+import { Check, Eye, LockKeyhole, Users } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -5,7 +6,9 @@ import {
   MAX_TITLE_CHARS,
   validateBoardInput,
 } from "@/features/lab/api";
+import type { LabBoardAccess } from "@/features/lab/model";
 import { LabMarkdownEditor } from "@/features/lab/ui/LabMarkdownEditor";
+import { LabTagInput } from "@/features/lab/ui/LabTagInput";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
@@ -23,6 +26,8 @@ type CreateLabBoardDialogProps = {
     title: string;
     summary?: string;
     content: string;
+    access: LabBoardAccess;
+    tags: string[];
   }) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
@@ -37,6 +42,8 @@ export function CreateLabBoardDialog({
   const [title, setTitle] = React.useState("");
   const [summary, setSummary] = React.useState("");
   const [content, setContent] = React.useState("");
+  const [access, setAccess] = React.useState<LabBoardAccess>("community");
+  const [tags, setTags] = React.useState<string[]>([]);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const titleInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -45,6 +52,8 @@ export function CreateLabBoardDialog({
     setTitle("");
     setSummary("");
     setContent("");
+    setAccess("community");
+    setTags([]);
     setErrorMessage(null);
     const timerId = globalThis.setTimeout(() => {
       titleInputRef.current?.focus();
@@ -61,6 +70,7 @@ export function CreateLabBoardDialog({
       title: trimmedTitle,
       summary: summary.trim() || undefined,
       content,
+      tags,
     });
     if (validationError) {
       setErrorMessage(validationError);
@@ -73,6 +83,8 @@ export function CreateLabBoardDialog({
         title: trimmedTitle,
         summary: summary.trim() || undefined,
         content,
+        access,
+        tags,
       });
       onOpenChange(false);
     } catch (error) {
@@ -90,11 +102,13 @@ export function CreateLabBoardDialog({
       }}
       open={open}
     >
+      {/* max-w-3xl, not the V2 chooser's max-w-2xl: the Markdown editor
+          renders a live preview beside the textarea and needs the width. */}
       <ChooserDialogContent
         className="max-w-3xl"
         contentClassName="pt-3"
         data-testid="create-lab-board-dialog"
-        description="Boards are shared: everyone in this community can read and edit them."
+        description="Choose who can find, read, and edit this board."
         footer={
           <div className="flex w-full items-center justify-end gap-3">
             <Button
@@ -145,6 +159,52 @@ export function CreateLabBoardDialog({
                 value={title}
               />
             </div>
+          </div>
+
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-medium text-foreground">
+              Board access
+            </legend>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <EditPolicyOption
+                checked={access === "community"}
+                description="Everyone in the community can read and edit."
+                icon={<Users className="h-4 w-4" />}
+                label="Community"
+                onSelect={() => setAccess("community")}
+              />
+              <EditPolicyOption
+                checked={access === "community_readonly"}
+                description="Everyone can find and read. Only you and your agents can edit."
+                icon={<Eye className="h-4 w-4" />}
+                label="Read-only"
+                onSelect={() => setAccess("community_readonly")}
+              />
+              <EditPolicyOption
+                checked={access === "private"}
+                description="Only you and your agents can find, read, and edit."
+                icon={<LockKeyhole className="h-4 w-4" />}
+                label="Private"
+                onSelect={() => setAccess("private")}
+              />
+            </div>
+          </fieldset>
+
+          <div className="space-y-1.5">
+            <label
+              className="text-sm font-medium text-foreground"
+              htmlFor="create-lab-board-tags"
+            >
+              Tags
+              <span className="ml-1 text-xs font-normal text-muted-foreground/50">
+                optional
+              </span>
+            </label>
+            <LabTagInput
+              id="create-lab-board-tags"
+              onChange={setTags}
+              tags={tags}
+            />
           </div>
 
           <div className="space-y-1.5">
@@ -203,5 +263,49 @@ export function CreateLabBoardDialog({
         </form>
       </ChooserDialogContent>
     </Dialog>
+  );
+}
+
+function EditPolicyOption({
+  checked,
+  description,
+  icon,
+  label,
+  onSelect,
+}: {
+  checked: boolean;
+  description: string;
+  icon: React.ReactNode;
+  label: string;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      aria-pressed={checked}
+      className={cn(
+        "relative rounded-xl border p-3 text-left transition-colors",
+        checked
+          ? "border-primary/45 bg-primary/8"
+          : "border-border/70 bg-muted/20 hover:bg-muted/40",
+      )}
+      data-testid={`create-lab-board-policy-${checked ? "selected" : "option"}-${label.toLowerCase().replaceAll(" ", "-")}`}
+      onClick={onSelect}
+      type="button"
+    >
+      <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+        <span
+          className={cn("text-muted-foreground", checked && "text-primary")}
+        >
+          {icon}
+        </span>
+        {label}
+      </span>
+      <span className="mt-1 block pr-5 text-xs leading-relaxed text-muted-foreground">
+        {description}
+      </span>
+      {checked ? (
+        <Check className="absolute right-3 top-3 h-4 w-4 text-primary" />
+      ) : null}
+    </button>
   );
 }

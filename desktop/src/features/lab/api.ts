@@ -1,10 +1,13 @@
 /**
  * Lab Boards ("Quadros") — relay access layer.
  *
- * A Lab Board is a community-wide, multi-writer Markdown document. Every
- * member can edit any board, so concurrency is settled by the relay with
- * compare-and-swap rather than by last-write-wins: each mutation names the
- * revision it was based on (`prev`), and the relay rejects it with
+ * A Lab Board is a Markdown document with one immutable access scope.
+ * Community boards are readable and writable by every community member;
+ * read-only boards are community-readable but writable only by their owner
+ * family; private boards are visible and writable only to their canonical
+ * human owner and that owner's managed agents. Concurrency is settled by the
+ * relay with compare-and-swap rather than by last-write-wins: each mutation
+ * names the revision it was based on (`prev`), and the relay rejects it with
  * `BOARD_HEAD_MISMATCH` if that is no longer the head.
  *
  * Two kinds (see `@/shared/constants/kinds` for the full contract):
@@ -24,6 +27,7 @@ import {
   KIND_LAB_BOARD_HEAD,
   KIND_LAB_BOARD_REVISION,
 } from "@/shared/constants/kinds";
+import { type LabBoardAccess, normalizeBoardTags } from "@/features/lab/model";
 
 /** Relay-enforced caps, mirrored so the UI can fail before a round trip. */
 export const MAX_TITLE_CHARS = 160;
@@ -43,6 +47,11 @@ export type LabBoardHead = {
   content: string;
   revision: number;
   status: LabBoardStatus;
+  /** Who may discover, read history, receive updates, and write. */
+  access: LabBoardAccess;
+  /** Canonical human owner, derived and signed by the relay. */
+  ownerPubkey: string | null;
+  tags: string[];
   /** Event id of the kind:40101 revision this projection reflects — the CAS token. */
   headEventId: string;
   updatedAt: number;
@@ -66,6 +75,12 @@ function tagValue(event: RelayEvent, name: string): string | null {
   return tag?.[1] ?? null;
 }
 
+function tagValues(event: RelayEvent, name: string): string[] {
+  return event.tags
+    .filter((entry) => entry[0] === name && entry[1])
+    .map((entry) => entry[1] as string);
+}
+
 function parseIntTag(event: RelayEvent, name: string): number | null {
   const raw = tagValue(event, name);
   if (raw === null) return null;
@@ -75,6 +90,34 @@ function parseIntTag(event: RelayEvent, name: string): number | null {
 
 function parseStatus(raw: string | null): LabBoardStatus {
   return raw === "archived" || raw === "frozen" ? raw : "active";
+}
+
+function parseAccess(
+  raw: string | null,
+  legacyEditPolicy: string | null,
+): LabBoardAccess | null {
+  let canonical: LabBoardAccess | null = null;
+  if (raw !== null) {
+    if (
+      raw !== "community" &&
+      raw !== "community_readonly" &&
+      raw !== "private"
+    ) {
+      return null;
+    }
+    canonical = raw;
+  }
+
+  const legacy: LabBoardAccess | null =
+    legacyEditPolicy === "owner_agents" ? "community_readonly" : null;
+  if (legacyEditPolicy !== null && legacy === null) return null;
+
+  if (canonical && legacy && canonical !== legacy) return null;
+  return canonical ?? legacy ?? "community";
+}
+
+function isValidPubkey(raw: string | null): raw is string {
+  return raw !== null && /^[0-9a-f]{64}$/i.test(raw);
 }
 
 /**
@@ -89,7 +132,20 @@ export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
   const boardId = tagValue(event, "d");
   const headEventId = tagValue(event, "head");
   const revision = parseIntTag(event, "revision");
-  if (!boardId || !headEventId || revision === null) return null;
+  const access = parseAccess(
+    tagValue(event, "access_scope"),
+    tagValue(event, "edit_policy"),
+  );
+  const ownerPubkey = tagValue(event, "owner");
+  if (
+    !boardId ||
+    !headEventId ||
+    revision === null ||
+    access === null ||
+    (access !== "community" && !isValidPubkey(ownerPubkey))
+  ) {
+    return null;
+  }
 
   return {
     boardId,
@@ -98,6 +154,9 @@ export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
     content: event.content,
     revision,
     status: parseStatus(tagValue(event, "status")),
+    access,
+    ownerPubkey,
+    tags: normalizeBoardTags(tagValues(event, "t")),
     headEventId,
     updatedAt: event.created_at,
   };
@@ -160,7 +219,9 @@ export function eventMatchesBoard(event: RelayEvent, boardId: string): boolean {
 }
 
 /**
- * List every board in the community, most recently updated first.
+ * List every board the authenticated actor may access, most recently updated
+ * first. The relay must apply board authorization before its limit;
+ * this client-side parser is only defence in depth.
  *
  * Safe to filter server-side by kind alone: 30623 is NIP-33, and we want all
  * `d` values, so no `#d` constraint is involved.
@@ -173,7 +234,9 @@ export async function fetchBoardHeads(): Promise<LabBoardHead[]> {
   return events
     .map(parseBoardHead)
     .filter((head): head is LabBoardHead => head !== null)
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+    .sort(
+      (a, b) => b.updatedAt - a.updatedAt || a.boardId.localeCompare(b.boardId),
+    );
 }
 
 /**
@@ -235,6 +298,7 @@ export function validateBoardInput(input: {
   title?: string;
   summary?: string;
   content: string;
+  tags?: string[];
 }): string | null {
   if (input.title !== undefined && input.title.trim().length === 0) {
     return "Title cannot be empty.";
@@ -250,6 +314,13 @@ export function validateBoardInput(input: {
   }
   if (new TextEncoder().encode(input.content).length > MAX_MARKDOWN_BYTES) {
     return `Content is limited to ${MAX_MARKDOWN_BYTES / 1024} KB.`;
+  }
+  if (
+    input.tags !== undefined &&
+    (normalizeBoardTags(input.tags).length !== input.tags.length ||
+      normalizeBoardTags(input.tags).some((tag) => [...tag].length > 32))
+  ) {
+    return "Tags must be unique, non-empty, and within the supported limits.";
   }
   return null;
 }
@@ -285,16 +356,23 @@ export async function createBoard(input: {
   title: string;
   summary?: string;
   content: string;
+  access: LabBoardAccess;
+  tags: string[];
 }): Promise<{ boardId: string; eventId: string }> {
   const boardId = crypto.randomUUID();
   const tags: string[][] = [
     ["d", boardId],
-    ["op", "create"],
+    // V2 deliberately fails closed on an older relay instead of letting it
+    // ignore a restricted scope and create a community-writable board.
+    ["op", "create_v2"],
     ["revision", "1"],
     ["title", input.title.trim()],
+    ["access_scope", input.access],
+    ["tags", "replace"],
   ];
   const summary = input.summary?.trim();
   if (summary) tags.push(["summary", summary]);
+  for (const tag of normalizeBoardTags(input.tags)) tags.push(["t", tag]);
 
   const eventId = await publishRevision(input.content, tags);
   return { boardId, eventId };
@@ -311,15 +389,20 @@ export async function updateBoard(input: {
   content: string;
   title?: string;
   summary?: string;
+  tags?: string[];
 }): Promise<string> {
   const tags: string[][] = [
     ["d", input.head.boardId],
-    ["op", "update"],
+    ["op", input.tags === undefined ? "update" : "update_v2"],
     ["prev", input.head.headEventId],
     ["revision", String(input.head.revision + 1)],
   ];
   if (input.title !== undefined) tags.push(["title", input.title.trim()]);
   if (input.summary !== undefined) tags.push(["summary", input.summary.trim()]);
+  if (input.tags !== undefined) {
+    tags.push(["tags", "replace"]);
+    for (const tag of normalizeBoardTags(input.tags)) tags.push(["t", tag]);
+  }
 
   return publishRevision(input.content, tags);
 }

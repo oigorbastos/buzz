@@ -1007,6 +1007,16 @@ async fn query_events_authed(
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
 
+    let lab_reader_principals = if crate::handlers::req::filters_request_lab_kinds(&filters) {
+        Some(
+            crate::handlers::lab::lab_reader_principals(state, tenant.community(), &pubkey_bytes)
+                .await
+                .map_err(|e| internal_error(&format!("lab ACL lookup: {e}")))?,
+        )
+    } else {
+        None
+    };
+
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
             return Err(api_error(
@@ -1022,6 +1032,7 @@ async fn query_events_authed(
             tenant,
             &authed_pubkey_hex,
             &pubkey_bytes,
+            lab_reader_principals.as_deref().unwrap_or(&[]),
         )
         .await;
     }
@@ -1241,6 +1252,9 @@ async fn query_events_authed(
         if crate::handlers::req::filter_can_match_shared_gated_kinds(filter) {
             query.shared_gated_reader = Some(pubkey_bytes.clone());
         }
+        if crate::handlers::req::filter_can_match_lab_kinds(filter) {
+            query.lab_reader_pubkeys = lab_reader_principals.clone();
+        }
 
         match extract_before_id(raw) {
             BeforeId::Malformed => {
@@ -1306,6 +1320,18 @@ async fn query_events_authed(
                     // covers all three gated event classes.
                     if !crate::handlers::req::event_visible_to_reader(&se.event, &pubkey_bytes) {
                         continue;
+                    }
+                    if let Some(ref principals) = lab_reader_principals {
+                        if !crate::handlers::req::lab_event_visible_to_reader(
+                            state,
+                            tenant.community(),
+                            &se.event,
+                            principals,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                     }
                     if let Ok(v) = serde_json::to_value(&se.event) {
                         events.push(v);
@@ -1440,6 +1466,16 @@ async fn count_events_authed(
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
 
+    let lab_reader_principals = if crate::handlers::req::filters_request_lab_kinds(&filters) {
+        Some(
+            crate::handlers::lab::lab_reader_principals(state, tenant.community(), &pubkey_bytes)
+                .await
+                .map_err(|e| internal_error(&format!("lab ACL lookup: {e}")))?,
+        )
+    } else {
+        None
+    };
+
     let mut total: u64 = 0;
     for filter in &filters {
         let needs_author_only_filtering =
@@ -1476,6 +1512,9 @@ async fn count_events_authed(
             // the fallback's query_events call doesn't over-fetch private rows.
             if needs_shared_gate_filtering {
                 query.shared_gated_reader = Some(pubkey_bytes.clone());
+            }
+            if crate::handlers::req::filter_can_match_lab_kinds(filter) {
+                query.lab_reader_pubkeys = lab_reader_principals.clone();
             }
             let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
                 !authors.is_empty()
@@ -1522,6 +1561,18 @@ async fn count_events_authed(
                             ) {
                                 continue;
                             }
+                            if let Some(ref principals) = lab_reader_principals {
+                                if !crate::handlers::req::lab_event_visible_to_reader(
+                                    state,
+                                    tenant.community(),
+                                    &se.event,
+                                    principals,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                            }
                             total += 1;
                         }
                     }
@@ -1545,6 +1596,9 @@ async fn count_events_authed(
             // the fallback query_events path.
             if needs_shared_gate_filtering {
                 query.shared_gated_reader = Some(pubkey_bytes.clone());
+            }
+            if crate::handlers::req::filter_can_match_lab_kinds(filter) {
+                query.lab_reader_pubkeys = lab_reader_principals.clone();
             }
 
             let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
@@ -1591,6 +1645,18 @@ async fn count_events_authed(
                                 &pubkey_bytes,
                             ) {
                                 continue;
+                            }
+                            if let Some(ref principals) = lab_reader_principals {
+                                if !crate::handlers::req::lab_event_visible_to_reader(
+                                    state,
+                                    tenant.community(),
+                                    &se.event,
+                                    principals,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
                             }
                             total += 1;
                         }
@@ -1644,6 +1710,7 @@ fn search_hit_accepted(
 
 /// Handle search filters by routing to Postgres FTS, then fetching full events
 /// from DB. Supports a bridge-only `page` extension over the FTS result set.
+#[allow(clippy::too_many_arguments)]
 async fn handle_bridge_search(
     state: &AppState,
     raw_filters: &[Value],
@@ -1652,6 +1719,7 @@ async fn handle_bridge_search(
     tenant: &buzz_core::tenant::TenantContext,
     reader_pubkey_hex: &str,
     pubkey_bytes: &[u8],
+    lab_reader_principals: &[Vec<u8>],
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Bridge always includes global (channel-less) events — same as WS with
     // full scopes. `None` means no accessible channels and no global access →
@@ -1771,6 +1839,16 @@ async fn handle_bridge_search(
             // check here ensures that a future FTS allowlist change cannot silently
             // reopen the bypass.
             if !crate::handlers::req::event_visible_to_reader(&stored.event, pubkey_bytes) {
+                continue;
+            }
+            if !crate::handlers::req::lab_event_visible_to_reader(
+                state,
+                tenant.community(),
+                &stored.event,
+                lab_reader_principals,
+            )
+            .await
+            {
                 continue;
             }
             // Dedup across filters.

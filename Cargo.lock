@@ -963,6 +963,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-normalization",
  "url",
  "uuid",
 ]
@@ -1266,6 +1267,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "uuid",
 ]

@@ -432,7 +432,12 @@ jobs:
             7z a -tzip -mx=9 "$ZIP_PATH" ./* >/dev/null
           )
           7z t "$ZIP_PATH" >/dev/null
-          ZIP_SHA=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          # Hash a bare relative name from inside the directory, exactly like
+          # SHA256SUMS.txt above. Handing sha256sum the Windows-style absolute
+          # path makes it escape the backslashes and prefix the whole line with
+          # a literal "\", which then leaked into ZIP-SHA256.txt as
+          # "SHA256=\c1edc7...".
+          ZIP_SHA=$(cd "$RELEASE_ROOT" && sha256sum "$ZIP_NAME" | awk '{print $1}')
           ZIP_SIZE=$(stat -c '%s' "$ZIP_PATH")
           cat > "$RELEASE_ROOT/ZIP-SHA256.txt" <<EOF
           SHA256=$ZIP_SHA

@@ -627,13 +627,16 @@ mod tests {
 
         // Bumped to 30 by 0029_lab_boards.sql (CAS gate) and
         // 0030_lab_board_d_tag_backfill.sql (d_tag pushdown for kind:40101),
-        // then to 32 by 0031_community_deletion.sql (durable whole-community
+        // then to 31 by 0031_lab_board_acl_tags.sql (Lab V2 ACL and tags),
+        // then to 33 by 0032_community_deletion.sql (durable whole-community
         // deletion engine, ported from upstream's 0029 — renumbered to avoid
-        // colliding with this fork's own 0029/0030) and
-        // 0032_community_deletion_recovery.sql (ported from upstream's 0030).
+        // colliding with this fork's own 0029/0030/0031) and
+        // 0033_community_deletion_recovery.sql (ported from upstream's 0030).
+        // 0031 is PINNED: it is already applied in production, so the ported
+        // deletion pair had to take 0032/0033 rather than displace it.
         // This count is a deliberate tripwire: adding a migration must be a
         // conscious act, so update it in the same commit that adds one.
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1009,12 +1012,24 @@ mod tests {
         );
         assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
 
+        // This fork owns 0031 for the Lab V2 board ACL and tags. It is
+        // already applied in production, so it is PINNED — nothing may take
+        // this slot, and the ported deletion pair below had to move up.
+        assert_eq!(migrations[30].version, 31);
+        let lab_board_acl_tags = migrations[30].sql.as_str();
+        assert!(lab_board_acl_tags.contains("ALTER TABLE lab_board_heads"));
+        assert!(lab_board_acl_tags.contains("access_scope"));
+        assert!(lab_board_acl_tags.contains("owner_pubkey"));
+        assert!(lab_board_acl_tags.contains("tags"));
+        assert!(desired_schema.contains("access_scope"));
+
         // Durable whole-community deletion control plane and universal DB
         // fence. Ported from upstream as 0029_community_deletion.sql and
-        // renumbered to 0031 on this fork — 0029/0030 are already taken by
-        // this fork's own Lab boards migrations (see comment above).
-        assert_eq!(migrations[30].version, 31);
-        let deletion = migrations[30].sql.as_str();
+        // renumbered to 0032 on this fork — 0029/0030 are already taken by
+        // this fork's own Lab boards migrations (see comment above) and 0031
+        // by the Lab V2 ACL/tags migration that is live in production.
+        assert_eq!(migrations[31].version, 32);
+        let deletion = migrations[31].sql.as_str();
         assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
         assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
@@ -1043,10 +1058,10 @@ mod tests {
         assert!(desired_schema.contains("retry_stage TEXT CHECK"));
 
         // Recovery migration (ported from upstream's 0030, renumbered to
-        // 0032 on this fork) alters populated tables and must preserve the
+        // 0033 on this fork) alters populated tables and must preserve the
         // same fail-fast lock behavior as the deletion migration.
-        assert_eq!(migrations[31].version, 32);
-        let deletion_recovery = migrations[31].sql.as_str();
+        assert_eq!(migrations[32].version, 33);
+        let deletion_recovery = migrations[32].sql.as_str();
         assert!(deletion_recovery.contains("SET LOCAL lock_timeout = '5s'"));
     }
 
@@ -1295,15 +1310,15 @@ mod tests {
         );
     }
 
-    /// Structural parity between migration 0031's deletion surface and the
+    /// Structural parity between migration 0032's deletion surface and the
     /// desired-state bootstrap schema (`schema/schema.sql`).
     ///
     /// Compares parsed statements, not substrings: every deletion control-
-    /// plane table, function, trigger, and index 0028 creates must exist in
+    /// plane table, function, trigger, and index 0032 creates must exist in
     /// schema.sql with an identical normalized definition; every operator-
-    /// global registry row 0028 inserts must be inserted by schema.sql; the
+    /// global registry row 0032 inserts must be inserted by schema.sql; the
     /// write-fence attachment target sets must be equal; and every column
-    /// 0028 adds to `communities` must exist in the desired-state
+    /// 0032 adds to `communities` must exist in the desired-state
     /// `communities` table. A desired-state bootstrap that passes this test
     /// cannot silently omit part of the deletion surface the way the
     /// pre-parity schema.sql omitted `community_deletion_manifest_keys` (and
@@ -1311,7 +1326,7 @@ mod tests {
     /// healthy, then wedging post-fence when the freeze stage first touched
     /// the missing relation.
     #[test]
-    fn deletion_surface_parity_between_migration_0031_and_schema_sql() {
+    fn deletion_surface_parity_between_migration_0032_and_schema_sql() {
         use std::collections::BTreeMap;
 
         #[derive(Default)]
@@ -1403,12 +1418,13 @@ mod tests {
         }
 
         // Ported from upstream's migrations/0029_community_deletion.sql,
-        // renumbered to 0031 on this fork (0029/0030 are this fork's own
-        // Lab boards migrations).
-        let migration_0031: &str = MIGRATOR
+        // renumbered to 0032 on this fork (0029/0030 are this fork's own
+        // Lab boards migrations, 0031 is the Lab V2 ACL/tags migration that
+        // is already applied in production and may never be displaced).
+        let migration_0032: &str = MIGRATOR
             .iter()
-            .find(|migration| migration.version == 31)
-            .expect("embedded migration 0031 (ported community deletion, upstream's 0029)")
+            .find(|migration| migration.version == 32)
+            .expect("embedded migration 0032 (ported community deletion, upstream's 0029)")
             .sql
             .as_ref();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1418,13 +1434,13 @@ mod tests {
         let schema_sql = std::fs::read_to_string(workspace_root.join("schema/schema.sql"))
             .expect("read schema/schema.sql");
 
-        let migration = surface(migration_0031);
+        let migration = surface(migration_0032);
         let schema = surface(&schema_sql);
 
         assert_eq!(
             migration.tables.len(),
             7,
-            "0031 (ported community deletion) control plane must define exactly the known tables: {:?}",
+            "0032 (ported community deletion) control plane must define exactly the known tables: {:?}",
             migration.tables.keys().collect::<Vec<_>>()
         );
         assert!(!migration.fence_attachments.is_empty());
@@ -1438,7 +1454,7 @@ mod tests {
             if table != "community_deletion_requests" {
                 assert_eq!(
                     in_schema, definition,
-                    "schema.sql definition of {table} drifted from migration 0031 (ported community deletion)"
+                    "schema.sql definition of {table} drifted from migration 0032 (ported community deletion)"
                 );
             }
         }
@@ -1450,7 +1466,7 @@ mod tests {
             if function != "community_write_fence_excluded_table" {
                 assert_eq!(
                     in_schema, definition,
-                    "schema.sql definition of {function}() drifted from migration 0031 (ported community deletion)"
+                    "schema.sql definition of {function}() drifted from migration 0032 (ported community deletion)"
                 );
             }
         }
@@ -1461,7 +1477,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("schema.sql is missing deletion trigger {trigger}"));
             assert_eq!(
                 in_schema, definition,
-                "schema.sql definition of trigger {trigger} drifted from migration 0031 (ported community deletion)"
+                "schema.sql definition of trigger {trigger} drifted from migration 0032 (ported community deletion)"
             );
         }
         for index in &migration.indexes {
@@ -1484,7 +1500,7 @@ mod tests {
             "write-fence attachment targets differ after recovery policy"
         );
 
-        // 0031's ALTER TABLE additions are expressed inline by the
+        // 0032's ALTER TABLE additions are expressed inline by the
         // desired-state `communities` definition; require the columns to
         // exist there (exact definition equality is impossible across the
         // ALTER/inline representations — behavior is pinned by the
