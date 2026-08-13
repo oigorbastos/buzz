@@ -129,3 +129,68 @@ describe("Lab board model", () => {
     );
   });
 });
+
+describe("Lab board archive visibility", () => {
+  const boards = [
+    {
+      id: "live",
+      access: "community",
+      ownerPubkey: null,
+      status: "active",
+      tags: ["roadmap"],
+    },
+    {
+      id: "smoke-test",
+      access: "community",
+      ownerPubkey: null,
+      status: "archived",
+      tags: ["roadmap"],
+    },
+    {
+      id: "frozen",
+      access: "community",
+      ownerPubkey: null,
+      status: "frozen",
+      tags: [],
+    },
+    // A V1 head with no status tag at all must not vanish from the list.
+    { id: "legacy", access: "community", ownerPubkey: null, tags: [] },
+  ];
+
+  function ids(input) {
+    return filterLabBoards({
+      boards,
+      currentPubkey: VIEWER,
+      filter: "all",
+      tag: null,
+      ...input,
+    }).map((board) => board.id);
+  }
+
+  it("hides archived boards by default and keeps every other status", () => {
+    assert.deepEqual(ids({}), ["live", "frozen", "legacy"]);
+    assert.deepEqual(ids({ includeArchived: false }), [
+      "live",
+      "frozen",
+      "legacy",
+    ]);
+  });
+
+  it("reveals archived boards when the toggle is on", () => {
+    assert.deepEqual(ids({ includeArchived: true }), [
+      "live",
+      "smoke-test",
+      "frozen",
+      "legacy",
+    ]);
+  });
+
+  it("still applies access and tag filters to revealed archived boards", () => {
+    // Archiving must not become a way to escape the ACL or the tag filter.
+    assert.deepEqual(ids({ includeArchived: true, tag: "roadmap" }), [
+      "live",
+      "smoke-test",
+    ]);
+    assert.deepEqual(ids({ includeArchived: true, filter: "private" }), []);
+  });
+});

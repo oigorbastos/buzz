@@ -24,6 +24,10 @@ import { relayClient } from "@/shared/api/relayClient";
 import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  isRelayUnreachableError,
+  RELAY_UNREACHABLE_SHORT,
+} from "@/shared/lib/relayError";
+import {
   KIND_LAB_BOARD_HEAD,
   KIND_LAB_BOARD_REVISION,
 } from "@/shared/constants/kinds";
@@ -430,4 +434,106 @@ export async function restoreBoardRevision(input: {
     ["restored_from", String(input.revision.revision)],
   ];
   return publishRevision(input.revision.content, tags);
+}
+
+/**
+ * Archive or unarchive a board — a *moderation* op, not a content mutation.
+ *
+ * Wire shape read off `parse_lab_board_envelope`
+ * (`crates/buzz-relay/src/handlers/lab.rs`). A moderation op carries `d` and
+ * `op` and nothing else:
+ * - `prev` is required for `update`/`restore` only; the parser explicitly
+ *   ignores it here, and `handle_moderation_op` never compares it. Sending one
+ *   would imply a compare-and-swap the relay does not perform.
+ * - `revision` is parsed but cross-checked only inside
+ *   `handle_content_mutation`. The head keeps its current revision number
+ *   across a status flip, so any value we sent would be a claim about a
+ *   revision that is not being created.
+ * - `access_scope`, the `tags` marker, `t` tags and `restored_from` are
+ *   *rejected* outside their own ops, so they must be absent.
+ *
+ * Content is empty for the same reason: the relay re-signs the kind:30623
+ * projection from the existing head's Markdown, so any text here would be
+ * recorded as an event body that never became board content.
+ */
+export function boardModerationTags(input: {
+  boardId: string;
+  archived: boolean;
+}): string[][] {
+  return [
+    ["d", input.boardId],
+    ["op", input.archived ? "archive" : "unarchive"],
+  ];
+}
+
+export async function setBoardArchived(input: {
+  head: LabBoardHead;
+  archived: boolean;
+}): Promise<string> {
+  return publishRevision(
+    "",
+    boardModerationTags({
+      boardId: input.head.boardId,
+      archived: input.archived,
+    }),
+  );
+}
+
+/**
+ * True when the relay refused a moderation op because the actor holds no
+ * community role.
+ *
+ * The client cannot predict this: authority lives in the relay's
+ * `relay_members` table, which no client API exposes per-board. Managed
+ * (NIP-OA) agents in particular are never members in their own right — they
+ * authenticate by owner delegation — so an agent identity always lands here.
+ */
+export function isBoardModerationDeniedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("moderator access required") ||
+    message.includes("not a relay member")
+  );
+}
+
+export const BOARD_MODERATION_DENIED_MESSAGE =
+  "Only a community owner or admin can archive a board, and the relay refused this identity. Managed agents never hold that role — archive from your own account instead.";
+
+/** Drop the relay's machine prefix so a fallback reads as a sentence. */
+function stripRelayPrefix(message: string): string {
+  return message
+    .replace(/^\s*(invalid|restricted|error|rate-limited):\s*/i, "")
+    .trim();
+}
+
+/**
+ * Turn a rejected archive/unarchive into something a person can act on.
+ *
+ * Every branch returns prose: a raw `invalid: cannot archive a lab board with
+ * status 'frozen' (expected 'active')` in a red box is indistinguishable from
+ * a crash to the person reading it.
+ */
+export function describeBoardModerationError(
+  error: unknown,
+  intent: "archive" | "unarchive",
+): string {
+  const fallback =
+    intent === "archive"
+      ? "Failed to archive this board."
+      : "Failed to unarchive this board.";
+  if (isRelayUnreachableError(error)) return RELAY_UNREACHABLE_SHORT;
+  if (isBoardModerationDeniedError(error)) {
+    return BOARD_MODERATION_DENIED_MESSAGE;
+  }
+  if (!(error instanceof Error)) return fallback;
+  const message = error.message.toLowerCase();
+  if (message.includes("expected '")) {
+    return "This board's status changed since the page loaded. Reopen it and try again.";
+  }
+  if (message.includes("rate-limited")) {
+    return "Too many board writes right now. Wait a minute and try again.";
+  }
+  const detail = stripRelayPrefix(error.message);
+  return detail ? `${fallback} ${detail}` : fallback;
 }

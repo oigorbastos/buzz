@@ -1,10 +1,14 @@
 import { useNavigate } from "@tanstack/react-router";
-import { Plus, Tag } from "lucide-react";
+import { Archive, Plus, Tag } from "lucide-react";
 import * as React from "react";
 
+import { describeBoardModerationError } from "@/features/lab/api";
+import { canModerateBoards } from "@/features/lab/boardStatus";
+import { useMyRelayMembershipQuery } from "@/features/community-members/hooks";
 import {
   useCreateLabBoardMutation,
   useLabBoardsQuery,
+  useSetLabBoardArchivedMutation,
 } from "@/features/lab/hooks";
 import {
   availableBoardTags,
@@ -46,6 +50,13 @@ export function LabScreen() {
   const [isCreateOpen, setIsCreateOpen] = React.useState(false);
   const [listFilter, setListFilter] = React.useState<LabBoardListFilter>("all");
   const [tagFilter, setTagFilter] = React.useState<string | null>(null);
+  const [showArchived, setShowArchived] = React.useState(false);
+  const [archiveError, setArchiveError] = React.useState<string | null>(null);
+  const relayMembershipQuery = useMyRelayMembershipQuery();
+  const canModerate = canModerateBoards(relayMembershipQuery.data?.role);
+  // Unarchiving from the list is what keeps archiving reversible: without it,
+  // hiding a board by default would make archiving a one-way trip.
+  const archiveMutation = useSetLabBoardArchivedMutation(null);
   const [viewMode, setViewMode] = React.useState<LabBoardViewMode>(() =>
     readStoredLabBoardViewMode(),
   );
@@ -70,6 +81,7 @@ export function LabScreen() {
         currentOwnerPubkey: currentProfileQuery.data?.ownerPubkey,
         filter: listFilter,
         tag: tagFilter,
+        includeArchived: showArchived,
       }),
     [
       boards,
@@ -77,7 +89,38 @@ export function LabScreen() {
       currentProfileQuery.data?.ownerPubkey,
       listFilter,
       tagFilter,
+      showArchived,
     ],
+  );
+  // Counted from the same ACL-filtered set the list renders, so the toggle
+  // never advertises a board the viewer may not read.
+  const archivedCount = React.useMemo(
+    () =>
+      filterLabBoards({
+        boards,
+        currentPubkey: identityQuery.data?.pubkey,
+        currentOwnerPubkey: currentProfileQuery.data?.ownerPubkey,
+        filter: "all",
+        tag: null,
+        includeArchived: true,
+      }).filter((board) => board.status === "archived").length,
+    [boards, identityQuery.data?.pubkey, currentProfileQuery.data?.ownerPubkey],
+  );
+
+  const handleUnarchive = React.useCallback(
+    (boardId: string) => {
+      const head = boards.find((board) => board.boardId === boardId);
+      if (!head) return;
+      setArchiveError(null);
+      archiveMutation.mutate(
+        { head, archived: false },
+        {
+          onError: (error) =>
+            setArchiveError(describeBoardModerationError(error, "unarchive")),
+        },
+      );
+    },
+    [archiveMutation, boards],
   );
 
   React.useEffect(() => {
@@ -163,6 +206,26 @@ export function LabScreen() {
           </select>
         </label>
 
+        {archivedCount > 0 || showArchived ? (
+          <button
+            aria-pressed={showArchived}
+            className={cn(
+              "flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors",
+              showArchived
+                ? "border-primary/40 bg-primary/12 text-foreground"
+                : "border-border/60 bg-background text-muted-foreground hover:text-foreground",
+            )}
+            data-testid="lab-toggle-archived"
+            onClick={() => setShowArchived((value) => !value)}
+            type="button"
+          >
+            <Archive className="h-3.5 w-3.5" />
+            {showArchived
+              ? "Hide archived"
+              : `Show archived (${archivedCount})`}
+          </button>
+        ) : null}
+
         <div className="ml-auto flex items-center gap-2">
           <span
             className="text-xs text-muted-foreground"
@@ -177,6 +240,15 @@ export function LabScreen() {
           />
         </div>
       </div>
+
+      {archiveError ? (
+        <p
+          className="mx-4 mt-3 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid="lab-list-archive-error"
+        >
+          {archiveError}
+        </p>
+      ) : null}
 
       {boardsQuery.isLoading ? (
         <p className="p-4 text-sm text-muted-foreground">Loading boards...</p>
@@ -193,8 +265,10 @@ export function LabScreen() {
           activeTag={tagFilter}
           boards={filteredBoards}
           isFiltered={listFilter !== "all" || tagFilter !== null}
+          isUnarchiving={archiveMutation.isPending}
           onOpen={openBoard}
           onTagSelect={setTagFilter}
+          onUnarchive={canModerate ? handleUnarchive : undefined}
           viewMode={viewMode}
         />
       )}

@@ -1,4 +1,6 @@
 import {
+  Archive,
+  ArchiveRestore,
   ArrowLeft,
   Eye,
   History,
@@ -14,6 +16,7 @@ import * as React from "react";
 import {
   BOARD_CONFLICT_MESSAGE,
   boardReference,
+  describeBoardModerationError,
   isBoardConflictError,
   type LabBoardHead,
   type LabBoardRevision,
@@ -21,9 +24,17 @@ import {
 } from "@/features/lab/api";
 import { canEditBoard, canReadBoard } from "@/features/lab/model";
 import {
+  availableArchiveAction,
+  boardAccessBadgeLabel,
+  canModerateBoards,
+  isBoardLocked,
+} from "@/features/lab/boardStatus";
+import { useMyRelayMembershipQuery } from "@/features/community-members/hooks";
+import {
   useLabBoardHistoryQuery,
   useLabBoardQuery,
   useRestoreLabBoardMutation,
+  useSetLabBoardArchivedMutation,
   useUpdateLabBoardMutation,
 } from "@/features/lab/hooks";
 import { LabBoardHistory } from "@/features/lab/ui/LabBoardHistory";
@@ -69,8 +80,15 @@ export function LabBoardView({
   );
   const updateMutation = useUpdateLabBoardMutation(boardId);
   const restoreMutation = useRestoreLabBoardMutation(boardId);
+  const archiveMutation = useSetLabBoardArchivedMutation(boardId);
   const identityQuery = useIdentityQuery();
   const currentProfileQuery = useUserProfileQuery(identityQuery.data?.pubkey);
+  // Board moderation is gated on the community role in the relay's
+  // `relay_members` table — the same seam ban/timeout use. This only decides
+  // whether to *offer* the action; the relay re-derives it per event and is
+  // the authority, so a rejection is still surfaced rather than assumed away.
+  const relayMembershipQuery = useMyRelayMembershipQuery();
+  const canModerate = canModerateBoards(relayMembershipQuery.data?.role);
 
   const [isEditing, setIsEditing] = React.useState(false);
   // Poll only while editing — that is the only window where another writer's
@@ -153,6 +171,25 @@ export function LabBoardView({
     }
   }
 
+  function handleSetArchived(head: LabBoardHead, archived: boolean) {
+    setErrorMessage(null);
+    archiveMutation.mutate(
+      { head, archived },
+      {
+        // The client cannot see `relay_members`, so "you may archive" is only
+        // ever a guess. When the relay disagrees, say what it said in prose —
+        // a silent no-op here would look like a broken button.
+        onError: (error) =>
+          setErrorMessage(
+            describeBoardModerationError(
+              error,
+              archived ? "archive" : "unarchive",
+            ),
+          ),
+      },
+    );
+  }
+
   function handleRestore(head: LabBoardHead, revision: LabBoardRevision) {
     setErrorMessage(null);
     restoreMutation.mutate(
@@ -211,11 +248,16 @@ export function LabBoardView({
   }
 
   const isFrozen = board.status === "frozen";
+  const isArchived = board.status === "archived";
+  // Widens the frozen gate to cover archived too; see `isBoardLocked` for why
+  // the relay's own refusal does not already cover this case.
+  const isLocked = isBoardLocked(board.status);
   const canWrite = canEditBoard(
     board,
     identityQuery.data?.pubkey,
     currentProfileQuery.data?.ownerPubkey,
   );
+  const archiveAction = availableArchiveAction(board.status);
   const isSaving = updateMutation.isPending;
   // The polled head has moved past the revision this draft was started from,
   // so saving will (correctly) be refused. Say so now rather than letting the
@@ -283,8 +325,10 @@ export function LabBoardView({
           {showHistory ? "Hide history" : "History"}
         </Button>
         {/* Editing requires write access (ACL), a live head (not a pinned
-            revision deep link), and an unfrozen board. */}
-        {!isEditing && !isFrozen && canWrite && viewingRevision === null ? (
+            revision deep link), and a board that is neither frozen nor
+            archived. `isLocked` widens the original `!isFrozen` term — the
+            other three conditions are unchanged. */}
+        {!isEditing && !isLocked && canWrite && viewingRevision === null ? (
           <Button
             data-testid="lab-board-edit"
             onClick={() => handleStartEditing(board)}
@@ -294,6 +338,34 @@ export function LabBoardView({
           >
             <Pencil className="h-4 w-4" />
             Edit
+          </Button>
+        ) : null}
+        {/* Archiving is a moderation op: it needs a community role rather than
+            board write access, and it is offered only from a status the relay
+            accepts as its source (active -> archive, archived -> unarchive;
+            a frozen board offers neither). Hidden while editing so it cannot
+            retire a board out from under an open draft. */}
+        {!isEditing && canModerate && archiveAction !== null ? (
+          <Button
+            data-testid={`lab-board-${archiveAction}`}
+            disabled={archiveMutation.isPending}
+            onClick={() =>
+              handleSetArchived(board, archiveAction === "archive")
+            }
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            {archiveAction === "archive" ? (
+              <Archive className="h-4 w-4" />
+            ) : (
+              <ArchiveRestore className="h-4 w-4" />
+            )}
+            {archiveMutation.isPending
+              ? "Working..."
+              : archiveAction === "archive"
+                ? "Archive"
+                : "Unarchive"}
           </Button>
         ) : null}
       </div>
@@ -317,9 +389,11 @@ export function LabBoardView({
                 : "Everyone in this community can find and read. Only the owner and their agents can edit."
               : "Only you and your agents can find, read, and edit this board."}
           {isFrozen ? " It is frozen, so edits are disabled." : ""}
+          {isArchived ? " It is archived, so edits are disabled." : ""}
         </span>
         <Badge
           className="normal-case tracking-normal"
+          data-testid="lab-board-access-badge"
           variant={
             board.access === "community"
               ? "secondary"
@@ -328,12 +402,13 @@ export function LabBoardView({
                 : "info"
           }
         >
-          {board.access === "community"
-            ? "Community"
-            : board.access === "community_readonly"
-              ? "Read-only"
-              : "Private"}
+          {boardAccessBadgeLabel({ access: board.access, canWrite })}
         </Badge>
+        {isArchived ? (
+          <Badge className="normal-case tracking-normal" variant="outline">
+            Archived
+          </Badge>
+        ) : null}
         {board.tags.map((tag) => (
           <span
             className="rounded-full border border-border/60 bg-background/70 px-2 py-0.5"
@@ -396,7 +471,7 @@ export function LabBoardView({
             </p>
           ) : (
             <LabBoardHistory
-              canRestore={canWrite && !isFrozen}
+              canRestore={canWrite && !isLocked}
               currentRevision={board.revision}
               isRestoring={restoreMutation.isPending}
               onRestore={(revision) => handleRestore(board, revision)}

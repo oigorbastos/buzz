@@ -1,15 +1,54 @@
-import { Eye, FlaskConical, LockKeyhole, Users } from "lucide-react";
+import {
+  ArchiveRestore,
+  Eye,
+  FlaskConical,
+  LockKeyhole,
+  Users,
+} from "lucide-react";
 
 import type { LabBoardHead } from "@/features/lab/api";
 import { LabBoardCopyIdButton } from "@/features/lab/ui/LabBoardCopyIdButton";
 import type { LabBoardViewMode } from "@/features/lab/viewPreference";
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
+import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 
 function StatusPill({ status }: { status: string }) {
   if (status === "active") return null;
   return <Badge variant="outline">{status}</Badge>;
+}
+
+/**
+ * Rendered only on an archived card, and only when the caller passed a handler
+ * (i.e. the viewer holds a community role). Sits above the card's full-bleed
+ * "open board" button via the same `z-20` escape the tag pills use, otherwise
+ * the click would just navigate.
+ */
+function UnarchiveButton({
+  board,
+  isUnarchiving,
+  onUnarchive,
+}: {
+  board: LabBoardHead;
+  isUnarchiving?: boolean;
+  onUnarchive?: (boardId: string) => void;
+}) {
+  if (board.status !== "archived" || !onUnarchive) return null;
+  return (
+    <Button
+      className="pointer-events-auto relative z-20"
+      data-testid={`lab-card-unarchive-${board.boardId}`}
+      disabled={isUnarchiving}
+      onClick={() => onUnarchive(board.boardId)}
+      size="xs"
+      type="button"
+      variant="outline"
+    >
+      <ArchiveRestore className="h-3.5 w-3.5" />
+      {isUnarchiving ? "Working..." : "Unarchive"}
+    </Button>
+  );
 }
 
 function AccessPill({ board }: { board: LabBoardHead }) {
@@ -85,15 +124,19 @@ function BoardTagPills({
 type BoardItemProps = {
   activeTag: string | null;
   board: LabBoardHead;
+  isUnarchiving?: boolean;
   onOpen: (boardId: string) => void;
   onTagSelect: (tag: string) => void;
+  onUnarchive?: (boardId: string) => void;
 };
 
 function LabBoardGridCard({
   activeTag,
   board,
+  isUnarchiving,
   onOpen,
   onTagSelect,
+  onUnarchive,
 }: BoardItemProps) {
   return (
     <Card className="group relative flex min-h-44 flex-col overflow-hidden border-border/60 bg-transparent shadow-none transition-colors duration-150 hover:bg-muted/20">
@@ -137,6 +180,13 @@ function LabBoardGridCard({
           <span>Revision {board.revision}</span>
           <span aria-hidden="true">·</span>
           <span>{formatUpdatedAt(board.updatedAt)}</span>
+          <span className="ml-auto">
+            <UnarchiveButton
+              board={board}
+              isUnarchiving={isUnarchiving}
+              onUnarchive={onUnarchive}
+            />
+          </span>
         </div>
       </div>
     </Card>
@@ -146,8 +196,10 @@ function LabBoardGridCard({
 function LabBoardListRow({
   activeTag,
   board,
+  isUnarchiving,
   onOpen,
   onTagSelect,
+  onUnarchive,
 }: BoardItemProps) {
   return (
     <Card className="group relative overflow-hidden border-border/60 bg-transparent shadow-none transition-colors duration-150 hover:bg-muted/20">
@@ -190,6 +242,11 @@ function LabBoardListRow({
             <span>Revision {board.revision}</span>
             <span>{formatUpdatedAt(board.updatedAt)}</span>
           </div>
+          <UnarchiveButton
+            board={board}
+            isUnarchiving={isUnarchiving}
+            onUnarchive={onUnarchive}
+          />
           <LabBoardCopyIdButton
             boardId={board.boardId}
             boardTitle={board.title}
@@ -230,8 +287,12 @@ type LabBoardListProps = {
   activeTag: string | null;
   boards: LabBoardHead[];
   isFiltered: boolean;
+  isUnarchiving?: boolean;
   onOpen: (boardId: string) => void;
   onTagSelect: (tag: string) => void;
+  /** Omitted when the viewer holds no community role — the relay would
+   * refuse, so the affordance is not offered. */
+  onUnarchive?: (boardId: string) => void;
   viewMode: LabBoardViewMode;
 };
 
@@ -239,8 +300,10 @@ export function LabBoardList({
   activeTag,
   boards,
   isFiltered,
+  isUnarchiving,
   onOpen,
   onTagSelect,
+  onUnarchive,
   viewMode,
 }: LabBoardListProps) {
   if (boards.length === 0) return <LabBoardEmptyState filtered={isFiltered} />;
@@ -261,17 +324,21 @@ export function LabBoardList({
           <LabBoardGridCard
             activeTag={activeTag}
             board={board}
+            isUnarchiving={isUnarchiving}
             key={board.boardId}
             onOpen={onOpen}
             onTagSelect={onTagSelect}
+            onUnarchive={onUnarchive}
           />
         ) : (
           <LabBoardListRow
             activeTag={activeTag}
             board={board}
+            isUnarchiving={isUnarchiving}
             key={board.boardId}
             onOpen={onOpen}
             onTagSelect={onTagSelect}
+            onUnarchive={onUnarchive}
           />
         ),
       )}

@@ -513,3 +513,169 @@ describe("Lab preview mock relay", () => {
     );
   });
 });
+
+describe("Lab board archiving", () => {
+  function moderationEvent(boardId, op, overrides = {}) {
+    return {
+      id: overrides.id ?? "7".repeat(64),
+      pubkey: overrides.pubkey ?? VIEWER,
+      created_at: Math.floor(Date.now() / 1_000),
+      kind: KIND_LAB_BOARD_REVISION,
+      // Exactly what `boardModerationTags` sends: no prev, no revision.
+      tags: [
+        ["d", boardId],
+        ["op", op],
+      ],
+      content: "",
+      sig: "0".repeat(128),
+      ...overrides,
+    };
+  }
+
+  function headOf(boardId) {
+    const [head] = queryMockLabBoards([
+      { kinds: [KIND_LAB_BOARD_HEAD], "#d": [boardId] },
+    ]);
+    return head;
+  }
+
+  it("archives without a prev or revision tag and flips the head status", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const before = headOf(MOCK_LAB_COMMUNITY_BOARD_ID);
+    assert.equal(tagValue(before, "status"), "active");
+
+    assert.deepEqual(
+      publishMockLabRevision(
+        moderationEvent(MOCK_LAB_COMMUNITY_BOARD_ID, "archive"),
+        VIEWER,
+      ),
+      { accepted: true, message: "" },
+    );
+
+    const after = headOf(MOCK_LAB_COMMUNITY_BOARD_ID);
+    assert.equal(tagValue(after, "status"), "archived");
+    // A status flip is not a content change: revision, head token, and
+    // Markdown all survive untouched.
+    assert.equal(tagValue(after, "revision"), tagValue(before, "revision"));
+    assert.equal(tagValue(after, "head"), tagValue(before, "head"));
+    assert.equal(after.content, before.content);
+  });
+
+  it("round-trips back to active on unarchive", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    publishMockLabRevision(
+      moderationEvent(MOCK_LAB_COMMUNITY_BOARD_ID, "archive"),
+      VIEWER,
+    );
+    assert.deepEqual(
+      publishMockLabRevision(
+        moderationEvent(MOCK_LAB_COMMUNITY_BOARD_ID, "unarchive", {
+          id: "8".repeat(64),
+        }),
+        VIEWER,
+      ),
+      { accepted: true, message: "" },
+    );
+    assert.equal(
+      tagValue(headOf(MOCK_LAB_COMMUNITY_BOARD_ID), "status"),
+      "active",
+    );
+  });
+
+  it("refuses an identity with no community role, board ownership regardless", () => {
+    // The viewer owns this private board outright and can edit it — and still
+    // may not archive it. Moderation authority lives in `relay_members`, not
+    // in the board ACL. This is the case every managed agent lands in.
+    resetMockLabBoards({
+      enabled: true,
+      moderatorPubkeys: [],
+      viewerPubkey: VIEWER,
+    });
+    assert.deepEqual(
+      publishMockLabRevision(
+        moderationEvent(MOCK_LAB_OWN_PRIVATE_BOARD_ID, "archive"),
+        VIEWER,
+      ),
+      { accepted: false, message: "restricted: moderator access required" },
+    );
+    assert.equal(
+      tagValue(headOf(MOCK_LAB_OWN_PRIVATE_BOARD_ID), "status"),
+      "active",
+    );
+  });
+
+  it("refuses before disclosing whether an unknown board exists", () => {
+    // Role is checked ahead of existence, so a non-moderator cannot probe for
+    // board ids by reading the difference between the two errors.
+    resetMockLabBoards({
+      enabled: true,
+      moderatorPubkeys: [],
+      viewerPubkey: VIEWER,
+    });
+    assert.deepEqual(
+      publishMockLabRevision(
+        moderationEvent("99999999-9999-4999-8999-999999999999", "archive"),
+        VIEWER,
+      ),
+      { accepted: false, message: "restricted: moderator access required" },
+    );
+  });
+
+  it("rejects a transition the current status does not allow", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    publishMockLabRevision(
+      moderationEvent(MOCK_LAB_COMMUNITY_BOARD_ID, "archive"),
+      VIEWER,
+    );
+    const second = publishMockLabRevision(
+      moderationEvent(MOCK_LAB_COMMUNITY_BOARD_ID, "archive", {
+        id: "b".repeat(64),
+      }),
+      VIEWER,
+    );
+    assert.equal(second.accepted, false);
+    assert.equal(
+      second.message,
+      "invalid: cannot archive a lab board with status 'archived' (expected 'active')",
+    );
+
+    const unarchiveActive = publishMockLabRevision(
+      moderationEvent(MOCK_LAB_READONLY_BOARD_ID, "unarchive", {
+        id: "c".repeat(64),
+      }),
+      VIEWER,
+    );
+    assert.equal(unarchiveActive.accepted, false);
+    assert.equal(
+      unarchiveActive.message,
+      "invalid: cannot unarchive a lab board with status 'active' (expected 'archived')",
+    );
+  });
+
+  it("reports a missing board to a moderator", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const boardId = "88888888-8888-4888-8888-888888888888";
+    assert.deepEqual(
+      publishMockLabRevision(moderationEvent(boardId, "archive"), VIEWER),
+      {
+        accepted: false,
+        message: `invalid: lab board ${boardId} does not exist`,
+      },
+    );
+  });
+
+  it("keeps an archived board readable so it can be found and restored", () => {
+    // Archiving is not deletion: the head must still be queryable, otherwise
+    // the "Show archived" toggle would have nothing to reveal.
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    publishMockLabRevision(
+      moderationEvent(MOCK_LAB_COMMUNITY_BOARD_ID, "archive"),
+      VIEWER,
+    );
+    const heads = queryMockLabBoards([{ kinds: [KIND_LAB_BOARD_HEAD] }]);
+    assert.equal(
+      heads.some((head) => tagValue(head, "d") === MOCK_LAB_COMMUNITY_BOARD_ID),
+      true,
+    );
+  });
+});

@@ -36,6 +36,25 @@ let mockLabEventCounter = 1;
 let mockLabViewerPubkey = "";
 const mockLabHeads = new Map<string, RelayEvent>();
 const mockLabRevisions: RelayEvent[] = [];
+/**
+ * Pubkeys holding a community `owner`/`admin` role — the mock's stand-in for
+ * the relay's `relay_members` table, which is what
+ * `authorize_moderation_action` actually reads. Board ownership is deliberately
+ * NOT consulted: on the real relay these are independent, and a managed agent
+ * is never a member in its own right no matter whose boards it can write.
+ */
+const mockLabModerators = new Set<string>();
+
+/** `op` values the relay routes to `handle_moderation_op`. */
+const MODERATION_OPS = new Set(["archive", "unarchive", "freeze", "unfreeze"]);
+
+/** `LabBoardOp::required_source_status` / `target_status`, mirrored. */
+const MODERATION_TRANSITIONS: Record<string, { from: string; to: string }> = {
+  archive: { from: "active", to: "archived" },
+  unarchive: { from: "archived", to: "active" },
+  freeze: { from: "active", to: "frozen" },
+  unfreeze: { from: "frozen", to: "active" },
+};
 
 function nextMockEventId(): string {
   const id = mockLabEventCounter.toString(16).padStart(64, "0");
@@ -80,6 +99,7 @@ function makeHead(input: {
   headEventId: string;
   ownerPubkey: string;
   revision: number;
+  status?: string;
   summary: string | null;
   tags: string[];
   title: string;
@@ -88,7 +108,7 @@ function makeHead(input: {
     ["d", input.boardId],
     ["title", input.title],
     ["revision", String(input.revision)],
-    ["status", "active"],
+    ["status", input.status ?? "active"],
     ["head", input.headEventId],
     ["access_scope", input.access],
     ["owner", input.ownerPubkey],
@@ -154,6 +174,13 @@ function seedBoard(input: {
 export function resetMockLabBoards(input: {
   effectiveOwnerPubkey?: string;
   enabled: boolean;
+  /**
+   * Community owner/admin pubkeys. Defaults to the effective owner — the
+   * single-operator shape of a real deployment, where the human running the
+   * relay is its owner. Pass `[]` to model an identity with no community role
+   * (every managed agent, and any plain member).
+   */
+  moderatorPubkeys?: string[];
   viewerPubkey: string;
 }) {
   mockLabEnabled = input.enabled;
@@ -162,6 +189,10 @@ export function resetMockLabBoards(input: {
   mockLabEventCounter = 1;
   mockLabHeads.clear();
   mockLabRevisions.length = 0;
+  mockLabModerators.clear();
+  for (const pubkey of input.moderatorPubkeys ?? [effectiveOwnerPubkey]) {
+    mockLabModerators.add(pubkey.toLowerCase());
+  }
   if (!mockLabEnabled) return;
 
   const now = Math.floor(Date.now() / 1_000);
@@ -319,6 +350,82 @@ export function queryMockLabBoards(
   );
 }
 
+/**
+ * `archive`/`unarchive`/`freeze`/`unfreeze`.
+ *
+ * Check order mirrors the relay exactly, because the order *is* the contract a
+ * client codes against: `authorize_moderation_action` runs before the CAS
+ * transaction opens, so a caller with no community role is told
+ * "moderator access required" whether or not the board exists. Existence and
+ * the status transition are only judged afterwards.
+ *
+ * Note what is absent: no `prev` comparison and no board-write ACL. A
+ * moderation op is not a compare-and-swap, and board ownership grants no
+ * moderation authority — that is why an owner who is not an admin still gets
+ * refused here.
+ */
+function publishMockLabModeration(input: {
+  actorPubkey: string;
+  boardId: string;
+  event: RelayEvent;
+  op: string;
+}): PublishResult {
+  if (!mockLabModerators.has(input.actorPubkey.toLowerCase())) {
+    return {
+      accepted: false,
+      message: "restricted: moderator access required",
+    };
+  }
+
+  const currentHead = mockLabHeads.get(input.boardId);
+  if (!currentHead) {
+    return {
+      accepted: false,
+      message: `invalid: lab board ${input.boardId} does not exist`,
+    };
+  }
+
+  const transition = MODERATION_TRANSITIONS[input.op];
+  if (!transition) {
+    return {
+      accepted: false,
+      message: `invalid: unknown lab board op ${input.op}`,
+    };
+  }
+  const currentStatus = tagValue(currentHead, "status") ?? "active";
+  if (currentStatus !== transition.from) {
+    return {
+      accepted: false,
+      message: `invalid: cannot ${input.op} a lab board with status '${currentStatus}' (expected '${transition.from}')`,
+    };
+  }
+
+  const access = boardAccess(currentHead);
+  if (!access) return { accepted: false, message: "BOARD_NOT_FOUND" };
+
+  // The relay re-signs the head projection with the new status but reuses the
+  // current revision number and Markdown — a status flip is not a content
+  // change, and no `lab_board_revisions` row is appended.
+  mockLabRevisions.push(input.event);
+  mockLabHeads.set(
+    input.boardId,
+    makeHead({
+      boardId: input.boardId,
+      content: currentHead.content,
+      createdAt: input.event.created_at,
+      access,
+      headEventId: tagValue(currentHead, "head") ?? input.event.id,
+      ownerPubkey: tagValue(currentHead, "owner") ?? "",
+      revision: Number.parseInt(tagValue(currentHead, "revision") ?? "1", 10),
+      status: transition.to,
+      summary: tagValue(currentHead, "summary"),
+      tags: tagValues(currentHead, "t"),
+      title: tagValue(currentHead, "title") ?? "Untitled board",
+    }),
+  );
+  return { accepted: true, message: "" };
+}
+
 export function publishMockLabRevision(
   event: RelayEvent,
   actorPubkey: string,
@@ -327,11 +434,26 @@ export function publishMockLabRevision(
   if (!mockLabEnabled || event.kind !== KIND_LAB_BOARD_REVISION) return null;
   const boardId = tagValue(event, "d");
   const op = tagValue(event, "op");
+  if (!boardId || !op) {
+    return { accepted: false, message: "invalid: incomplete Lab revision" };
+  }
+
+  // Moderation ops branch before the `revision` tag is read: they legitimately
+  // carry none, because a status flip does not create a revision.
+  if (MODERATION_OPS.has(op)) {
+    return publishMockLabModeration({
+      actorPubkey,
+      boardId,
+      event,
+      op,
+    });
+  }
+
   const requestedRevision = Number.parseInt(
     tagValue(event, "revision") ?? "",
     10,
   );
-  if (!boardId || !op || !Number.isSafeInteger(requestedRevision)) {
+  if (!Number.isSafeInteger(requestedRevision)) {
     return { accepted: false, message: "invalid: incomplete Lab revision" };
   }
 

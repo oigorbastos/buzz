@@ -18,6 +18,7 @@ import {
   type LabBoardHead,
   type LabBoardRevision,
   restoreBoardRevision,
+  setBoardArchived,
   updateBoard,
 } from "@/features/lab/api";
 
@@ -115,6 +116,25 @@ export function useRestoreLabBoardMutation(boardId: string | null) {
     mutationFn: (input: { head: LabBoardHead; revision: LabBoardRevision }) =>
       restoreBoardRevision(input),
     onSuccess: () => invalidateBoard(queryClient, boardId),
+  });
+}
+
+/**
+ * Archive or unarchive a board.
+ *
+ * `boardId` is nullable so the board list can drive this for a board it is not
+ * currently displaying; passing `null` still invalidates the list, which is the
+ * query that decides whether the board is on screen at all.
+ */
+export function useSetLabBoardArchivedMutation(boardId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { head: LabBoardHead; archived: boolean }) =>
+      setBoardArchived(input),
+    // A status flip re-signs the head projection (see `handle_moderation_op`),
+    // so the head and the list are stale exactly as they are after an edit.
+    onSuccess: (_result, variables) =>
+      invalidateBoard(queryClient, boardId ?? variables.head.boardId),
   });
 }
 
