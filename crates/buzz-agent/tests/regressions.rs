@@ -105,6 +105,39 @@ async fn spawn_capturing_llm_with_status(responses: Vec<(u16, Value)>) -> Captur
 /// line that never arrives still fails the caller's `assert!`, just 5s later.
 const STDERR_SETTLE: Duration = Duration::from_secs(5);
 
+/// How long the harness lets an MCP server finish `initialize` + `tools/list`.
+///
+/// Work-scale, not scheduler-scale — the opposite of [`STDERR_SETTLE`].
+/// `spawn_one` puts this one bound on both stages, and
+/// `tool_metadata_caps_enforced` deliberately makes the second stage
+/// expensive: 200 tools x 100 KB of description is ~20 MB of JSON to
+/// serialize, push through a pipe, and parse back. That is ~0.7s on an idle
+/// box, so the 2s this used to be left barely 3x of headroom — and lost it
+/// routinely once the CPUs were busy: 14 of 40 rounds at `--test-threads 16`
+/// against saturated cores. Timing that same `session/new` over 40 such
+/// rounds put the median at 1.8s and the worst case at 3.1s, i.e. the old
+/// bound cut straight through the middle of the distribution.
+///
+/// Nothing asserts this bound except `mcp_init_timeout_kills_child`, which
+/// hangs `initialize` on purpose and opts back down to
+/// [`MCP_INIT_TIMEOUT_HANG_SECS`] locally. Everywhere else it is pure
+/// impatience, and firing it does not make a test stricter — it makes it
+/// wrong: `session/new` comes back an error, so a test written to check
+/// metadata *caps* never reaches a single cap assertion.
+///
+/// Generous, because overshooting costs nothing: an MCP server that never
+/// answers still fails the test, just later. Kept under the 15s
+/// [`Harness::recv`] deadline so that failure is still the agent's own
+/// "timeout after 10s" rather than an opaque "recv timeout".
+const MCP_INIT_TIMEOUT_SECS: &str = "10";
+
+/// The short budget for the one test that asserts the init timeout *fires*.
+///
+/// `mcp_init_timeout_kills_child` hangs `initialize` forever, so this is how
+/// long it sits there before the agent gives up; it then asserts the round
+/// trip took under 8s, which this has to stay comfortably below.
+const MCP_INIT_TIMEOUT_HANG_SECS: &str = "2";
+
 struct Harness {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
@@ -124,7 +157,7 @@ impl Harness {
             .env("BUZZ_AGENT_LLM_TIMEOUT_SECS", "5")
             .env("BUZZ_AGENT_TOOL_TIMEOUT_SECS", "5")
             .env("BUZZ_AGENT_MAX_ROUNDS", "8")
-            .env("BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS", "2");
+            .env("BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS", MCP_INIT_TIMEOUT_SECS);
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -361,12 +394,25 @@ async fn assistant_text_preserved_across_prompts() {
     h.shutdown().await;
 }
 
-/// MCP init that hangs forever must time out within ~2s, surface an error,
-/// and the child process must be killed (not lingering).
+/// MCP init that hangs forever must time out, surface an error, and the child
+/// process must be killed (not lingering).
+///
+/// The only test that asserts the init timeout *fires*, so it is the only one
+/// that wants it short — hence the local [`MCP_INIT_TIMEOUT_HANG_SECS`]
+/// instead of the harness default. Nothing here is racing real work: the fake
+/// server never answers `initialize` at all, so no amount of CPU contention
+/// can make this bound legitimately overrun.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_init_timeout_kills_child() {
     let llm = spawn_capturing_llm(vec![]).await;
-    let mut h = Harness::spawn(&llm.url).await;
+    let mut h = Harness::spawn_with_env(
+        &llm.url,
+        &[(
+            "BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS",
+            MCP_INIT_TIMEOUT_HANG_SECS,
+        )],
+    )
+    .await;
 
     let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
     h.send(
