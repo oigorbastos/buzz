@@ -195,7 +195,7 @@ fn ensure_nest_materializes_claude_skill_on_windows() {
 
 #[cfg(windows)]
 #[test]
-fn ensure_nest_upgrades_windows_claude_skill_from_five_to_six() {
+fn ensure_nest_upgrades_a_stale_windows_claude_skill_to_current() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
@@ -221,7 +221,7 @@ fn ensure_nest_upgrades_windows_claude_skill_from_five_to_six() {
         fs::read_to_string(claude_dir.join(".skill-version"))
             .unwrap()
             .trim(),
-        "6"
+        NEST_SKILL_VERSION.to_string()
     );
 }
 
