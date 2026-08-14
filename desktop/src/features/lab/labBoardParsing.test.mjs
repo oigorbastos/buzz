@@ -3,9 +3,13 @@ import { describe, it } from "node:test";
 
 import {
   BOARD_MODERATION_DENIED_MESSAGE,
+  BOARD_RENAME_CONFLICT_MESSAGE,
   boardModerationTags,
   boardReference,
+  boardRenamePayload,
+  boardUpdateTags,
   describeBoardModerationError,
+  describeBoardRenameError,
   eventMatchesBoard,
   isBoardConflictError,
   isBoardModerationDeniedError,
@@ -16,6 +20,7 @@ import {
   parseBoardRevision,
   sortRevisions,
   validateBoardInput,
+  validateBoardRename,
 } from "./api.ts";
 
 const KIND_HEAD = 30623;
@@ -354,6 +359,169 @@ describe("validateBoardInput", () => {
     assert.equal(
       validateBoardInput({ title: "é".repeat(MAX_TITLE_CHARS), content: "" }),
       null,
+    );
+  });
+});
+
+describe("board rename wire shape", () => {
+  const head = {
+    boardId: BOARD,
+    title: "Sprint plan",
+    summary: "what we are doing",
+    content: "# Sprint plan\n\nreal work that must survive a rename",
+    revision: 7,
+    status: "active",
+    access: "community",
+    ownerPubkey: null,
+    tags: ["produto", "roadmap"],
+    headEventId: EVENT_ID,
+    updatedAt: 1_700_000_000,
+  };
+
+  it("resends the head's own content under the head's own CAS token", () => {
+    // The invariant the whole feature rests on: content and `prev` come from
+    // one snapshot, so the text being republished is by construction the text
+    // of the revision named in `prev`. Splicing two reads together here would
+    // reintroduce the silent-overwrite bug `editBase` exists to prevent.
+    const payload = boardRenamePayload({ head, title: "Sprint plan Q4" });
+    assert.equal(payload.head, head);
+    assert.equal(payload.content, head.content);
+
+    const tags = boardUpdateTags(payload);
+    assert.deepEqual(tags, [
+      ["d", BOARD],
+      ["op", "update"],
+      ["prev", EVENT_ID],
+      ["revision", "8"],
+      ["title", "Sprint plan Q4"],
+    ]);
+  });
+
+  it("leaves every field but the title alone", () => {
+    const tags = boardUpdateTags(
+      boardRenamePayload({ head, title: "Sprint plan Q4" }),
+    );
+    const names = tags.map(([name]) => name);
+    // No `tags=replace` marker means the relay keeps the topic tags; an absent
+    // `summary` means it keeps the summary. Sending either would make a rename
+    // able to erase something nobody asked it to touch.
+    for (const forbidden of ["tags", "t", "summary", "access_scope"]) {
+      assert.equal(names.includes(forbidden), false, `sent \`${forbidden}\``);
+    }
+  });
+
+  it("trims the title it sends", () => {
+    const tags = boardUpdateTags(
+      boardRenamePayload({ head, title: "  Sprint plan Q4  " }),
+    );
+    assert.deepEqual(
+      tags.find(([name]) => name === "title"),
+      ["title", "Sprint plan Q4"],
+    );
+  });
+
+  it("refuses a rename the relay would silently swallow or reject", () => {
+    // Empty is the dangerous one: the relay drops an empty `title` tag and
+    // falls back to the current title, so this would be accepted, change
+    // nothing, and still append a revision.
+    assert.match(validateBoardRename({ head, title: "" }), /cannot be empty/);
+    assert.match(
+      validateBoardRename({ head, title: "   " }),
+      /cannot be empty/,
+    );
+    assert.match(
+      validateBoardRename({ head, title: "t".repeat(MAX_TITLE_CHARS + 1) }),
+      /Title is limited/,
+    );
+    assert.equal(
+      validateBoardRename({ head, title: "t".repeat(MAX_TITLE_CHARS) }),
+      null,
+    );
+  });
+
+  it("counts the title cap in characters, as the relay does", () => {
+    assert.equal(
+      validateBoardRename({ head, title: "é".repeat(MAX_TITLE_CHARS) }),
+      null,
+    );
+    assert.match(
+      validateBoardRename({ head, title: "é".repeat(MAX_TITLE_CHARS + 1) }),
+      /Title is limited/,
+    );
+  });
+
+  it("declines to spend a revision on the name the board already has", () => {
+    assert.match(
+      validateBoardRename({ head, title: "Sprint plan" }),
+      /already this board's name/,
+    );
+    assert.match(
+      validateBoardRename({ head, title: "  Sprint plan  " }),
+      /already this board's name/,
+    );
+    assert.equal(validateBoardRename({ head, title: "Sprint plan Q4" }), null);
+  });
+});
+
+describe("board rename errors", () => {
+  it("reports a lost compare-and-swap without promising a kept draft", () => {
+    const message = describeBoardRenameError(
+      new Error("relay rejected event: invalid: BOARD_HEAD_MISMATCH — stale"),
+    );
+    assert.equal(message, BOARD_RENAME_CONFLICT_MESSAGE);
+    // A rename risks no typing, so the editor's "your text is kept" line would
+    // be a non sequitur; what matters is that the board is untouched.
+    assert.match(message, /Nothing was changed/);
+  });
+
+  it("explains a frozen board instead of dumping the refusal", () => {
+    assert.equal(
+      describeBoardRenameError(
+        new Error("restricted: lab board is frozen and cannot be edited"),
+      ),
+      "This board is frozen, so it cannot be renamed.",
+    );
+  });
+
+  it("keeps the relay's deliberate ambiguity about a board it will not name", () => {
+    const message = describeBoardRenameError(
+      new Error("invalid: lab board not found"),
+    );
+    assert.equal(
+      message,
+      "This board is no longer available for editing from this account.",
+    );
+    // The relay answers "not found" for both missing and unauthorized so it is
+    // not an existence oracle; this sentence must not undo that.
+    assert.equal(/deleted|does not exist|no such board/i.test(message), false);
+  });
+
+  it("names a read-only refusal for what it is", () => {
+    assert.equal(
+      describeBoardRenameError(new Error("BOARD_READ_ONLY")),
+      "This board is read-only for you, so it cannot be renamed.",
+    );
+  });
+
+  it("reports a dead relay as connectivity, not as a rename failure", () => {
+    assert.equal(
+      describeBoardRenameError(new Error("relay unreachable: VPN reauth")),
+      "Can't reach the relay.",
+    );
+  });
+
+  it("keeps an unrecognised rejection readable", () => {
+    assert.equal(
+      describeBoardRenameError(new Error("invalid: something new happened")),
+      "Failed to rename this board. something new happened",
+    );
+    assert.equal(
+      describeBoardRenameError(new Error("")),
+      "Failed to rename this board.",
+    );
+    assert.equal(
+      describeBoardRenameError(undefined),
+      "Failed to rename this board.",
     );
   });
 });

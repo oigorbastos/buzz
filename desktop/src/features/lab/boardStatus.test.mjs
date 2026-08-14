@@ -5,8 +5,10 @@ import {
   availableArchiveAction,
   boardAccessBadgeLabel,
   canModerateBoards,
+  canRenameBoard,
   isBoardLocked,
 } from "./boardStatus.ts";
+import { canEditBoard } from "./model.ts";
 
 describe("Lab board status rules", () => {
   it("locks editing for frozen AND archived boards", () => {
@@ -33,6 +35,52 @@ describe("Lab board status rules", () => {
     // membership query resolves to null/undefined for it.
     assert.equal(canModerateBoards(null), false);
     assert.equal(canModerateBoards(undefined), false);
+  });
+});
+
+describe("Lab board rename affordance", () => {
+  const offered = {
+    canWrite: true,
+    isEditing: false,
+    status: "active",
+    viewingRevision: null,
+  };
+
+  it("is offered on a live, unlocked board the viewer can write", () => {
+    assert.equal(canRenameBoard(offered), true);
+  });
+
+  it("is withheld from anyone who may not write the board", () => {
+    // Fed by `canEditBoard` — the audited ACL — rather than re-derived here.
+    // A non-owner looking at a read-only board is the case that matters: the
+    // relay would answer "lab board not found", so offering the button at all
+    // would be a lie.
+    const readOnlyBoard = { access: "community_readonly", ownerPubkey: "a" };
+    const stranger = canEditBoard(readOnlyBoard, "b");
+    assert.equal(stranger, false);
+    assert.equal(canRenameBoard({ ...offered, canWrite: stranger }), false);
+  });
+
+  it("is withheld from a frozen or archived board", () => {
+    // Same widened lock the Edit button uses: the relay refuses a frozen
+    // board outright, and renaming an archived one would resurrect it into
+    // the default list under a new name.
+    assert.equal(canRenameBoard({ ...offered, status: "frozen" }), false);
+    assert.equal(canRenameBoard({ ...offered, status: "archived" }), false);
+  });
+
+  it("is withheld while a draft is open", () => {
+    // A rename is itself a compare-and-swap against the head, so allowing one
+    // mid-edit would invalidate the draft's frozen `prev` and turn the user's
+    // own save into a conflict.
+    assert.equal(canRenameBoard({ ...offered, isEditing: true }), false);
+  });
+
+  it("is withheld on a revision-pinned deep link", () => {
+    // Revision 0 is a real revision, not "no revision" — the guard tests
+    // against null on purpose.
+    assert.equal(canRenameBoard({ ...offered, viewingRevision: 3 }), false);
+    assert.equal(canRenameBoard({ ...offered, viewingRevision: 0 }), false);
   });
 });
 

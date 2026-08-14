@@ -17,6 +17,7 @@ import {
   fetchBoardHistory,
   type LabBoardHead,
   type LabBoardRevision,
+  renameBoard,
   restoreBoardRevision,
   setBoardArchived,
   updateBoard,
@@ -107,6 +108,23 @@ export function useUpdateLabBoardMutation(boardId: string | null) {
       tags?: string[];
     }) => updateBoard(input),
     onSuccess: () => invalidateBoard(queryClient, boardId),
+  });
+}
+
+/**
+ * Rename a board.
+ *
+ * Same invalidation set as an edit, because on the wire it *is* an edit: the
+ * accepted revision advances the head, appends to history, and changes the
+ * title the list renders.
+ */
+export function useRenameLabBoardMutation(boardId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { head: LabBoardHead; title: string }) =>
+      renameBoard(input),
+    onSuccess: (_result, variables) =>
+      invalidateBoard(queryClient, boardId ?? variables.head.boardId),
   });
 }
 

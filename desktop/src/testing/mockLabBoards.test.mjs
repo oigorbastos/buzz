@@ -6,10 +6,17 @@ import {
   MOCK_LAB_OTHER_PRIVATE_BOARD_ID,
   MOCK_LAB_OWN_PRIVATE_BOARD_ID,
   MOCK_LAB_READONLY_BOARD_ID,
+  MOCK_MAX_TITLE_CHARS,
   publishMockLabRevision,
   queryMockLabBoards,
   resetMockLabBoards,
 } from "./mockLabBoards.ts";
+import {
+  boardRenamePayload,
+  boardUpdateTags,
+  MAX_TITLE_CHARS,
+  parseBoardHead,
+} from "../features/lab/api.ts";
 import {
   KIND_LAB_BOARD_HEAD,
   KIND_LAB_BOARD_REVISION,
@@ -676,6 +683,178 @@ describe("Lab board archiving", () => {
     assert.equal(
       heads.some((head) => tagValue(head, "d") === MOCK_LAB_COMMUNITY_BOARD_ID),
       true,
+    );
+  });
+});
+
+describe("Lab board renaming", () => {
+  function readHead(boardId) {
+    const [head] = queryMockLabBoards([
+      { kinds: [KIND_LAB_BOARD_HEAD], "#d": [boardId] },
+    ]);
+    return parseBoardHead(head);
+  }
+
+  /**
+   * The event the desktop actually publishes for a rename: tags straight from
+   * `boardUpdateTags(boardRenamePayload(...))`, so this suite exercises the
+   * shipped wire shape rather than a hand-copied imitation of it. Only signing
+   * and transport are stubbed.
+   *
+   * `head` here is a parsed `LabBoardHead`, unlike `revisionEvent` above which
+   * takes a raw relay event.
+   */
+  function renameEvent(head, title, overrides = {}) {
+    const payload = boardRenamePayload({ head, title });
+    return {
+      id: overrides.id ?? "5".repeat(64),
+      pubkey: overrides.pubkey ?? VIEWER,
+      created_at: Math.floor(Date.now() / 1_000),
+      kind: KIND_LAB_BOARD_REVISION,
+      tags: boardUpdateTags(payload),
+      content: payload.content,
+      sig: "0".repeat(128),
+      ...overrides,
+    };
+  }
+
+  it("mirrors the client's title cap", () => {
+    // Two copies of one relay constant; if they ever drift, the client starts
+    // refusing what the relay accepts, or vice versa.
+    assert.equal(MOCK_MAX_TITLE_CHARS, MAX_TITLE_CHARS);
+  });
+
+  it("changes the name and nothing else", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const before = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+
+    assert.deepEqual(
+      publishMockLabRevision(renameEvent(before, "Roadmap Q4"), VIEWER),
+      { accepted: true, message: "" },
+    );
+
+    const after = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    assert.equal(after.title, "Roadmap Q4");
+    // Everything a rename must not disturb. Content is the sharp one: the
+    // Markdown is resent verbatim, so a mistake here silently empties boards.
+    assert.equal(after.content, before.content);
+    assert.deepEqual(after.tags, before.tags);
+    assert.equal(after.summary, before.summary);
+    assert.equal(after.access, before.access);
+    assert.equal(after.status, before.status);
+    // It is a real revision on the wire, not a metadata poke.
+    assert.equal(after.revision, before.revision + 1);
+    assert.notEqual(after.headEventId, before.headEventId);
+  });
+
+  it("leaves the new name in place for the next writer to build on", () => {
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const first = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    publishMockLabRevision(renameEvent(first, "Roadmap Q4"), VIEWER);
+
+    const second = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    assert.deepEqual(
+      publishMockLabRevision(
+        renameEvent(second, "Roadmap Q4 — congelado", { id: "6".repeat(64) }),
+        VIEWER,
+      ),
+      { accepted: true, message: "" },
+    );
+    assert.equal(
+      readHead(MOCK_LAB_COMMUNITY_BOARD_ID).title,
+      "Roadmap Q4 — congelado",
+    );
+  });
+
+  it("refuses a rename based on a head someone else has already moved", () => {
+    // The hazard this feature had to be designed around. A rename resends the
+    // content it read, so if it were allowed to land after a concurrent edit
+    // it would republish the old Markdown under a new name and destroy that
+    // edit. The CAS is what stops it — and it must fail loudly, not retry.
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const stale = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+
+    const [rawHead] = queryMockLabBoards([
+      { kinds: [KIND_LAB_BOARD_HEAD], "#d": [MOCK_LAB_COMMUNITY_BOARD_ID] },
+    ]);
+    const concurrentEdit = revisionEvent(rawHead, { id: "4".repeat(64) });
+    assert.equal(publishMockLabRevision(concurrentEdit, VIEWER).accepted, true);
+
+    assert.deepEqual(
+      publishMockLabRevision(renameEvent(stale, "Roadmap Q4"), VIEWER),
+      { accepted: false, message: "BOARD_HEAD_MISMATCH" },
+    );
+
+    const after = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    assert.equal(after.title, stale.title);
+    // The concurrent edit survived intact — the whole point.
+    assert.equal(after.content, concurrentEdit.content);
+    assert.equal(after.revision, stale.revision + 1);
+  });
+
+  it("refuses an over-long title before it can reach the board", () => {
+    // Client-side validation refuses this first (`validateBoardRename`); this
+    // proves the relay is the backstop rather than the only line of defence.
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const head = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    const tooLong = "t".repeat(MOCK_MAX_TITLE_CHARS + 1);
+
+    const result = publishMockLabRevision(renameEvent(head, tooLong), VIEWER);
+    assert.equal(result.accepted, false);
+    assert.match(result.message, /title exceeds maximum of 160 characters/);
+    assert.equal(readHead(MOCK_LAB_COMMUNITY_BOARD_ID).title, head.title);
+  });
+
+  it("accepts an empty title, keeps the old name, and still burns a revision", () => {
+    // Why `validateBoardRename` refuses an empty name instead of letting the
+    // relay handle it: `parse_lab_board_envelope` drops an empty `title` tag,
+    // so this is not an error — it is a revision that renames nothing.
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const head = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    const blankTitle = renameEvent(head, "x");
+    blankTitle.tags = blankTitle.tags.map((tag) =>
+      tag[0] === "title" ? ["title", ""] : tag,
+    );
+
+    assert.deepEqual(publishMockLabRevision(blankTitle, VIEWER), {
+      accepted: true,
+      message: "",
+    });
+    const after = readHead(MOCK_LAB_COMMUNITY_BOARD_ID);
+    assert.equal(after.title, head.title);
+    assert.equal(after.revision, head.revision + 1);
+  });
+
+  it("refuses a rename from someone who may only read the board", () => {
+    // The read-only board is owned by someone else, so the viewer can see it
+    // and cannot write it. `canRenameBoard` hides the button for exactly this
+    // case; the relay is what makes hiding it more than cosmetic.
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const head = readHead(MOCK_LAB_READONLY_BOARD_ID);
+    assert.deepEqual(
+      publishMockLabRevision(renameEvent(head, "Renomeado à força"), VIEWER),
+      { accepted: false, message: "BOARD_READ_ONLY" },
+    );
+    assert.equal(readHead(MOCK_LAB_READONLY_BOARD_ID).title, head.title);
+  });
+
+  it("refuses a rename of a private board the renamer cannot see", () => {
+    // Read the head as its owner, then come back as someone else holding a
+    // *correct* board id and a *current* CAS token — everything a guesser
+    // could ever have. Authorization is judged before CAS, so the answer is
+    // the same opaque BOARD_NOT_FOUND a nonexistent id gets, and a rename
+    // cannot be used to probe for private boards.
+    resetMockLabBoards({ enabled: true, viewerPubkey: OTHER_OWNER });
+    const head = readHead(MOCK_LAB_OTHER_PRIVATE_BOARD_ID);
+    resetMockLabBoards({ enabled: true, viewerPubkey: VIEWER });
+    const [reseeded] = queryMockLabBoards([
+      { kinds: [KIND_LAB_BOARD_HEAD], "#d": [MOCK_LAB_OTHER_PRIVATE_BOARD_ID] },
+    ]);
+    assert.equal(reseeded, undefined, "the board must stay hidden from VIEWER");
+
+    assert.deepEqual(
+      publishMockLabRevision(renameEvent(head, "Vazou?"), VIEWER),
+      { accepted: false, message: "BOARD_NOT_FOUND" },
     );
   });
 });

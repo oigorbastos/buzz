@@ -45,6 +45,15 @@ const mockLabRevisions: RelayEvent[] = [];
  */
 const mockLabModerators = new Set<string>();
 
+/**
+ * `crates/buzz-relay/src/handlers/lab.rs::MAX_TITLE_CHARS`, mirrored — kept
+ * local for the same reason `MODERATION_TRANSITIONS` is, so the mock stays
+ * free of an import cycle with the client it is standing in for. The desktop's
+ * own copy is `MAX_TITLE_CHARS` in `@/features/lab/api`; the suite asserts the
+ * two agree.
+ */
+export const MOCK_MAX_TITLE_CHARS = 160;
+
 /** `op` values the relay routes to `handle_moderation_op`. */
 const MODERATION_OPS = new Set(["archive", "unarchive", "freeze", "unfreeze"]);
 
@@ -449,6 +458,21 @@ export function publishMockLabRevision(
     });
   }
 
+  // Envelope shape is judged before anything reads the board, mirroring
+  // `parse_lab_board_envelope`, which runs ahead of authorization and the CAS
+  // transaction. An empty `title` tag is *dropped* there rather than clearing
+  // the title (`.filter(|s| !s.is_empty())`), so a rename sent with an empty
+  // name is accepted and quietly keeps the old one — the exact outcome the
+  // desktop refuses client-side, and one the mock must not be gentler about.
+  const rawTitle = tagValue(event, "title");
+  const envelopeTitle = rawTitle ? rawTitle : null;
+  if (envelopeTitle && [...envelopeTitle].length > MOCK_MAX_TITLE_CHARS) {
+    return {
+      accepted: false,
+      message: `invalid: lab board title exceeds maximum of ${MOCK_MAX_TITLE_CHARS} characters (got ${[...envelopeTitle].length})`,
+    };
+  }
+
   const requestedRevision = Number.parseInt(
     tagValue(event, "revision") ?? "",
     10,
@@ -544,10 +568,11 @@ export function publishMockLabRevision(
       revision: requestedRevision,
       summary: tagValue(event, "summary") ?? tagValue(currentHead, "summary"),
       tags: nextTags,
+      // A present title renames the board; an absent (or relay-dropped empty)
+      // one keeps the current name. This is the whole rename mechanism —
+      // `handle_content_mutation` does the same `envelope.title.or(head.title)`.
       title:
-        tagValue(event, "title") ??
-        tagValue(currentHead, "title") ??
-        "Untitled board",
+        envelopeTitle ?? tagValue(currentHead, "title") ?? "Untitled board",
     }),
   );
   return { accepted: true, message: "" };

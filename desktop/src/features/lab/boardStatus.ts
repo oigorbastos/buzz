@@ -43,6 +43,41 @@ export function availableArchiveAction(
   return null;
 }
 
+/**
+ * Whether to offer the rename affordance.
+ *
+ * Renaming publishes an ordinary `update` revision, so it needs exactly what
+ * editing needs and nothing more: board write access — the audited ACL in
+ * `model.ts`, whose answer the caller passes in rather than having it
+ * re-derived here — a board that is neither frozen nor archived, and the live
+ * head rather than a pinned revision deep link. It is additionally hidden
+ * while a draft is open, because a rename is itself a compare-and-swap write
+ * against the head and would invalidate that draft's frozen `prev`.
+ *
+ * Those are the Edit button's four conditions, restated rather than shared:
+ * that guard was merged from two lineages and is left alone on purpose.
+ *
+ * Not offered from the board *list*, deliberately. Archiving could be driven
+ * from there because a moderation op carries no `prev` and cannot conflict;
+ * a rename can, and the list's heads come from `useLabBoardsQuery`, which
+ * caches for 30s precisely because it is not a CAS token (contrast
+ * `useLabBoardQuery`'s `staleTime: 0`). Renaming off that copy would mean
+ * routine, unexplainable conflicts.
+ */
+export function canRenameBoard(input: {
+  canWrite: boolean;
+  isEditing: boolean;
+  status: BoardStatus;
+  viewingRevision: number | null;
+}): boolean {
+  return (
+    !input.isEditing &&
+    !isBoardLocked(input.status) &&
+    input.canWrite &&
+    input.viewingRevision === null
+  );
+}
+
 /** Community roles the relay accepts for `ModerationAction::ModerateBoard`. */
 export function canModerateBoards(relayRole: string | null | undefined) {
   return relayRole === "owner" || relayRole === "admin";

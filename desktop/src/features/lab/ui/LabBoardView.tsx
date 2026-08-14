@@ -8,6 +8,7 @@ import {
   Pencil,
   Save,
   LockKeyhole,
+  TextCursorInput,
   Users,
   X,
 } from "lucide-react";
@@ -27,12 +28,14 @@ import {
   availableArchiveAction,
   boardAccessBadgeLabel,
   canModerateBoards,
+  canRenameBoard,
   isBoardLocked,
 } from "@/features/lab/boardStatus";
 import { useMyRelayMembershipQuery } from "@/features/community-members/hooks";
 import {
   useLabBoardHistoryQuery,
   useLabBoardQuery,
+  useRenameLabBoardMutation,
   useRestoreLabBoardMutation,
   useSetLabBoardArchivedMutation,
   useUpdateLabBoardMutation,
@@ -42,6 +45,7 @@ import { LabBoardCopyIdButton } from "@/features/lab/ui/LabBoardCopyIdButton";
 import { LabMarkdownEditor } from "@/features/lab/ui/LabMarkdownEditor";
 import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
 import { LabTagInput } from "@/features/lab/ui/LabTagInput";
+import { RenameLabBoardDialog } from "@/features/lab/ui/RenameLabBoardDialog";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import {
@@ -79,6 +83,7 @@ export function LabBoardView({
     showHistory || viewingRevision !== null,
   );
   const updateMutation = useUpdateLabBoardMutation(boardId);
+  const renameMutation = useRenameLabBoardMutation(boardId);
   const restoreMutation = useRestoreLabBoardMutation(boardId);
   const archiveMutation = useSetLabBoardArchivedMutation(boardId);
   const identityQuery = useIdentityQuery();
@@ -91,6 +96,7 @@ export function LabBoardView({
   const canModerate = canModerateBoards(relayMembershipQuery.data?.role);
 
   const [isEditing, setIsEditing] = React.useState(false);
+  const [isRenameOpen, setIsRenameOpen] = React.useState(false);
   // Poll only while editing — that is the only window where another writer's
   // revision changes what this user should do next.
   const boardQuery = useLabBoardQuery(boardId, isEditing);
@@ -111,6 +117,9 @@ export function LabBoardView({
   const deferredContent = React.useDeferredValue(board?.content ?? "");
 
   function handleStartEditing(head: LabBoardHead) {
+    // A rename is a CAS write against this same head, so it must never be
+    // pending behind a draft whose `prev` it would invalidate.
+    setIsRenameOpen(false);
     setDraft(head.content);
     setDraftTags(head.tags);
     // Freeze the revision this draft is derived from. Everything below depends
@@ -258,6 +267,12 @@ export function LabBoardView({
     currentProfileQuery.data?.ownerPubkey,
   );
   const archiveAction = availableArchiveAction(board.status);
+  const canRename = canRenameBoard({
+    canWrite,
+    isEditing,
+    status: board.status,
+    viewingRevision,
+  });
   const isSaving = updateMutation.isPending;
   // The polled head has moved past the revision this draft was started from,
   // so saving will (correctly) be refused. Say so now rather than letting the
@@ -338,6 +353,22 @@ export function LabBoardView({
           >
             <Pencil className="h-4 w-4" />
             Edit
+          </Button>
+        ) : null}
+        {/* Renaming is an ordinary content mutation, so it is offered under
+            the same conditions as editing — see `canRenameBoard`, which
+            restates that guard rather than reshaping it. */}
+        {canRename ? (
+          <Button
+            data-testid="lab-board-rename"
+            disabled={renameMutation.isPending}
+            onClick={() => setIsRenameOpen(true)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <TextCursorInput className="h-4 w-4" />
+            Rename
           </Button>
         ) : null}
         {/* Archiving is a moderation op: it needs a community role rather than
@@ -564,6 +595,24 @@ export function LabBoardView({
           )}
         </div>
       )}
+
+      {/* Mounted only behind the same guard as the button, so a reader of a
+          board they cannot write has no rename surface at all — not a hidden
+          one. `board` is the head this view is rendering, so the content the
+          rename resends and the `prev` it swaps against come from one
+          snapshot: the property that makes a rename unable to carry stale
+          text. */}
+      {canRename ? (
+        <RenameLabBoardDialog
+          board={board}
+          isRenaming={renameMutation.isPending}
+          onOpenChange={setIsRenameOpen}
+          onRename={(title) =>
+            renameMutation.mutateAsync({ head: board, title })
+          }
+          open={isRenameOpen}
+        />
+      ) : null}
     </div>
   );
 }

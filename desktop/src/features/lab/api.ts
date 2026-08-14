@@ -382,19 +382,21 @@ export async function createBoard(input: {
   return { boardId, eventId };
 }
 
-/**
- * Save an edit, compare-and-swapping against `head`.
- *
- * `title`/`summary` are omitted when unchanged: on the wire, an absent tag
- * means "keep the current value", and there is no empty-means-clear form.
- */
-export async function updateBoard(input: {
+export type BoardUpdateInput = {
   head: LabBoardHead;
   content: string;
   title?: string;
   summary?: string;
   tags?: string[];
-}): Promise<string> {
+};
+
+/**
+ * The tag envelope of one content mutation, without publishing it.
+ *
+ * Split out of `updateBoard` only so the wire shape can be asserted without a
+ * relay — it is the same list that has always been sent, in the same order.
+ */
+export function boardUpdateTags(input: BoardUpdateInput): string[][] {
   const tags: string[][] = [
     ["d", input.head.boardId],
     ["op", input.tags === undefined ? "update" : "update_v2"],
@@ -407,8 +409,97 @@ export async function updateBoard(input: {
     tags.push(["tags", "replace"]);
     for (const tag of normalizeBoardTags(input.tags)) tags.push(["t", tag]);
   }
+  return tags;
+}
 
-  return publishRevision(input.content, tags);
+/**
+ * Save an edit, compare-and-swapping against `head`.
+ *
+ * `title`/`summary` are omitted when unchanged: on the wire, an absent tag
+ * means "keep the current value", and there is no empty-means-clear form.
+ */
+export async function updateBoard(input: BoardUpdateInput): Promise<string> {
+  return publishRevision(input.content, boardUpdateTags(input));
+}
+
+/**
+ * Everything a rename sends, derived from one head — the whole safety argument
+ * for the feature lives in this function.
+ *
+ * There is no title-only op on the wire. `parse_lab_board_envelope` treats
+ * `title` as an optional field of an ordinary `update`, and
+ * `handle_content_mutation` rebuilds the kind:30623 projection from
+ * `event.content` — so borrowing the moderation ops' empty body would *blank
+ * the board* rather than leave it alone. A rename has to resend the Markdown
+ * verbatim, which makes it a full read-modify-write and puts it in reach of
+ * the hazard `LabBoardView.editBase` exists to prevent.
+ *
+ * What removes that hazard here is that both halves come from a single
+ * snapshot: `head.content` and `head.headEventId` are parsed from the same
+ * kind:30623 event, so the text being resent is *by construction* the text of
+ * the exact revision named in `prev`. A rename can therefore never carry stale
+ * content: if anyone published in between, the relay's compare-and-swap
+ * refuses with `BOARD_HEAD_MISMATCH` and nothing is overwritten. Splicing a
+ * `prev` from one read onto content from another would defeat this entirely —
+ * that is the one thing a caller must not do, and why this takes a whole
+ * `LabBoardHead` rather than the three fields it reads.
+ *
+ * Plain `update`, not `update_v2`: with no `tags=replace` marker the relay
+ * keeps the board's topic tags, and an absent `summary` keeps the summary.
+ * Absent means "unchanged" on this wire, which is what a rename wants for
+ * every field but one.
+ */
+export function boardRenamePayload(input: {
+  head: LabBoardHead;
+  title: string;
+}): BoardUpdateInput {
+  return {
+    head: input.head,
+    content: input.head.content,
+    title: input.title.trim(),
+  };
+}
+
+/**
+ * Refuse a rename the relay would mishandle or waste a revision on.
+ *
+ * The empty case is not cosmetic: `parse_lab_board_envelope` drops an empty
+ * `title` tag (`.filter(|s| !s.is_empty())`) and an absent title falls back to
+ * the current one, so an empty rename would be *accepted*, change nothing, and
+ * still append a revision. The length cap mirrors the relay's `MAX_TITLE_CHARS`
+ * so it can be explained here instead of coming back as a rejection.
+ */
+export function validateBoardRename(input: {
+  head: Pick<LabBoardHead, "content" | "title">;
+  title: string;
+}): string | null {
+  const nextTitle = input.title.trim();
+  const invalid = validateBoardInput({
+    title: nextTitle,
+    content: input.head.content,
+  });
+  if (invalid) return invalid;
+  if (nextTitle === input.head.title) {
+    return "That is already this board's name.";
+  }
+  return null;
+}
+
+/**
+ * Rename a board without touching a character of its text.
+ *
+ * Validates first so a refusable title never reaches the relay, then publishes
+ * the ordinary update `boardRenamePayload` describes. A conflict propagates to
+ * the caller: a rename that quietly retried against a newer head would be
+ * exactly the silent overwrite the CAS exists to stop.
+ */
+export async function renameBoard(input: {
+  head: LabBoardHead;
+  title: string;
+}): Promise<string> {
+  const invalid = validateBoardRename(input);
+  if (invalid) throw new Error(invalid);
+  return updateBoard(boardRenamePayload(input));
 }
 
 /**
@@ -530,6 +621,45 @@ export function describeBoardModerationError(
   const message = error.message.toLowerCase();
   if (message.includes("expected '")) {
     return "This board's status changed since the page loaded. Reopen it and try again.";
+  }
+  if (message.includes("rate-limited")) {
+    return "Too many board writes right now. Wait a minute and try again.";
+  }
+  const detail = stripRelayPrefix(error.message);
+  return detail ? `${fallback} ${detail}` : fallback;
+}
+
+/**
+ * A rename lost the compare-and-swap.
+ *
+ * Deliberately not `BOARD_CONFLICT_MESSAGE`: that one promises "your text is
+ * kept", which is the right thing to say to someone whose draft is still on
+ * screen and the wrong thing to say here, where no text was at stake and the
+ * board is untouched. Saying so is the whole point — the alternative, retrying
+ * against the new head, would republish the content this rename read moments
+ * before and destroy whatever landed in between.
+ */
+export const BOARD_RENAME_CONFLICT_MESSAGE =
+  "Someone else published to this board while this was open, so the rename was refused. Nothing was changed — close this, let the board reload, and rename it again.";
+
+/** Turn a rejected rename into something a person can act on. */
+export function describeBoardRenameError(error: unknown): string {
+  const fallback = "Failed to rename this board.";
+  if (isRelayUnreachableError(error)) return RELAY_UNREACHABLE_SHORT;
+  if (isBoardConflictError(error)) return BOARD_RENAME_CONFLICT_MESSAGE;
+  if (!(error instanceof Error)) return fallback;
+  const message = error.message.toLowerCase();
+  if (message.includes("frozen")) {
+    return "This board is frozen, so it cannot be renamed.";
+  }
+  // The relay answers a write it will not authorize with "lab board not found"
+  // whether the board is missing or merely beyond this identity's reach — it
+  // refuses to be an existence oracle. Neither may this sentence.
+  if (message.includes("not found") || message.includes("not_found")) {
+    return "This board is no longer available for editing from this account.";
+  }
+  if (message.includes("read_only") || message.includes("read-only")) {
+    return "This board is read-only for you, so it cannot be renamed.";
   }
   if (message.includes("rate-limited")) {
     return "Too many board writes right now. Wait a minute and try again.";
