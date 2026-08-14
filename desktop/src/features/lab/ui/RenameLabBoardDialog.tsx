@@ -141,8 +141,13 @@ export function RenameLabBoardDialog({
                 data-testid="rename-lab-board-title"
                 disabled={isRenaming}
                 id="rename-lab-board-title"
-                // Mirrors the relay's own cap so the field stops where the
-                // relay would refuse, instead of paying a round trip to learn.
+                // A soft stop, deliberately not the authoritative check: HTML
+                // maxLength counts UTF-16 code units while the relay and
+                // `validateBoardRename` both count Unicode scalar values, so an
+                // astral-heavy title (emoji, CJK ext-B) is cut here around 80
+                // code points where the relay would still accept 160. It errs
+                // toward refusing early and never admits what the relay rejects;
+                // `validateBoardRename` remains the correct gate.
                 maxLength={MAX_TITLE_CHARS}
                 onChange={(event) => setTitle(event.target.value)}
                 ref={titleInputRef}

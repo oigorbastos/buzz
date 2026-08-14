@@ -15,6 +15,7 @@ import {
   fetchBoardHead,
   fetchBoardHeads,
   fetchBoardHistory,
+  isBoardConflictError,
   type LabBoardHead,
   type LabBoardRevision,
   renameBoard,
@@ -125,6 +126,17 @@ export function useRenameLabBoardMutation(boardId: string | null) {
       renameBoard(input),
     onSuccess: (_result, variables) =>
       invalidateBoard(queryClient, boardId ?? variables.head.boardId),
+    // A lost CAS must also refetch, or the next attempt rebuilds the identical
+    // payload from the same stale cached head and fails identically — a retry
+    // loop with no exit but leaving the board. Nothing else refreshes it here:
+    // the poll only runs while editing, `refetchOnWindowFocus` is off, and the
+    // dialog never mounts the head query itself. This is safe only because
+    // `canRenameBoard` forbids renaming while a draft is open, so there is no
+    // `editBase` for the refetch to disturb.
+    onError: (error, variables) => {
+      if (!isBoardConflictError(error)) return;
+      invalidateBoard(queryClient, boardId ?? variables.head.boardId);
+    },
   });
 }
 

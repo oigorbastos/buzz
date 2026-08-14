@@ -35,6 +35,13 @@ import { type LabBoardAccess, normalizeBoardTags } from "@/features/lab/model";
 
 /** Relay-enforced caps, mirrored so the UI can fail before a round trip. */
 export const MAX_TITLE_CHARS = 160;
+
+/**
+ * Rendered in place of a title when the relay holds no `title` tag. It is a
+ * display default, not a stored value — `validateBoardRename` relies on that
+ * distinction so an untitled board can still be given this exact name.
+ */
+export const UNTITLED_BOARD_TITLE = "Untitled board";
 export const MAX_SUMMARY_CHARS = 500;
 export const MAX_MARKDOWN_BYTES = 64 * 1024;
 
@@ -153,7 +160,7 @@ export function parseBoardHead(event: RelayEvent): LabBoardHead | null {
 
   return {
     boardId,
-    title: tagValue(event, "title") ?? "Untitled board",
+    title: tagValue(event, "title") ?? UNTITLED_BOARD_TITLE,
     summary: tagValue(event, "summary"),
     content: event.content,
     revision,
@@ -479,7 +486,13 @@ export function validateBoardRename(input: {
     content: input.head.content,
   });
   if (invalid) return invalid;
-  if (nextTitle === input.head.title) {
+  // `head.title` carries UNTITLED_BOARD_TITLE when the relay holds no title tag
+  // at all, so an equality check there would refuse the one rename that is not
+  // a no-op: naming an untitled board exactly that actually stores the title.
+  if (
+    input.head.title !== UNTITLED_BOARD_TITLE &&
+    nextTitle === input.head.title
+  ) {
     return "That is already this board's name.";
   }
   return null;
