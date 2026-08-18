@@ -47,7 +47,7 @@ use super::event::dispatch_persistent_event;
 
 use crate::conformance::{
     self as conf, channel_label, claimed_community_from_event, emit, msg_id_label,
-    state_for_request, EmitGuard, TraceAction, Verdict,
+    state_for_request, CommunityLabel, EmitGuard, TraceAction, Verdict,
 };
 
 fn validate_custom_emoji_tags(event: &Event) -> Result<(), IngestError> {
@@ -594,6 +594,44 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
     )
+}
+
+/// The three-way write action emitted at the trailing dispatch seam, shared by
+/// the message and reaction paths.
+///
+/// `channel_id.is_some()` separates channel-bearing (Insert/Duplicate) from
+/// channel-less (InsertGlobal); `was_inserted` separates accepted-new from
+/// no-op-on-conflict. A channel-less duplicate collapses onto InsertGlobal —
+/// the spec does not model it separately, because channel-less duplicates
+/// share the observation shape of channel-less inserts at this seam; see
+/// docs/spec/MultiTenantRelay.tla lines 559-595.
+///
+/// This is a named function rather than two inline `match`es so the
+/// channel-less case is reachable from a unit test. The reaction path used to
+/// carry `channel_id.expect("reaction path has channel")` here, which panicked
+/// the ingest worker on any reaction whose target had no channel (#5294).
+fn write_trace_action(
+    event_id: &[u8],
+    channel_id: Option<Uuid>,
+    was_inserted: bool,
+    claimed_community: Option<CommunityLabel>,
+) -> TraceAction {
+    match (channel_id, was_inserted) {
+        (Some(ch), true) => TraceAction::WriteInsert {
+            msg_id: msg_id_label(event_id),
+            channel: channel_label(ch),
+            claimed_community,
+        },
+        (Some(ch), false) => TraceAction::WriteDuplicate {
+            msg_id: msg_id_label(event_id),
+            channel: channel_label(ch),
+            claimed_community,
+        },
+        (None, _) => TraceAction::WriteInsertGlobal {
+            msg_id: msg_id_label(event_id),
+            claimed_community,
+        },
+    }
 }
 
 /// Check channel membership: member OR open-visibility channel.
@@ -2829,30 +2867,12 @@ async fn ingest_event_inner(
         };
 
         let pubkey_hex = auth.pubkey().to_hex();
-        // Spec WriteInsert (line 514) / WriteDuplicate (line 606) /
-        // WriteInsertGlobal (line 559): emit the abstract write action. The
-        // persist API returns `was_inserted` (true → Insert/Global, false →
-        // Duplicate). Reactions on project events (issue/PR roots and their
-        // comments) carry no `h` tag, so `channel_id` can be `None` here —
-        // mirror the message write's three-way split instead of asserting a
-        // channel, which panicked the ingest worker on those events.
+        // Emit the abstract write action. A reaction's channel comes from its
+        // target, not from an `h` tag, so `channel_id` is `None` whenever the
+        // target is channel-less — project roots and their comments upstream,
+        // and in this fork every Lab board revision and head projection too.
         let claimed = claimed_community_from_event(&event);
-        let action = match (channel_id, was_inserted) {
-            (Some(ch), true) => TraceAction::WriteInsert {
-                msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(ch),
-                claimed_community: claimed,
-            },
-            (Some(ch), false) => TraceAction::WriteDuplicate {
-                msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(ch),
-                claimed_community: claimed,
-            },
-            (None, _) => TraceAction::WriteInsertGlobal {
-                msg_id: msg_id_label(event.id.as_bytes()),
-                claimed_community: claimed,
-            },
-        };
+        let action = write_trace_action(event.id.as_bytes(), channel_id, was_inserted, claimed);
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
         dispatch_persistent_event(
             tenant,
@@ -2979,22 +2999,7 @@ async fn ingest_event_inner(
     // see docs/spec/MultiTenantRelay.tla lines 559-595.
     {
         let claimed = claimed_community_from_event(&event);
-        let action = match (channel_id, was_inserted) {
-            (Some(ch), true) => TraceAction::WriteInsert {
-                msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(ch),
-                claimed_community: claimed,
-            },
-            (Some(ch), false) => TraceAction::WriteDuplicate {
-                msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(ch),
-                claimed_community: claimed,
-            },
-            (None, _) => TraceAction::WriteInsertGlobal {
-                msg_id: msg_id_label(event.id.as_bytes()),
-                claimed_community: claimed,
-            },
-        };
+        let action = write_trace_action(event.id.as_bytes(), channel_id, was_inserted, claimed);
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
     }
     dispatch_persistent_event(
@@ -3023,9 +3028,9 @@ mod tests {
     use super::*;
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
-        KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
-        KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE,
-        KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
+        KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LAB_BOARD_HEAD,
+        KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE,
+        KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
 
@@ -3392,6 +3397,71 @@ mod tests {
     #[test]
     fn reactions_do_not_require_h_tag() {
         assert!(!requires_h_channel_scope(KIND_REACTION));
+    }
+
+    /// Regression for the ingest-worker panic on a reaction to a channel-less
+    /// target (#5294). This seam used to read
+    /// `channel_id.expect("reaction path has channel")`.
+    ///
+    /// Both halves are asserted on purpose. The insert is the first hit; the
+    /// duplicate is what made it permanent — the row is written before the
+    /// panic, so the client sees a failed request for a persisted event and
+    /// retries, and a duplicate carrying the same assumption head-of-line
+    /// blocks a durable publish queue for good.
+    #[test]
+    fn channel_less_write_traces_global_instead_of_asserting_a_channel() {
+        let event_id = [0x11u8; 32];
+
+        assert!(matches!(
+            write_trace_action(&event_id, None, true, None),
+            TraceAction::WriteInsertGlobal { .. }
+        ));
+        assert!(matches!(
+            write_trace_action(&event_id, None, false, None),
+            TraceAction::WriteInsertGlobal { .. }
+        ));
+    }
+
+    /// The channel-bearing halves must not collapse onto the global variant.
+    /// Dropping the channel dimension here would not crash anything — it would
+    /// silently blind the conformance checks that read it (M2/M8), which is the
+    /// failure mode a "just make it Option" fix walks into.
+    #[test]
+    fn channel_bearing_writes_keep_their_channel_dimension() {
+        let event_id = [0x22u8; 32];
+        let channel = Uuid::from_u128(0x7777);
+
+        assert!(matches!(
+            write_trace_action(&event_id, Some(channel), true, None),
+            TraceAction::WriteInsert { .. }
+        ));
+        assert!(matches!(
+            write_trace_action(&event_id, Some(channel), false, None),
+            TraceAction::WriteDuplicate { .. }
+        ));
+    }
+
+    /// Why a reaction reaches that seam with no channel at all.
+    ///
+    /// A reaction is neither forced to carry an `h` tag nor forced global, so
+    /// its `channel_id` is whatever the target lookup returned — `None` for a
+    /// channel-less target (`ReactionChannelResult::NoChannel`). Nothing
+    /// between that lookup and the write seam rejects it.
+    ///
+    /// This fork is more exposed than upstream's framing suggests. Upstream
+    /// described project roots and their comments; here Lab boards are
+    /// community-scoped rather than channel-scoped, so every board revision
+    /// (40101) and head projection (30623) is another channel-less row a
+    /// reaction can point at.
+    #[test]
+    fn a_reaction_can_reach_the_write_seam_without_a_channel() {
+        assert!(!requires_h_channel_scope(KIND_REACTION));
+        assert!(!is_global_only_kind(KIND_REACTION));
+
+        // Lab kinds are not channel-scoped either, so their stored rows carry
+        // no channel for a reaction to inherit.
+        assert!(!requires_h_channel_scope(KIND_LAB_BOARD_REVISION));
+        assert!(!requires_h_channel_scope(KIND_LAB_BOARD_HEAD));
     }
 
     #[test]
