@@ -192,6 +192,18 @@ const CLAUDE_BUZZ_ALLOWED_TOOLS: &[&str] = &[
     // requires `--base`, so the semantic CAS guard lives in clap rather than
     // in Claude Code's fragile shell-string glob matcher.
     "Bash(buzz lab update:*)",
+    // Creating a board, same prefix-rule shape: `--title` and `--content` are
+    // required by clap, so the argument semantics stay there.
+    //
+    // What this rule does NOT constrain is `--access`. A prefix rule matches
+    // every flag, `--access private` included, and this list is the ONLY
+    // pre-authorization for the Claude agents that read it. Board access scope
+    // is immutable after creation, so an agent that picks `private` picks it
+    // once and forever; the refusal for that scope lives in the workstation
+    // PreToolUse guard and in the prompt text below, not here. Barbosa is a
+    // separate case entirely — its adapter replaces `allowedTools` with an
+    // empty list, so none of these six reach it and its own grammar decides.
+    "Bash(buzz lab create:*)",
 ];
 
 fn claude_code_session_options(agent_name: &str) -> Option<ClaudeCodeSessionOptions> {
@@ -4175,6 +4187,7 @@ mod tests {
                 "Bash(buzz lab history:*)",
                 "Bash(buzz lab ref:*)",
                 "Bash(buzz lab update:*)",
+                "Bash(buzz lab create:*)",
             ]
         );
         let serialized = serde_json::to_value(&claude).unwrap();
@@ -4182,10 +4195,15 @@ mod tests {
         assert!(allowed_tools
             .iter()
             .any(|tool| tool == "Bash(buzz messages send:*)"));
+        assert!(allowed_tools
+            .iter()
+            .any(|tool| tool == "Bash(buzz lab create:*)"));
+        // `create` is admitted as of this change; `restore` is not, and neither
+        // is Channel Canvas. The shape assertion stays: nothing but the one
+        // reply command and the `buzz lab` family may appear here.
         assert!(allowed_tools.iter().all(|tool| {
             let value = tool.as_str().unwrap();
             !value.contains("buzz canvas")
-                && !value.contains(" create")
                 && !value.contains(" restore")
                 && (value == "Bash(buzz messages send:*)" || value.contains("Bash(buzz lab"))
         }));

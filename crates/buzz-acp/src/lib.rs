@@ -4101,6 +4101,16 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("--content - < <path-to-snapshot>.md"));
         assert!(!prompt.contains("<<'BUZZ_LAB_MARKDOWN'"));
         assert!(prompt.contains("Windows caps that near 8 KB"));
+        // Creation. `--content` is mandatory and only ever `-`, so the redirect
+        // is the only spelling that exists -- an agent taught the update flow
+        // alone reports it cannot make a board at all.
+        assert!(prompt
+            .contains("buzz lab create --title '<title>' --content - < <path-to-snapshot>.md"));
+        assert!(prompt.contains("no inline form and no heredoc form"));
+        // And the one scope it must not mint, with the reason attached so the
+        // refusal is not retried under another spelling.
+        assert!(prompt.contains("Do not\ncreate a board with `--access private`"));
+        assert!(prompt.contains("immutable after creation"));
     }
 }
 

@@ -52,11 +52,11 @@ fn nest_skill_contains_lab_cas_workflow() {
     assert!(BUZZ_CLI_SKILL_MD.contains("complete Markdown document, not a diff"));
     assert!(BUZZ_CLI_SKILL_MD.contains("Exit code 5 is a stale-base conflict"));
     assert!(BUZZ_CLI_SKILL_MD.contains("--content-only"));
-    // Redirection, not a heredoc: a heredoc puts the whole snapshot on the
-    // command line, which Windows caps near 8 KB, so a board past ~7 KB became
-    // impossible for an agent to update. Assert the heredoc stays gone.
     assert!(BUZZ_CLI_SKILL_MD.contains("--content - < <path-to-snapshot>.md"));
     assert!(!BUZZ_CLI_SKILL_MD.contains("<<'BUZZ_LAB_MARKDOWN'"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("buzz lab create --title '<title>' --content -"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("no inline form and no heredoc form"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("Do not\ncreate a board with `--access private`"));
 }
 
 #[test]

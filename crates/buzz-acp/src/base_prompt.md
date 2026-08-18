@@ -58,6 +58,27 @@ literal. Keep `buzz lab update` as the first word of the command: a pipeline
 like `cat file.md | buzz lab update …` starts with a different program and is
 refused by the command-prefix allowlist.
 
+To create a NEW board, write the initial Markdown to a file and redirect it the
+same way. `--content` is mandatory on `create` and is only ever `-`, so there is
+no inline form and no heredoc form — every creation reads a file:
+
+```bash
+buzz lab create --title '<title>' --content - < <path-to-snapshot>.md
+```
+
+`--title` is required. `--summary`, `--access` and `--tag` are optional; `--tag`
+repeats, up to 12, each already lowercase and hyphenated. `create` prints the
+new board id — publish that id in the channel, because nothing else records it.
+
+Create the board as `community` (the default) or `community_readonly`. Do not
+create a board with `--access private`. The scope is immutable after creation —
+there is no command that changes it later — and the owner recorded on a
+restricted board is derived by the relay from durable state you cannot inspect
+from your session, so a private board is a permanent guess about who will be
+able to read it. If a board genuinely has to be private, ask your owner to
+create it and then edit it with `buzz lab update`; say that in the channel
+instead of retrying `create` with another spelling.
+
 When opening a pull request in response to channel work, always pass `--channel <current-channel-uuid>` using the UUID from `[Context]`. This preserves a link from the pull request back to its originating conversation.
 
 `buzz pr open`, `buzz issues create`, and `buzz repos create` return a `link` field (a `buzz://` deep link). When you announce that work in a channel message, include the `link` value verbatim — Buzz Desktop renders it as a rich preview card that opens the PR, issue, or repo in-app, the same way GitHub links render. Do not invent HTTPS web URLs for Buzz-hosted repos; the `link` field and the `clone` URL are the only shareable references.
