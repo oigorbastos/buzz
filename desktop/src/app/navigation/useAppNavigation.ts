@@ -11,6 +11,7 @@ import { resolveSearchHitDestination } from "@/app/navigation/resolveSearchHitDe
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
+  force?: boolean;
   replace?: boolean;
   resetScroll?: boolean;
 };
@@ -26,18 +27,17 @@ export function useAppNavigation() {
       next: {
         to: string;
         params?: Record<string, string>;
-        // Numbers are allowed alongside strings so a purely-numeric value
-        // (e.g. `goLabBoard`'s `revision`) round-trips through the router's
-        // default JSON-ish search codec as `?revision=5` instead of the
-        // double-encoded `?revision=%225%22` a numeric-looking *string*
-        // produces (JSON.parse("5") succeeds, so the codec re-quotes it).
+        // Numbers are allowed alongside strings so numeric route search values
+        // round-trip through the router's JSON-ish search codec without being
+        // double-encoded as quoted strings.
         search?: Record<string, string | number | undefined>;
+        state?: Record<string, unknown>;
       },
       behavior: NavigationBehavior = {},
     ) => {
       const nextLocation = router.buildLocation(next as never);
 
-      if (location.href === nextLocation.href) {
+      if (location.href === nextLocation.href && !behavior.force) {
         return false;
       }
 
@@ -150,6 +150,11 @@ export function useAppNavigation() {
         pullRequestId?: string;
         issueId?: string;
         repositoryId?: string;
+        /** Workspace tab requested by a share link (link vocabulary). */
+        tab?: string;
+        /** Unique per entity-link activation so repeating the same link can
+         * re-apply an unchanged tab selection. */
+        entityNavigationId?: string;
       },
     ) =>
       commitNavigation(
@@ -169,9 +174,16 @@ export function useAppNavigation() {
             ...(behavior?.repositoryId
               ? { repositoryId: behavior.repositoryId }
               : {}),
+            ...(behavior?.tab ? { tab: behavior.tab } : {}),
           },
+          state: behavior?.entityNavigationId
+            ? { entityNavigationId: behavior.entityNavigationId }
+            : undefined,
         },
-        behavior,
+        {
+          ...behavior,
+          force: Boolean(behavior?.entityNavigationId),
+        },
       ),
     [commitNavigation],
   );

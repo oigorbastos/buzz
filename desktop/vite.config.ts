@@ -45,6 +45,10 @@ export default defineConfig(async () => ({
         import.meta.dirname,
         "../preview-features.json",
       ),
+      "@model-capabilities-manifest": path.resolve(
+        import.meta.dirname,
+        "../scripts/model-capabilities.json",
+      ),
     },
   },
 

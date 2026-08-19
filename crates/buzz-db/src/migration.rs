@@ -634,9 +634,11 @@ mod tests {
         // 0033_community_deletion_recovery.sql (ported from upstream's 0030).
         // 0031 is PINNED: it is already applied in production, so the ported
         // deletion pair had to take 0032/0033 rather than displace it.
+        // then to 34 by 0034_workflow_run_error_codes.sql (upstream's
+        // 0031, renumbered because 0029/0030/0031 are already occupied).
         // This count is a deliberate tripwire: adding a migration must be a
         // conscious act, so update it in the same commit that adds one.
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 34);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1063,6 +1065,27 @@ mod tests {
         assert_eq!(migrations[32].version, 33);
         let deletion_recovery = migrations[32].sql.as_str();
         assert!(deletion_recovery.contains("SET LOCAL lock_timeout = '5s'"));
+    }
+
+    #[test]
+    fn workflow_run_error_codes_are_additive_and_backfilled_without_parsing_diagnostics() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+
+        assert_eq!(migrations[33].version, 34);
+        let sql = migrations[33].sql.as_str();
+        assert!(sql.contains("ALTER TABLE workflow_runs ADD COLUMN error_code TEXT"));
+        assert!(sql.contains("SET error_code = 'legacy_unclassified'"));
+        assert!(sql.contains("status IN ('failed', 'cancelled')"));
+        assert!(!sql.contains("error_message LIKE"));
+        assert!(!MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 1)
+            .expect("initial migration")
+            .sql
+            .as_str()
+            .contains("error_code"));
+        assert!(include_str!("../../../schema/schema.sql").contains("error_code          TEXT"));
     }
 
     #[test]

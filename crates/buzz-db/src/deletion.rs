@@ -4719,7 +4719,6 @@ mod postgres_tests {
         .await
         .expect("drop probe database");
     }
-
     /// End-to-end confirmation that a real Lab board's rows are actually
     /// purged, in FK-safe order, by a full deletion run — not just that the
     /// catalog checks accept the two tables' presence (see

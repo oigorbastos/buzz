@@ -72,8 +72,9 @@ fn nip98_post_header(keys: &Keys, url: &str, body: &str) -> String {
 }
 
 async fn e2e_db_pool() -> sqlx::Pool<sqlx::Postgres> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string() // sadscan:disable np.postgres.1
+    });
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
@@ -717,6 +718,81 @@ async fn test_stored_events_returned_before_eose() {
         found,
         "Stored event not returned before EOSE. Got: {events:?}"
     );
+
+    client.disconnect().await.expect("disconnect");
+}
+
+/// An explicit `#h` branch that cannot match must not cancel a valid OR sibling.
+/// The valid channel remains usable for historical delivery and live fan-out;
+/// malformed-only requests still close because no authorized UUID survives.
+#[tokio::test]
+#[ignore]
+async fn test_valid_channel_survives_malformed_or_empty_h_sibling() {
+    let url = relay_url();
+    let kind: u16 = 9;
+    let keys = Keys::generate();
+    let channel = create_test_channel(&keys).await;
+    let mut client = BuzzTestClient::connect(&url, &keys).await.expect("connect");
+
+    for (label, sibling) in [
+        (
+            "malformed",
+            serde_json::json!({"kinds": [kind], "#h": ["not-a-uuid"]}),
+        ),
+        ("empty", serde_json::json!({"kinds": [kind], "#h": []})),
+    ] {
+        let historical = format!("{label}-historical-{}", Uuid::new_v4());
+        let ok = client
+            .send_text_message(&keys, &channel, &historical, kind)
+            .await
+            .expect("send historical event");
+        assert!(ok.accepted, "historical event rejected: {}", ok.message);
+
+        let valid = Filter::new()
+            .kind(Kind::Custom(kind))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()]);
+        let sibling: Filter = serde_json::from_value(sibling).expect("parse sibling filter");
+        let sid = sub_id(label);
+        client
+            .subscribe(&sid, vec![valid, sibling])
+            .await
+            .expect("subscribe");
+
+        let events = client
+            .collect_until_eose(&sid, Duration::from_secs(5))
+            .await
+            .expect("valid sibling history followed by EOSE");
+        assert!(
+            events.iter().any(|event| event.content == historical),
+            "valid sibling history missing for {label} #h branch: {events:?}",
+        );
+
+        let live = format!("{label}-live-{}", Uuid::new_v4());
+        let ok = client
+            .send_text_message(&keys, &channel, &live, kind)
+            .await
+            .expect("send live event");
+        assert!(ok.accepted, "live event rejected: {}", ok.message);
+        let message = client
+            .recv_event(Duration::from_secs(5))
+            .await
+            .expect("receive post-EOSE live event");
+        match message {
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } => {
+                assert_eq!(subscription_id, sid);
+                assert_eq!(event.content, live);
+            }
+            other => panic!("expected live EVENT for {label} sibling, got {other:?}"),
+        }
+
+        client
+            .close_subscription(&sid)
+            .await
+            .expect("close subscription");
+    }
 
     client.disconnect().await.expect("disconnect");
 }
@@ -2269,14 +2345,17 @@ async fn add_member_with_role_ws(
     (ok.accepted, ok.message)
 }
 
-/// Only owners/admins can add another identity to a private channel.
+/// Any active member can add any ordinary role to a private channel.
 #[tokio::test]
 #[ignore]
-async fn test_private_channel_member_cannot_invite() {
+async fn test_private_channel_any_member_can_invite() {
     let url = relay_url();
     let owner_keys = Keys::generate();
-    let member_keys = Keys::generate();
-    let invitee_keys = Keys::generate();
+    let actors = [
+        ("member", Keys::generate()),
+        ("guest", Keys::generate()),
+        ("bot", Keys::generate()),
+    ];
 
     // Connect as owner and create a private channel.
     let mut owner_client = BuzzTestClient::connect(&url, &owner_keys)
@@ -2284,54 +2363,70 @@ async fn test_private_channel_member_cannot_invite() {
         .expect("connect as owner");
     let channel_id = create_private_channel_ws(&mut owner_client, &owner_keys).await;
 
-    // Owner adds member_keys as a regular member.
-    let (accepted, msg) = add_member_ws(
-        &mut owner_client,
-        &channel_id,
-        &member_keys.public_key().to_hex(),
-        &owner_keys,
-    )
-    .await;
-    assert!(accepted, "owner should add member, got: {msg}");
+    // Seed one actor for each ordinary active role.
+    for (role, keys) in &actors {
+        let (accepted, msg) = add_member_with_role_ws(
+            &mut owner_client,
+            &channel_id,
+            &keys.public_key().to_hex(),
+            role,
+            &owner_keys,
+        )
+        .await;
+        assert!(accepted, "owner should add {role} actor, got: {msg}");
+    }
 
-    // Connect as the regular member.
-    let mut member_client = BuzzTestClient::connect(&url, &member_keys)
-        .await
-        .expect("connect as member");
+    // Exercise the full ordinary-role target matrix. Relay and DB authorization
+    // both run here, unlike the Desktop/mobile policy-unit-test mirrors.
+    for (actor_role, actor_keys) in &actors {
+        let mut actor_client = BuzzTestClient::connect(&url, actor_keys)
+            .await
+            .unwrap_or_else(|err| panic!("connect as {actor_role}: {err}"));
 
-    // Regular member tries to invite a third user.
-    let (accepted, msg) = add_member_ws(
-        &mut member_client,
-        &channel_id,
-        &invitee_keys.public_key().to_hex(),
-        &member_keys,
-    )
-    .await;
-    assert!(
-        !accepted,
-        "regular member must not add another private-channel identity: {msg}"
-    );
-    assert!(
-        msg.contains("owners/admins"),
-        "rejection should name the owner/admin requirement, got: {msg}"
-    );
+        for target_role in ["member", "guest", "bot"] {
+            let target_keys = Keys::generate();
+            let target_pubkey_hex = target_keys.public_key().to_hex();
+            let (accepted, msg) = add_member_with_role_ws(
+                &mut actor_client,
+                &channel_id,
+                &target_pubkey_hex,
+                target_role,
+                actor_keys,
+            )
+            .await;
+            assert!(
+                accepted,
+                "private-channel {actor_role} should add {target_role}, got: {msg}"
+            );
+            assert_eq!(
+                member_role(&url, &owner_keys, &channel_id, &target_pubkey_hex).await,
+                Some(target_role.to_string()),
+                "private-channel {actor_role} add must persist the {target_role} role"
+            );
+        }
 
-    // The same member re-adding *themselves* stays idempotent — the huddle
-    // bot-add and kind:9021 paths depend on a self-targeted PUT_USER working.
-    let (accepted, msg) = add_member_ws(
-        &mut member_client,
-        &channel_id,
-        &member_keys.public_key().to_hex(),
-        &member_keys,
-    )
-    .await;
-    assert!(
-        accepted,
-        "self-targeted re-add must stay idempotent, got: {msg}"
-    );
+        // Re-adding oneself stays idempotent — the huddle bot-add and kind:9021
+        // paths depend on a self-targeted PUT_USER working.
+        let (accepted, msg) = add_member_with_role_ws(
+            &mut actor_client,
+            &channel_id,
+            &actor_keys.public_key().to_hex(),
+            actor_role,
+            actor_keys,
+        )
+        .await;
+        assert!(
+            accepted,
+            "self-targeted {actor_role} re-add must stay idempotent, got: {msg}"
+        );
+
+        actor_client
+            .disconnect()
+            .await
+            .unwrap_or_else(|err| panic!("disconnect {actor_role}: {err}"));
+    }
 
     owner_client.disconnect().await.expect("disconnect owner");
-    member_client.disconnect().await.expect("disconnect member");
 }
 
 /// An admin — not just the owner — can still add to a private channel.
