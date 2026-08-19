@@ -140,6 +140,8 @@ export function AppShell() {
     goChannel,
     goHome,
     goNewMessage,
+    goProjects,
+    goPulse,
     goSettings,
     closeSettings,
     openSearchHit,

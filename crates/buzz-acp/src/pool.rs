@@ -32,8 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, ClaudeCodeSessionOptions,
-    EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport,
+    EnvVar, McpServer, ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
