@@ -287,8 +287,9 @@ describe("visibility-gated hooks", () => {
     focused = true;
     await act(async () => window.dispatchEvent(new window.Event("focus")));
     assert.deepEqual(observed, [1_000, false]);
+    // Windows can defer the two zero-delay scheduler turns beyond 10 ms.
     await act(
-      async () => new Promise((resolve) => window.setTimeout(resolve, 10)),
+      async () => new Promise((resolve) => window.setTimeout(resolve, 50)),
     );
     assert.deepEqual(observed, [1_000, false, 1_000]);
 
