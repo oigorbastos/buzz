@@ -4732,6 +4732,30 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 }
 
 #[cfg(test)]
+fn test_shell_command() -> String {
+    #[cfg(windows)]
+    {
+        // `bash` may resolve to the WSL launcher on Windows, which exits
+        // immediately when spawned by a native test process. GitHub's
+        // Windows runner provides Git for Windows, whose bash supports the
+        // POSIX scripts used by these ACP subprocess tests.
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = std::env::var_os(variable) {
+                let path = std::path::PathBuf::from(root)
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe");
+                if path.is_file() {
+                    return path.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
+    "bash".to_owned()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -6057,7 +6081,8 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let shell = test_shell_command();
+        let acp = AcpClient::spawn(&shell, &["-c".to_string(), script], &[], false)
             .await
             .expect("spawn lifecycle ACP script");
         let mut agent = OwnedAgent {
@@ -6153,7 +6178,8 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let shell = test_shell_command();
+        let acp = AcpClient::spawn(&shell, &["-c".to_string(), script], &[], false)
             .await
             .expect("spawn channel lifecycle ACP script");
         let channel_id = Uuid::new_v4();
@@ -6329,7 +6355,8 @@ while IFS= read -r line; do
   count=$((count + 1))
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+        let shell = test_shell_command();
+        let acp = AcpClient::spawn(&shell, &["-c".into(), script], &[], false)
             .await
             .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
@@ -6482,7 +6509,8 @@ done"#
 printf '%s\n' "$line" > '{quoted_capture}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+        let shell = test_shell_command();
+        let acp = AcpClient::spawn(&shell, &["-c".into(), script], &[], false)
             .await
             .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
@@ -8628,7 +8656,8 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let shell = test_shell_command();
+        AcpClient::spawn(&shell, &["-c".to_string(), script], &[], false)
             .await
             .expect("spawn effort ACP script")
     }
@@ -8799,7 +8828,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configO
 IFS= read -r _effort
 exit 0"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let shell = test_shell_command();
+        let acp = AcpClient::spawn(&shell, &["-c".to_string(), script], &[], false)
             .await
             .expect("spawn transport-exit ACP script");
         let mut agent = effort_agent(acp, Some("high"));
@@ -8888,7 +8918,8 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let shell = test_shell_command();
+        AcpClient::spawn(&shell, &["-c".to_string(), script], &[], false)
             .await
             .expect("spawn switch ACP script")
     }
@@ -9184,7 +9215,8 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let shell = test_shell_command();
+        AcpClient::spawn(&shell, &["-c".to_string(), script], &[], false)
             .await
             .expect("spawn switch ACP script")
     }
