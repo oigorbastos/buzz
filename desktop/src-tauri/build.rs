@@ -7,6 +7,60 @@ include!("src/managed_agents/reserved_env_keys.rs");
 
 use base64::Engine as _;
 
+const TRUSTED_LOCAL_APP_PERMISSION: &str =
+    include_str!("permissions/trusted-local-app-commands.toml");
+
+#[derive(serde::Deserialize)]
+struct AppPermissionManifest {
+    permission: Vec<AppPermission>,
+}
+
+#[derive(serde::Deserialize)]
+struct AppPermission {
+    identifier: String,
+    commands: AppPermissionCommands,
+}
+
+#[derive(serde::Deserialize)]
+struct AppPermissionCommands {
+    allow: Vec<String>,
+}
+
+fn app_manifest_commands() -> &'static [&'static str] {
+    let manifest: AppPermissionManifest = toml::from_str(TRUSTED_LOCAL_APP_PERMISSION)
+        .expect("trusted local app command permission must be valid TOML");
+    let mut matching = manifest
+        .permission
+        .into_iter()
+        .filter(|permission| permission.identifier == "trusted-local-app-commands");
+    let permission = matching
+        .next()
+        .expect("trusted-local-app-commands permission is required");
+    assert!(
+        matching.next().is_none(),
+        "trusted-local-app-commands permission must be unique"
+    );
+    assert!(
+        !permission.commands.allow.is_empty(),
+        "trusted local app command inventory must not be empty"
+    );
+
+    let mut seen = std::collections::BTreeSet::new();
+    let commands = permission
+        .commands
+        .allow
+        .into_iter()
+        .map(|command| {
+            assert!(
+                seen.insert(command.clone()),
+                "duplicate app command in manifest: {command}"
+            );
+            Box::leak(command.into_boxed_str()) as &'static str
+        })
+        .collect::<Vec<_>>();
+    Box::leak(commands.into_boxed_slice())
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_HTTP");
@@ -18,6 +72,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_RELAY_RECONNECT_CMD");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY");
+    println!("cargo:rerun-if-changed=permissions/trusted-local-app-commands.toml");
     println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
 
     // Explicit owner-only agent-access capability. Release packaging sets this
@@ -132,13 +187,16 @@ fn main() {
         );
     }
 
+    let app_commands = app_manifest_commands();
     tauri_build::try_build(
-        tauri_build::Attributes::new().plugin(
-            "websocket",
-            tauri_build::InlinedPlugin::new()
-                .commands(&["connect", "send", "disconnect", "disconnect_all"])
-                .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
-        ),
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(app_commands))
+            .plugin(
+                "websocket",
+                tauri_build::InlinedPlugin::new()
+                    .commands(&["connect", "send", "disconnect", "disconnect_all"])
+                    .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
+            ),
     )
     .expect("failed to build Tauri application");
 }

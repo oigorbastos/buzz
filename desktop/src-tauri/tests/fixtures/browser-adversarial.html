@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'unsafe-inline'; connect-src 'self' tauri: ipc: buzz-media:; img-src 'self' data:; object-src 'none'"
+    />
+    <title>Buzz remote WebView adversarial boundary harness</title>
+  </head>
+  <body>
+    <h1>Buzz remote WebView adversarial boundary harness</h1>
+    <pre id="results" aria-live="polite"></pre>
+    <input id="input-file-picker" type="file" hidden />
+    <script>
+      const results = {};
+      const output = document.querySelector("#results");
+
+      function serialize(value) {
+        if (value === undefined) return "undefined";
+        if (value === null) return "null";
+        if (typeof value === "object") return Object.prototype.toString.call(value);
+        return String(value).slice(0, 120);
+      }
+
+      async function attempt(name, operation) {
+        try {
+          const value = await operation();
+          results[name] = { resolved: true, value: serialize(value) };
+        } catch (error) {
+          results[name] = {
+            resolved: false,
+            error: error && error.name ? String(error.name) : "Error",
+          };
+        }
+        output.textContent = JSON.stringify(results, null, 2);
+      }
+
+      function invoke(command, payload) {
+        const bridge = globalThis.__TAURI_INTERNALS__;
+        if (!bridge || typeof bridge.invoke !== "function") {
+          return Promise.reject(new DOMException("Tauri IPC is absent", "NotSupportedError"));
+        }
+        return bridge.invoke(command, payload);
+      }
+
+      function withTimeout(operation, timeoutMs = 1500) {
+        return Promise.race([
+          operation,
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new DOMException("Prompt did not fail closed", "TimeoutError")), timeoutMs),
+          ),
+        ]);
+      }
+
+      async function run() {
+        results.opener = { resolved: true, value: serialize(window.opener) };
+
+        await attempt("app-get-nsec", () => invoke("get_nsec"));
+        await attempt("app-sign-event", () => invoke("sign_event", { event: {} }));
+        await attempt("app-clipboard", () => invoke("read_clipboard_text"));
+        await attempt("plugin-dialog", () => invoke("plugin:dialog|open"));
+        await attempt("plugin-filesystem", () =>
+          invoke("plugin:fs|read_text_file", { path: "C:\\Windows\\win.ini" }),
+        );
+
+        await attempt("custom-media-protocol", () =>
+          fetch("buzz-media://localhost/media/adversarial-probe"),
+        );
+        await attempt("tauri-scheme", () => fetch("tauri://localhost/"));
+        await attempt("ipc-scheme", () => fetch("ipc://localhost/"));
+        await attempt("data-scheme", () => fetch("data:text/plain,probe"));
+        await attempt("javascript-scheme", () => fetch("javascript:void(0)"));
+
+        await attempt("popup", () => window.open("/popup-probe", "_blank"));
+        await attempt("camera-microphone", () =>
+          navigator.mediaDevices.getUserMedia({ audio: true, video: true }),
+        );
+        await attempt(
+          "geolocation",
+          () =>
+            new Promise((resolve, reject) =>
+              navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 1000 }),
+            ),
+        );
+        await attempt("notifications", () => Notification.requestPermission());
+        await attempt("clipboard-read", () => navigator.clipboard.readText());
+        await attempt("clipboard-write", () => navigator.clipboard.writeText("buzz-boundary-probe"));
+        await attempt("file-picker", () =>
+          withTimeout(
+            typeof globalThis.showOpenFilePicker === "function"
+              ? globalThis.showOpenFilePicker()
+              : Promise.reject(new DOMException("File picker API absent", "NotSupportedError")),
+          ),
+        );
+        await attempt("input-file-picker", () =>
+          withTimeout(
+            new Promise((resolve) => {
+              const picker = document.querySelector("#input-file-picker");
+              picker.addEventListener("cancel", () => resolve("cancelled"), { once: true });
+              picker.addEventListener("change", () => resolve("changed"), { once: true });
+              picker.click();
+            }),
+          ),
+        );
+
+        const download = document.createElement("a");
+        download.href = "data:application/octet-stream,buzz-boundary-probe";
+        download.download = "buzz-boundary-probe.txt";
+        download.textContent = "download probe";
+        document.body.append(download);
+        download.click();
+        results.download = { resolved: true, value: "click-dispatched" };
+
+        output.textContent = JSON.stringify(results, null, 2);
+        document.documentElement.dataset.complete = "true";
+      }
+
+      run();
+    </script>
+  </body>
+</html>

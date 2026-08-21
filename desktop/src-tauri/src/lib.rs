@@ -295,13 +295,10 @@ pub fn run() {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     };
     let app = app_menu::install(builder)
-        .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
-            let app = ctx.app_handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let response = media_proxy::handle_buzz_media(&app, &request).await;
-                responder.respond(response);
-            });
-        })
+        .register_asynchronous_uri_scheme_protocol(
+            "buzz-media",
+            media_proxy::handle_buzz_media_protocol,
+        )
         .manage(build_app_state())
         .manage(ClipboardState::new())
         .manage(PendingCommunityDeepLinks::default())
@@ -609,6 +606,7 @@ pub fn run() {
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,
+            browser_action,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,

@@ -150,6 +150,23 @@ pub async fn spawn_media_proxy(http_client: reqwest::Client, app_handle: tauri::
     port
 }
 
+pub(crate) fn handle_buzz_media_protocol(
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    request: http::Request<Vec<u8>>,
+    responder: tauri::UriSchemeResponder,
+) {
+    if !is_trusted_protocol_webview(ctx.webview_label()) {
+        responder.respond(protocol_forbidden_response());
+        return;
+    }
+
+    let app = ctx.app_handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let response = handle_buzz_media(&app, &request).await;
+        responder.respond(response);
+    });
+}
+
 /// Proxy media requests through the Rust backend so they traverse the VPN tunnel.
 ///
 /// WKWebView's networking stack bypasses the VPN tunnel, causing 403s from Cloudflare Access.
@@ -297,6 +314,17 @@ pub async fn handle_buzz_media(
     }
 }
 
+pub(crate) fn is_trusted_protocol_webview(label: &str) -> bool {
+    label == "main"
+        || label
+            .strip_prefix("huddle-")
+            .is_some_and(|suffix| !suffix.is_empty())
+}
+
+pub(crate) fn protocol_forbidden_response() -> http::Response<Vec<u8>> {
+    error_response(403, "forbidden")
+}
+
 fn error_response(status: u16, msg: &str) -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(status)
@@ -308,4 +336,19 @@ fn error_response(status: u16, msg: &str) -> http::Response<Vec<u8>> {
                 .body(Vec::new())
                 .unwrap()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_trusted_protocol_webview, protocol_forbidden_response};
+
+    #[test]
+    fn custom_media_protocol_is_closed_to_untrusted_webviews() {
+        assert!(is_trusted_protocol_webview("main"));
+        assert!(is_trusted_protocol_webview("huddle-7"));
+        assert!(!is_trusted_protocol_webview("huddle-"));
+        assert!(!is_trusted_protocol_webview("browser-main"));
+        assert!(!is_trusted_protocol_webview("main-child"));
+        assert_eq!(protocol_forbidden_response().status(), 403);
+    }
 }
