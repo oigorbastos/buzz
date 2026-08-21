@@ -1,14 +1,22 @@
 import * as React from "react";
-import { ExternalLink, RefreshCw, ShieldCheck } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/shared/ui/button";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
+import { Button } from "@/shared/ui/button";
 
 import {
   copyApprovedPresetUrl,
+  getBrowserRuntimeState,
   getBrowserSecurityStatus,
+  hideBrowserChild,
+  mountBrowserChild,
+  navigateBrowserBack,
+  navigateBrowserForward,
+  navigateBrowserHome,
   openApprovedPresetExternally,
+  reloadBrowser,
+  setBrowserChildBounds,
 } from "./browserClient";
 import { recordBrowserMetric } from "./browserMetrics";
 import {
@@ -17,8 +25,10 @@ import {
   workspaceSurfaceLabel,
 } from "./browserProfile";
 import type {
+  BrowserBounds,
   BrowserPreset,
   BrowserPresetId,
+  BrowserRuntimeState,
   BrowserSecurityStatus,
 } from "./browserTypes";
 import { BrowserToolbar } from "./BrowserToolbar";
@@ -28,21 +38,48 @@ type LoadState =
   | { kind: "loading" }
   | { kind: "ready"; status: BrowserSecurityStatus };
 
+function elementBounds(element: HTMLElement): BrowserBounds | null {
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return null;
+  return {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function boundsKey(bounds: BrowserBounds) {
+  return [bounds.x, bounds.y, bounds.width, bounds.height]
+    .map((value) => value.toFixed(2))
+    .join(":");
+}
+
+function hasBlockingOverlay() {
+  return Boolean(
+    document.querySelector(
+      '[role="dialog"], [role="alertdialog"], [data-testid="community-change-overlay"], [data-radix-popper-content-wrapper], [data-state="open"][role="menu"], [data-state="open"][role="listbox"]',
+    ),
+  );
+}
+
 export function BrowserScreen() {
   const [loadState, setLoadState] = React.useState<LoadState>({
     kind: "loading",
   });
   const [selectedPreset, setSelectedPreset] =
     React.useState<BrowserPresetId | null>(null);
+  const [runtimeState, setRuntimeState] =
+    React.useState<BrowserRuntimeState | null>(null);
+  const [runtimeError, setRuntimeError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [retryGeneration, setRetryGeneration] = React.useState(0);
+  const hostRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
     let cancelled = false;
     setLoadState({ kind: "loading" });
-    if (retryGeneration === 0) {
-      recordBrowserMetric("surface_opened");
-    }
+    if (retryGeneration === 0) recordBrowserMetric("surface_opened");
 
     void getBrowserSecurityStatus()
       .then((status) => {
@@ -53,6 +90,23 @@ export function BrowserScreen() {
             kind: "error",
             message:
               "O perfil do renderer não corresponde à política nativa deste build.",
+          });
+          return;
+        }
+        if (!status.remote_content_enabled) {
+          setSelectedPreset(null);
+          setLoadState({
+            kind: "error",
+            message:
+              "A navegação integrada está disponível no Buzz para Windows.",
+          });
+          return;
+        }
+        if (!status.configured || status.presets.length === 0) {
+          setSelectedPreset(null);
+          setLoadState({
+            kind: "error",
+            message: "Este build não possui destinos Web aprovados.",
           });
           return;
         }
@@ -85,12 +139,118 @@ export function BrowserScreen() {
     presets.find((preset) => preset.id === selectedPreset) ?? null;
   const surfaceLabel = workspaceSurfaceLabel(status?.profile ?? "disabled");
 
+  React.useEffect(() => {
+    if (!selectedPreset || !status?.remote_content_enabled) return;
+    const host = hostRef.current;
+    if (!host) return;
+    if (retryGeneration > 0) setRuntimeError(null);
+
+    let cancelled = false;
+    let mounted = false;
+    let lastBounds = "";
+    let frame = 0;
+
+    const fail = (error: unknown) => {
+      if (cancelled) return;
+      setRuntimeError(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível abrir o destino dentro do Buzz.",
+      );
+      void hideBrowserChild().catch(() => undefined);
+    };
+
+    const syncBounds = async () => {
+      frame = 0;
+      const bounds = elementBounds(host);
+      if (!bounds) return;
+      const key = boundsKey(bounds);
+      if (mounted && key === lastBounds) return;
+      lastBounds = key;
+      try {
+        const state = mounted
+          ? await setBrowserChildBounds(bounds)
+          : await mountBrowserChild(selectedPreset, bounds);
+        if (cancelled) return;
+        mounted = true;
+        setRuntimeError(null);
+        setRuntimeState(state);
+      } catch (error) {
+        fail(error);
+      }
+    };
+
+    const scheduleBounds = () => {
+      if (frame !== 0) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => void syncBounds());
+    };
+
+    const observer = new ResizeObserver(scheduleBounds);
+    observer.observe(host);
+    window.addEventListener("resize", scheduleBounds);
+    window.addEventListener("scroll", scheduleBounds, true);
+    scheduleBounds();
+
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+      window.removeEventListener("resize", scheduleBounds);
+      window.removeEventListener("scroll", scheduleBounds, true);
+      if (frame !== 0) cancelAnimationFrame(frame);
+      void hideBrowserChild().catch(() => undefined);
+    };
+  }, [retryGeneration, selectedPreset, status?.remote_content_enabled]);
+
+  React.useEffect(() => {
+    if (!runtimeState?.mounted) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void getBrowserRuntimeState()
+        .then((state) => {
+          if (!cancelled) setRuntimeState(state);
+        })
+        .catch(() => undefined);
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [runtimeState?.mounted]);
+
+  React.useEffect(() => {
+    if (!runtimeState?.mounted) return;
+    let overlayVisible = false;
+    const syncVisibility = () => {
+      const next = hasBlockingOverlay();
+      if (next === overlayVisible) return;
+      overlayVisible = next;
+      if (next) {
+        void hideBrowserChild().catch(() => undefined);
+      } else if (hostRef.current) {
+        const bounds = elementBounds(hostRef.current);
+        const preset = selectedPreset ?? runtimeState.preset;
+        if (bounds && preset) {
+          void mountBrowserChild(preset, bounds).catch(() => undefined);
+        }
+      }
+    };
+    const observer = new MutationObserver(syncVisibility);
+    observer.observe(document.body, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+      attributeFilter: ["data-state", "role"],
+    });
+    syncVisibility();
+    return () => observer.disconnect();
+  }, [runtimeState?.mounted, runtimeState?.preset, selectedPreset]);
+
   const selectPreset = React.useCallback((preset: BrowserPresetId) => {
     setSelectedPreset(preset);
     recordBrowserMetric("preset_selected", preset);
   }, []);
 
-  const perform = React.useCallback(
+  const performLinkAction = React.useCallback(
     async (action: "copy" | "external", preset: BrowserPreset | null) => {
       if (!preset) return;
       setBusy(true);
@@ -116,13 +276,44 @@ export function BrowserScreen() {
     [],
   );
 
+  const performRuntimeAction = React.useCallback(
+    async (action: () => Promise<BrowserRuntimeState>) => {
+      setBusy(true);
+      try {
+        const next = await action();
+        setRuntimeState(next);
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "A navegação integrada falhou.",
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [],
+  );
+
   return (
     <div className="flex h-full min-h-0 flex-col" data-testid="browser-screen">
       <TopChromeInsetHeader data-tauri-drag-region flush>
         <BrowserToolbar
           busy={busy || loadState.kind === "loading"}
-          onCopyUrl={() => void perform("copy", selected)}
-          onOpenExternal={() => void perform("external", selected)}
+          canGoBack={runtimeState?.can_go_back ?? false}
+          canGoForward={runtimeState?.can_go_forward ?? false}
+          onBack={() => void performRuntimeAction(navigateBrowserBack)}
+          onCopyUrl={() => void performLinkAction("copy", selected)}
+          onForward={() => void performRuntimeAction(navigateBrowserForward)}
+          onHome={() =>
+            selectedPreset
+              ? void performRuntimeAction(() =>
+                  navigateBrowserHome(selectedPreset),
+                )
+              : undefined
+          }
+          onOpenExternal={() => void performLinkAction("external", selected)}
+          onReload={() => void performRuntimeAction(reloadBrowser)}
           onSelectPreset={selectPreset}
           presets={presets}
           selectedPreset={selectedPreset}
@@ -130,14 +321,8 @@ export function BrowserScreen() {
         />
       </TopChromeInsetHeader>
 
-      <main className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-background p-5">
-        {loadState.kind === "loading" ? (
-          <p className="text-sm text-muted-foreground">
-            Verificando a fronteira do Web Workspace…
-          </p>
-        ) : null}
-
-        {loadState.kind === "error" ? (
+      {loadState.kind === "error" ? (
+        <main className="flex min-h-0 flex-1 items-center justify-center bg-background p-5">
           <section className="w-full max-w-xl rounded-2xl border border-destructive/30 bg-card p-6">
             <h1 className="text-lg font-semibold">
               Web Workspace indisponível
@@ -154,59 +339,44 @@ export function BrowserScreen() {
               Tentar novamente
             </Button>
           </section>
-        ) : null}
-
-        {status ? (
-          <section className="w-full max-w-2xl rounded-2xl border border-amber-500/25 bg-card p-6 shadow-sm">
-            <div className="flex items-start gap-3">
-              <div className="rounded-xl bg-amber-500/10 p-2 text-amber-600">
-                <ShieldCheck className="size-5" />
-              </div>
-              <div className="min-w-0">
-                <h1 className="text-lg font-semibold">
-                  Navegação interna ainda bloqueada
-                </h1>
-                <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                  O renderer local e os destinos aprovados estão prontos, mas
-                  esta versão do WebView2 não permite comprovar todos os gates
-                  de permissões e histórico sem enfraquecer a fronteira Tauri.
-                  Nenhuma página remota é carregada dentro do Buzz.
-                </p>
-              </div>
+        </main>
+      ) : (
+        <main
+          className="relative min-h-0 flex-1 overflow-hidden bg-background"
+          data-testid="browser-child-host"
+          ref={hostRef}
+        >
+          {loadState.kind === "loading" || !runtimeState?.mounted ? (
+            <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+              Abrindo o destino aprovado…
             </div>
-
-            {selected ? (
-              <div className="mt-5 rounded-xl border border-border/60 bg-muted/30 p-4">
-                <p className="font-medium">{selected.label}</p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {selected.subtitle}
-                </p>
-                <p className="mt-3 break-all font-mono text-xs text-muted-foreground">
-                  {selected.url_display}
-                </p>
+          ) : null}
+          {runtimeError ? (
+            <section className="absolute inset-5 z-10 m-auto h-fit max-w-xl rounded-2xl border border-destructive/30 bg-card p-6 shadow-lg">
+              <h1 className="text-lg font-semibold">
+                Não foi possível navegar
+              </h1>
+              <p className="mt-2 text-sm text-muted-foreground">
+                {runtimeError}
+              </p>
+              <div className="mt-5 flex gap-2">
                 <Button
-                  className="mt-4"
-                  disabled={busy}
-                  onClick={() => void perform("external", selected)}
+                  onClick={() => setRetryGeneration((value) => value + 1)}
+                  variant="outline"
                 >
-                  <ExternalLink />
-                  Abrir no navegador externo
+                  <RefreshCw />
+                  Tentar novamente
+                </Button>
+                <Button
+                  onClick={() => void performLinkAction("external", selected)}
+                >
+                  Abrir externamente
                 </Button>
               </div>
-            ) : (
-              <p className="mt-5 rounded-xl border border-border/60 bg-muted/30 p-4 text-sm text-muted-foreground">
-                Este build não possui um perfil e destinos aprovados
-                compatíveis.
-              </p>
-            )}
-
-            <p className="mt-4 text-xs text-muted-foreground">
-              Gate remoto: fechado · capability do child: nenhuma · AppManifest:{" "}
-              {status.app_manifest_command_count} comandos inventariados
-            </p>
-          </section>
-        ) : null}
-      </main>
+            </section>
+          ) : null}
+        </main>
+      )}
     </div>
   );
 }

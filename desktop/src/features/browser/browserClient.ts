@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BrowserAction,
   BrowserActionResult,
+  BrowserBounds,
   BrowserPresetId,
+  BrowserRuntimeState,
   BrowserSecurityStatus,
 } from "./browserTypes";
 
@@ -56,4 +58,76 @@ export async function openApprovedPresetExternally(
   if (result.type !== "completed" || result.action !== "open_external") {
     throw new Error("Unexpected Browser external-open response");
   }
+}
+
+async function performRuntimeAction(
+  action: BrowserAction,
+  invokeCommand?: BrowserInvoker,
+): Promise<BrowserRuntimeState> {
+  const result = await invokeBrowserAction(action, invokeCommand);
+  if (result.type !== "runtime_state") {
+    throw new Error("Unexpected Browser runtime response");
+  }
+  return result;
+}
+
+export function mountBrowserChild(
+  preset: BrowserPresetId,
+  bounds: BrowserBounds,
+  invokeCommand?: BrowserInvoker,
+) {
+  return performRuntimeAction({ type: "mount", preset, bounds }, invokeCommand);
+}
+
+export function setBrowserChildBounds(
+  bounds: BrowserBounds,
+  invokeCommand?: BrowserInvoker,
+) {
+  return performRuntimeAction({ type: "set_bounds", bounds }, invokeCommand);
+}
+
+export function selectBrowserPreset(
+  preset: BrowserPresetId,
+  invokeCommand?: BrowserInvoker,
+) {
+  return performRuntimeAction({ type: "select_preset", preset }, invokeCommand);
+}
+
+export function navigateBrowserBack(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "back" }, invokeCommand);
+}
+
+export function navigateBrowserForward(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "forward" }, invokeCommand);
+}
+
+export function reloadBrowser(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "reload" }, invokeCommand);
+}
+
+export function navigateBrowserHome(
+  preset: BrowserPresetId,
+  invokeCommand?: BrowserInvoker,
+) {
+  return performRuntimeAction({ type: "home", preset }, invokeCommand);
+}
+
+export function showBrowserChild(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "show" }, invokeCommand);
+}
+
+export function hideBrowserChild(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "hide" }, invokeCommand);
+}
+
+export function focusBrowserChild(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "focus" }, invokeCommand);
+}
+
+export function clearBrowserData(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "clear_data" }, invokeCommand);
+}
+
+export function getBrowserRuntimeState(invokeCommand?: BrowserInvoker) {
+  return performRuntimeAction({ type: "runtime_state" }, invokeCommand);
 }

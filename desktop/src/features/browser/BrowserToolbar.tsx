@@ -5,7 +5,7 @@ import {
   ExternalLink,
   Home,
   RotateCw,
-  ShieldAlert,
+  ShieldCheck,
 } from "lucide-react";
 
 import { Button } from "@/shared/ui/button";
@@ -14,20 +14,30 @@ import type { BrowserPreset, BrowserPresetId } from "./browserTypes";
 
 type BrowserToolbarProps = {
   busy: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  onBack: () => void;
   onCopyUrl: () => void;
+  onForward: () => void;
+  onHome: () => void;
   onOpenExternal: () => void;
+  onReload: () => void;
   onSelectPreset: (preset: BrowserPresetId) => void;
   presets: BrowserPreset[];
   selectedPreset: BrowserPresetId | null;
   surfaceLabel: string;
 };
 
-const LOCKED_CONTROL_TITLE = "Disponível após o gate de segurança do WebView2";
-
 export function BrowserToolbar({
   busy,
+  canGoBack,
+  canGoForward,
+  onBack,
   onCopyUrl,
+  onForward,
+  onHome,
   onOpenExternal,
+  onReload,
   onSelectPreset,
   presets,
   selectedPreset,
@@ -41,7 +51,7 @@ export function BrowserToolbar({
       data-testid="browser-toolbar"
     >
       <div className="flex min-w-0 items-center gap-2">
-        <ShieldAlert className="size-4 shrink-0 text-amber-500" />
+        <ShieldCheck className="size-4 shrink-0 text-emerald-600" />
         <span className="hidden text-sm font-medium sm:inline">
           {surfaceLabel}
         </span>
@@ -67,36 +77,40 @@ export function BrowserToolbar({
       <div className="flex items-center gap-1">
         <Button
           aria-label="Voltar"
-          disabled
+          disabled={busy || !canGoBack}
+          onClick={onBack}
           size="icon"
-          title={LOCKED_CONTROL_TITLE}
+          title="Voltar"
           variant="ghost"
         >
           <ArrowLeft />
         </Button>
         <Button
           aria-label="Avançar"
-          disabled
+          disabled={busy || !canGoForward}
+          onClick={onForward}
           size="icon"
-          title={LOCKED_CONTROL_TITLE}
+          title="Avançar"
           variant="ghost"
         >
           <ArrowRight />
         </Button>
         <Button
           aria-label="Recarregar"
-          disabled
+          disabled={busy || !hasPreset}
+          onClick={onReload}
           size="icon"
-          title={LOCKED_CONTROL_TITLE}
+          title="Recarregar"
           variant="ghost"
         >
           <RotateCw />
         </Button>
         <Button
           aria-label="Início"
-          disabled
+          disabled={busy || !hasPreset}
+          onClick={onHome}
           size="icon"
-          title={LOCKED_CONTROL_TITLE}
+          title="Início"
           variant="ghost"
         >
           <Home />

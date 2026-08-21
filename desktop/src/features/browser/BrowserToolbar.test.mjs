@@ -9,8 +9,14 @@ test("toolbar exposes the approved MVP controls without an address bar", () => {
   const html = renderToStaticMarkup(
     createElement(BrowserToolbar, {
       busy: false,
+      canGoBack: true,
+      canGoForward: false,
+      onBack() {},
       onCopyUrl() {},
+      onForward() {},
+      onHome() {},
       onOpenExternal() {},
+      onReload() {},
       onSelectPreset() {},
       presets: [
         {
@@ -37,5 +43,7 @@ test("toolbar exposes the approved MVP controls without an address bar", () => {
     assert.match(html, new RegExp(label));
   }
   assert.equal(html.includes('type="text"'), false);
-  assert.match(html, /aria-label="Voltar" disabled/);
+  assert.doesNotMatch(html, /aria-label="Voltar"[^>]*disabled/);
+  assert.match(html, /aria-label="Avançar"[^>]*disabled/);
+  assert.doesNotMatch(html, /aria-label="Recarregar"[^>]*disabled/);
 });
