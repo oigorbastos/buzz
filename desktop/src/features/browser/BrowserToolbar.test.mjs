@@ -26,6 +26,7 @@ test("toolbar exposes the approved MVP controls without an address bar", () => {
           url_display: "http://approved.example/mission",
         },
       ],
+      runtimeReady: true,
       selectedPreset: "mission-control",
       surfaceLabel: "Web",
     }),
@@ -46,4 +47,36 @@ test("toolbar exposes the approved MVP controls without an address bar", () => {
   assert.doesNotMatch(html, /aria-label="Voltar"[^>]*disabled/);
   assert.match(html, /aria-label="Avançar"[^>]*disabled/);
   assert.doesNotMatch(html, /aria-label="Recarregar"[^>]*disabled/);
+});
+
+test("toolbar keeps native navigation disabled until the child is mounted", () => {
+  const html = renderToStaticMarkup(
+    createElement(BrowserToolbar, {
+      busy: false,
+      canGoBack: false,
+      canGoForward: false,
+      onBack() {},
+      onCopyUrl() {},
+      onForward() {},
+      onHome() {},
+      onOpenExternal() {},
+      onReload() {},
+      onSelectPreset() {},
+      presets: [
+        {
+          id: "sessions",
+          label: "Sessions",
+          subtitle: "LLM",
+          url_display: "https://approved.example/",
+        },
+      ],
+      runtimeReady: false,
+      selectedPreset: "sessions",
+      surfaceLabel: "Web",
+    }),
+  );
+
+  assert.match(html, /aria-label="Recarregar"[^>]*disabled/);
+  assert.match(html, /aria-label="Início"[^>]*disabled/);
+  assert.doesNotMatch(html, /aria-label="Copiar URL aprovada"[^>]*disabled/);
 });

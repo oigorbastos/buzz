@@ -1,10 +1,27 @@
-use super::browser::{BrowserBounds, BrowserPresetId, NavigationPolicy};
+use super::browser::{BrowserBounds, BrowserPresetId, NavigationPolicy, WorkspaceProfile};
 
 #[derive(Clone, Debug)]
 pub(super) struct RuntimePreset {
     pub id: BrowserPresetId,
     pub home: String,
     pub navigation: NavigationPolicy,
+    pub profile: WorkspaceProfile,
+}
+
+pub(super) const fn workspace_storage_partition(
+    profile: WorkspaceProfile,
+) -> Option<(&'static str, &'static str)> {
+    match profile {
+        WorkspaceProfile::Operator => Some((
+            "web-workspace-operator-webview2-v1",
+            "buzz-web-workspace-operator",
+        )),
+        WorkspaceProfile::Collaborator => Some((
+            "web-workspace-collaborator-webview2-v1",
+            "buzz-web-workspace-collaborator",
+        )),
+        WorkspaceProfile::Disabled => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,9 +87,6 @@ mod platform {
     };
 
     const CHILD_WEBVIEW_ID: &str = "browser-main";
-    const PROFILE_NAME: &str = "buzz-web-workspace";
-    const UDF_DIRECTORY: &str = "web-workspace-webview2-v1";
-
     thread_local! {
         static BROWSER_RUNTIME: RefCell<Option<BrowserRuntime>> = const { RefCell::new(None) };
     }
@@ -82,16 +96,22 @@ mod platform {
         _context: Box<WebContext>,
         navigation: Arc<RwLock<NavigationPolicy>>,
         preset: BrowserPresetId,
+        bounds: BrowserBounds,
         visible: bool,
     }
 
     impl BrowserRuntime {
         fn create(
             window: &tauri::Window,
-            data_directory: PathBuf,
+            data_root: PathBuf,
             bounds: BrowserBounds,
             preset: RuntimePreset,
         ) -> Result<Self, String> {
+            let (udf_directory, profile_name) = workspace_storage_partition(preset.profile)
+                .ok_or_else(|| {
+                    "browser storage is unavailable for this build profile".to_string()
+                })?;
+            let data_directory = data_root.join(udf_directory);
             std::fs::create_dir_all(&data_directory)
                 .map_err(|error| format!("failed to prepare browser profile: {error}"))?;
 
@@ -121,6 +141,8 @@ mod platform {
                 })
                 .with_file_chooser_disabled(true)
                 .with_external_uri_schemes_disabled(true)
+                .with_web_sockets_disabled(true)
+                .with_remote_content_hardening(true)
                 .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
                 .with_download_started_handler(|_, _| false)
                 .with_permission_handler(|_| PermissionResponse::Deny)
@@ -133,7 +155,7 @@ mod platform {
                 .with_browser_accelerator_keys(false)
                 .with_default_context_menus(false)
                 .with_browser_extensions_enabled(false)
-                .with_profile_name(PROFILE_NAME)
+                .with_profile_name(profile_name)
                 .build_as_child(window)
                 .map_err(|error| format!("failed to create isolated browser child: {error}"))?;
 
@@ -146,6 +168,7 @@ mod platform {
                 _context: context,
                 navigation,
                 preset: preset.id,
+                bounds,
                 visible: true,
             })
         }
@@ -167,14 +190,26 @@ mod platform {
         }
 
         fn select_preset(&mut self, preset: RuntimePreset) -> Result<(), String> {
-            *self
+            let previous_policy = self
                 .navigation
-                .write()
-                .map_err(|_| "browser navigation policy lock poisoned".to_string())? =
-                preset.navigation;
-            self.webview
-                .load_url(&preset.home)
-                .map_err(|error| format!("failed to navigate to approved preset: {error}"))?;
+                .read()
+                .map_err(|_| "browser navigation policy lock poisoned".to_string())?
+                .clone();
+            {
+                let mut policy = self
+                    .navigation
+                    .write()
+                    .map_err(|_| "browser navigation policy lock poisoned".to_string())?;
+                *policy = preset.navigation;
+            }
+            if let Err(error) = self.webview.load_url(&preset.home) {
+                *self
+                    .navigation
+                    .write()
+                    .map_err(|_| "browser navigation policy lock poisoned".to_string())? =
+                    previous_policy;
+                return Err(format!("failed to navigate to approved preset: {error}"));
+            }
             self.preset = preset.id;
             Ok(())
         }
@@ -203,7 +238,7 @@ mod platform {
 
     fn run_operation(
         window: &tauri::Window,
-        data_directory: &PathBuf,
+        data_root: &PathBuf,
         operation: RuntimeOperation,
         preset: Option<RuntimePreset>,
     ) -> Result<RuntimeState, String> {
@@ -219,7 +254,19 @@ mod platform {
                 if slot.is_none() {
                     *slot = Some(BrowserRuntime::create(
                         window,
-                        data_directory.clone(),
+                        data_root.clone(),
+                        bounds,
+                        requested,
+                    )?);
+                } else if slot.as_ref().is_some_and(|runtime| runtime.preset != id) {
+                    let previous = slot.take().ok_or_else(|| {
+                        "browser child disappeared during preset change".to_string()
+                    })?;
+                    let _ = previous.webview.set_visible(false);
+                    drop(previous);
+                    *slot = Some(BrowserRuntime::create(
+                        window,
+                        data_root.clone(),
                         bounds,
                         requested,
                     )?);
@@ -228,9 +275,7 @@ mod platform {
                         .webview
                         .set_bounds(to_wry_bounds(bounds))
                         .map_err(|error| format!("failed to size browser child: {error}"))?;
-                    if runtime.preset != id {
-                        runtime.select_preset(requested)?;
-                    }
+                    runtime.bounds = bounds;
                     runtime.set_visible(true)?;
                 }
                 return slot
@@ -242,6 +287,51 @@ mod platform {
             if matches!(operation, RuntimeOperation::State) && slot.is_none() {
                 return Ok(RuntimeState::unmounted());
             }
+
+            if let RuntimeOperation::SelectPreset(id) = operation {
+                let requested = preset.ok_or_else(|| {
+                    "browser preset is not available in this distribution profile".to_string()
+                })?;
+                if requested.id != id {
+                    return Err("browser preset identity mismatch".to_string());
+                }
+                if slot.as_ref().is_some_and(|runtime| runtime.preset != id) {
+                    let bounds = slot
+                        .as_ref()
+                        .ok_or_else(|| "browser child is not mounted".to_string())?
+                        .bounds;
+                    let previous = slot.take().ok_or_else(|| {
+                        "browser child disappeared during preset change".to_string()
+                    })?;
+                    let _ = previous.webview.set_visible(false);
+                    drop(previous);
+                    *slot = Some(BrowserRuntime::create(
+                        window,
+                        data_root.clone(),
+                        bounds,
+                        requested,
+                    )?);
+                }
+                return slot
+                    .as_ref()
+                    .ok_or_else(|| "browser child is not mounted".to_string())?
+                    .state();
+            }
+
+            if matches!(operation, RuntimeOperation::ClearData) {
+                let runtime = slot
+                    .take()
+                    .ok_or_else(|| "browser child is not mounted".to_string())?;
+                runtime
+                    .webview
+                    .close_and_clear_all_browsing_data()
+                    .map_err(|error| {
+                        format!("failed to close and clear browser profile: {error}")
+                    })?;
+                drop(runtime);
+                return Ok(RuntimeState::unmounted());
+            }
+
             let runtime = slot
                 .as_mut()
                 .ok_or_else(|| "browser child is not mounted".to_string())?;
@@ -249,19 +339,14 @@ mod platform {
                 RuntimeOperation::Mount { .. } => {
                     return Err("browser mount was dispatched twice".to_string());
                 }
-                RuntimeOperation::SetBounds(bounds) => runtime
-                    .webview
-                    .set_bounds(to_wry_bounds(bounds))
-                    .map_err(|error| format!("failed to size browser child: {error}"))?,
-                RuntimeOperation::SelectPreset(id) => {
-                    let requested = preset.ok_or_else(|| {
-                        "browser preset is not available in this distribution profile".to_string()
-                    })?;
-                    if requested.id != id {
-                        return Err("browser preset identity mismatch".to_string());
-                    }
-                    runtime.select_preset(requested)?;
+                RuntimeOperation::SetBounds(bounds) => {
+                    runtime
+                        .webview
+                        .set_bounds(to_wry_bounds(bounds))
+                        .map_err(|error| format!("failed to size browser child: {error}"))?;
+                    runtime.bounds = bounds;
                 }
+                RuntimeOperation::SelectPreset(_) => unreachable!("handled before runtime borrow"),
                 RuntimeOperation::Back => runtime
                     .webview
                     .go_back()
@@ -286,10 +371,7 @@ mod platform {
                     .webview
                     .focus()
                     .map_err(|error| format!("failed to focus browser child: {error}"))?,
-                RuntimeOperation::ClearData => runtime
-                    .webview
-                    .clear_all_browsing_data()
-                    .map_err(|error| format!("failed to clear browser profile: {error}"))?,
+                RuntimeOperation::ClearData => unreachable!("handled before runtime borrow"),
                 RuntimeOperation::State => {}
             }
             runtime.state()
@@ -304,14 +386,50 @@ mod platform {
         let window = app
             .get_window("main")
             .ok_or_else(|| "main window is unavailable".to_string())?;
-        let data_directory = app
+        let data_root = app
             .path()
             .app_local_data_dir()
-            .map_err(|error| format!("browser profile directory is unavailable: {error}"))?
-            .join(UDF_DIRECTORY);
+            .map_err(|error| format!("browser profile directory is unavailable: {error}"))?;
         let (sender, receiver) = oneshot::channel();
         app.run_on_main_thread(move || {
-            let _ = sender.send(run_operation(&window, &data_directory, operation, preset));
+            let _ = sender.send(run_operation(&window, &data_root, operation, preset));
+        })
+        .map_err(|error| format!("browser main-thread dispatch failed: {error}"))?;
+        receiver
+            .await
+            .map_err(|_| "browser main-thread result channel closed".to_string())?
+    }
+
+    pub(super) async fn current_url(
+        app: tauri::AppHandle,
+        expected_preset: BrowserPresetId,
+    ) -> Result<Option<String>, String> {
+        let (sender, receiver) = oneshot::channel();
+        app.run_on_main_thread(move || {
+            let result = BROWSER_RUNTIME.with(|slot| {
+                let slot = slot.borrow();
+                let Some(runtime) = slot.as_ref() else {
+                    return Ok(None);
+                };
+                if runtime.preset != expected_preset {
+                    return Err("browser preset changed before URL query".to_string());
+                }
+                let value = runtime
+                    .webview
+                    .url()
+                    .map_err(|error| format!("failed to query browser URL: {error}"))?;
+                let parsed = Url::parse(&value)
+                    .map_err(|_| "browser returned an invalid current URL".to_string())?;
+                if !runtime
+                    .navigation
+                    .read()
+                    .is_ok_and(|policy| policy.allows(&parsed))
+                {
+                    return Err("browser returned a URL outside the active preset".to_string());
+                }
+                Ok(Some(value))
+            });
+            let _ = sender.send(result);
         })
         .map_err(|error| format!("browser main-thread dispatch failed: {error}"))?;
         receiver
@@ -322,7 +440,7 @@ mod platform {
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use super::{RuntimeOperation, RuntimePreset, RuntimeState};
+    use super::{BrowserPresetId, RuntimeOperation, RuntimePreset, RuntimeState};
 
     pub(super) async fn perform(
         _app: tauri::AppHandle,
@@ -331,6 +449,29 @@ mod platform {
     ) -> Result<RuntimeState, String> {
         Err("the isolated Web Workspace child is available on Windows only".to_string())
     }
+
+    pub(super) async fn current_url(
+        _app: tauri::AppHandle,
+        _expected_preset: BrowserPresetId,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
-pub(super) use platform::perform;
+pub(super) use platform::{current_url, perform};
+
+#[cfg(test)]
+mod tests {
+    use super::{workspace_storage_partition, WorkspaceProfile};
+
+    #[test]
+    fn operator_and_collaborator_use_separate_cookie_partitions() {
+        let operator = workspace_storage_partition(WorkspaceProfile::Operator).unwrap();
+        let collaborator = workspace_storage_partition(WorkspaceProfile::Collaborator).unwrap();
+        assert_ne!(operator, collaborator);
+        assert_eq!(
+            workspace_storage_partition(WorkspaceProfile::Disabled),
+            None
+        );
+    }
+}

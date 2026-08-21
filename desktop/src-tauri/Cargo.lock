@@ -13251,6 +13251,7 @@ dependencies = [
  "http",
  "once_cell",
  "raw-window-handle",
+ "serde_json",
  "thiserror 2.0.18",
  "webview2-com",
  "windows 0.61.3",

@@ -55,6 +55,7 @@
 
       async function run() {
         results.opener = { resolved: true, value: serialize(window.opener) };
+        results.hostObjects = { resolved: true, value: serialize(globalThis.chrome?.webview?.hostObjects) };
 
         await attempt("app-get-nsec", () => invoke("get_nsec"));
         await attempt("app-sign-event", () => invoke("sign_event", { event: {} }));
@@ -63,6 +64,7 @@
         await attempt("plugin-filesystem", () =>
           invoke("plugin:fs|read_text_file", { path: "C:\\Windows\\win.ini" }),
         );
+        await attempt("web-message", () => globalThis.chrome.webview.postMessage("buzz-boundary-probe"));
 
         await attempt("custom-media-protocol", () =>
           fetch("buzz-media://localhost/media/adversarial-probe"),
@@ -76,6 +78,7 @@
         await attempt("camera-microphone", () =>
           navigator.mediaDevices.getUserMedia({ audio: true, video: true }),
         );
+        await attempt("screen-capture", () => navigator.mediaDevices.getDisplayMedia({ video: true }));
         await attempt(
           "geolocation",
           () =>
@@ -86,6 +89,27 @@
         await attempt("notifications", () => Notification.requestPermission());
         await attempt("clipboard-read", () => navigator.clipboard.readText());
         await attempt("clipboard-write", () => navigator.clipboard.writeText("buzz-boundary-probe"));
+        await attempt("legacy-clipboard-write", () => document.execCommand("copy"));
+        await attempt("alert-dialog", () => alert("buzz-boundary-probe"));
+        await attempt("confirm-dialog", () => confirm("buzz-boundary-probe"));
+        await attempt("prompt-dialog", () => prompt("buzz-boundary-probe"));
+        await attempt("print-dialog", () => window.print());
+        await attempt("window-close", () => window.close());
+        await attempt("websocket", () => withTimeout(new Promise((resolve, reject) => {
+          const socket = new WebSocket("wss://example.invalid/buzz-boundary-probe");
+          socket.addEventListener("open", resolve, { once: true });
+          socket.addEventListener("error", reject, { once: true });
+        })));
+        await attempt("webrtc-datachannel", () => {
+          const peer = new RTCPeerConnection({ iceServers: [{ urls: "stun:example.invalid:3478" }] });
+          peer.createDataChannel("buzz-boundary-probe");
+          peer.close();
+          return "constructor-available";
+        });
+        await attempt("webtransport", () => {
+          const transport = new WebTransport("https://example.invalid/buzz-boundary-probe");
+          return withTimeout(transport.ready);
+        });
         await attempt("file-picker", () =>
           withTimeout(
             typeof globalThis.showOpenFilePicker === "function"

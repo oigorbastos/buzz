@@ -61,6 +61,8 @@ pub(crate) struct InnerWebView {
   pub controller: ICoreWebView2Controller,
   pub webview: ICoreWebView2,
   pub env: ICoreWebView2Environment,
+  // Keep the CDP response-policy receiver alive for the webview lifetime.
+  _security_csp_receiver: Option<ICoreWebView2DevToolsProtocolEventReceiver>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
   #[allow(dead_code)]
@@ -142,7 +144,7 @@ impl InnerWebView {
       background_color,
       pl_attrs.profile_name.as_deref(),
     )?;
-    let webview = Self::init_webview(
+    let (webview, security_csp_receiver) = Self::init_webview(
       parent,
       hwnd,
       id.clone(),
@@ -171,6 +173,7 @@ impl InnerWebView {
       is_child,
       webview,
       env,
+      _security_csp_receiver: security_csp_receiver,
       drag_drop_controller,
     };
 
@@ -437,8 +440,42 @@ impl InnerWebView {
     controller: &ICoreWebView2Controller,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
     is_child: bool,
-  ) -> Result<ICoreWebView2> {
+  ) -> Result<(
+    ICoreWebView2,
+    Option<ICoreWebView2DevToolsProtocolEventReceiver>,
+  )> {
     let webview = unsafe { controller.CoreWebView2()? };
+    let remote_content_hardening = pl_attrs.remote_content_hardening;
+
+    if remote_content_hardening {
+      if attributes.ipc_handler.is_some()
+        || !attributes.initialization_scripts.is_empty()
+        || !attributes.custom_protocols.is_empty()
+        || attributes.html.is_some()
+        || attributes.headers.is_some()
+        || attributes.proxy_config.is_some()
+        || pl_attrs.additional_browser_args.is_some()
+      {
+        return Err(
+          windows::core::Error::new(
+            E_INVALIDARG,
+            "remote hardening forbids IPC, scripts, protocols, HTML, headers, and proxies",
+          )
+          .into(),
+        );
+      }
+
+      // These assignments make the hardened builder option fail-safe even if
+      // a future call site forgets one of the matching public builder flags.
+      attributes.clipboard = false;
+      attributes.devtools = false;
+      attributes.general_autofill_enabled = false;
+      attributes.permission_handler = Some(Box::new(|_| PermissionResponse::Deny));
+      attributes.new_window_req_handler = Some(Box::new(|_, _| NewWindowResponse::Deny));
+      attributes.download_started_handler = Some(Box::new(|_, _| false));
+      attributes.download_completed_handler = None;
+      attributes.drag_drop_handler = Some(Box::new(|_| true));
+    }
 
     // Theme
     if let Some(theme) = pl_attrs.theme {
@@ -475,7 +512,16 @@ impl InnerWebView {
     unsafe { Self::set_webview_settings(&webview, &attributes, &pl_attrs)? };
 
     // Webview handlers
-    unsafe { Self::attach_handlers(hwnd, &webview, &mut attributes, &mut token, env)? };
+    unsafe {
+      Self::attach_handlers(
+        hwnd,
+        &webview,
+        &mut attributes,
+        &mut token,
+        env,
+        !remote_content_hardening,
+      )?
+    };
 
     // Do not expose `window.ipc` unless the embedding application explicitly
     // configured a receiver. The upstream implementation installs the bridge
@@ -589,15 +635,27 @@ impl InnerWebView {
       }
     }
 
-    if pl_attrs.file_chooser_disabled {
+    if pl_attrs.file_chooser_disabled || remote_content_hardening {
       Self::disable_file_chooser(&webview)?;
     }
 
-    if pl_attrs.external_uri_schemes_disabled {
+    if pl_attrs.external_uri_schemes_disabled || remote_content_hardening {
       unsafe {
         Self::disable_external_uri_schemes(&webview, &mut token)?;
       }
     }
+
+    if pl_attrs.web_sockets_disabled || remote_content_hardening {
+      Self::disable_web_sockets(&webview)?;
+    }
+
+    let security_csp_receiver = if remote_content_hardening {
+      Self::deny_clipboard_writes(&webview)?;
+      unsafe { Self::attach_remote_native_prompt_guards(&webview, &mut token)? };
+      Some(unsafe { Self::install_remote_response_policy(&webview, &mut token)? })
+    } else {
+      None
+    };
 
     // Navigation
     if let Some(mut url) = attributes.url {
@@ -643,7 +701,7 @@ impl InnerWebView {
       }
     }
 
-    Ok(webview)
+    Ok((webview, security_csp_receiver))
   }
 
   #[inline]
@@ -735,6 +793,282 @@ impl InnerWebView {
   }
 
   #[inline]
+  fn disable_web_sockets(webview: &ICoreWebView2) -> Result<()> {
+    let network_webview = webview.clone();
+    CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
+      Box::new(move |handler| {
+        unsafe {
+          network_webview.CallDevToolsProtocolMethod(w!("Network.enable"), w!("{}"), &handler)?;
+        }
+        Ok(())
+      }),
+      Box::new(|result, response| {
+        result?;
+        if response.contains("\"error\"") {
+          return Err(windows::core::Error::new(
+            E_FAIL,
+            "WebView2 refused the network policy bootstrap",
+          ));
+        }
+        Ok(())
+      }),
+    )?;
+
+    let blocked_webview = webview.clone();
+    Ok(
+      CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| {
+          unsafe {
+            blocked_webview.CallDevToolsProtocolMethod(
+              w!("Network.setBlockedURLs"),
+              w!(r#"{"urls":["ws://*","wss://*"]}"#),
+              &handler,
+            )?;
+          }
+          Ok(())
+        }),
+        Box::new(|result, response| {
+          result?;
+          if response.contains("\"error\"") {
+            return Err(windows::core::Error::new(
+              E_FAIL,
+              "WebView2 refused the WebSocket deny policy",
+            ));
+          }
+          Ok(())
+        }),
+      )?,
+    )
+  }
+
+  #[inline]
+  fn call_devtools_method_and_wait(
+    webview: &ICoreWebView2,
+    method: &str,
+    parameters: &str,
+    refusal_message: &'static str,
+  ) -> Result<()> {
+    let webview = webview.clone();
+    let method = HSTRING::from(method);
+    let parameters = HSTRING::from(parameters);
+    Ok(
+      CallDevToolsProtocolMethodCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| {
+          unsafe { webview.CallDevToolsProtocolMethod(&method, &parameters, &handler)? };
+          Ok(())
+        }),
+        Box::new(move |result, response| {
+          result?;
+          if response.contains("\"error\"") {
+            return Err(windows::core::Error::new(E_FAIL, refusal_message));
+          }
+          Ok(())
+        }),
+      )?,
+    )
+  }
+
+  #[inline]
+  fn deny_clipboard_writes(webview: &ICoreWebView2) -> Result<()> {
+    for permission in ["clipboardReadWrite", "clipboardSanitizedWrite"] {
+      let parameters = serde_json::json!({
+        "permission": { "name": permission },
+        "setting": "denied",
+      })
+      .to_string();
+      Self::call_devtools_method_and_wait(
+        webview,
+        "Browser.setPermission",
+        &parameters,
+        "WebView2 refused the clipboard deny policy",
+      )?;
+    }
+    Ok(())
+  }
+
+  #[inline]
+  unsafe fn attach_remote_native_prompt_guards(
+    webview: &ICoreWebView2,
+    token: &mut EventRegistrationToken,
+  ) -> Result<()> {
+    webview
+      .cast::<ICoreWebView2_10>()?
+      .add_BasicAuthenticationRequested(
+        &BasicAuthenticationRequestedEventHandler::create(Box::new(|_, args| {
+          if let Some(args) = args {
+            unsafe { args.SetCancel(true)? };
+          }
+          Ok(())
+        })),
+        token,
+      )?;
+
+    webview
+      .cast::<ICoreWebView2_5>()?
+      .add_ClientCertificateRequested(
+        &ClientCertificateRequestedEventHandler::create(Box::new(|_, args| {
+          if let Some(args) = args {
+            unsafe {
+              args.SetCancel(true)?;
+              args.SetHandled(true)?;
+            }
+          }
+          Ok(())
+        })),
+        token,
+      )?;
+
+    webview
+      .cast::<ICoreWebView2_14>()?
+      .add_ServerCertificateErrorDetected(
+        &ServerCertificateErrorDetectedEventHandler::create(Box::new(|_, args| {
+          if let Some(args) = args {
+            unsafe {
+              args.SetAction(COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_CANCEL)?;
+            }
+          }
+          Ok(())
+        })),
+        token,
+      )?;
+
+    webview
+      .cast::<ICoreWebView2_24>()?
+      .add_NotificationReceived(
+        &NotificationReceivedEventHandler::create(Box::new(|_, args| {
+          if let Some(args) = args {
+            unsafe { args.SetHandled(true)? };
+          }
+          Ok(())
+        })),
+        token,
+      )?;
+
+    webview.cast::<ICoreWebView2_25>()?.add_SaveAsUIShowing(
+      &SaveAsUIShowingEventHandler::create(Box::new(|_, args| {
+        if let Some(args) = args {
+          unsafe {
+            args.SetCancel(true)?;
+            args.SetSuppressDefaultDialog(true)?;
+          }
+        }
+        Ok(())
+      })),
+      token,
+    )?;
+
+    webview
+      .cast::<ICoreWebView2_27>()?
+      .add_ScreenCaptureStarting(
+        &ScreenCaptureStartingEventHandler::create(Box::new(|_, args| {
+          if let Some(args) = args {
+            unsafe {
+              args.SetCancel(true)?;
+              args.SetHandled(true)?;
+            }
+          }
+          Ok(())
+        })),
+        token,
+      )?;
+
+    Ok(())
+  }
+
+  #[inline]
+  unsafe fn install_remote_response_policy(
+    webview: &ICoreWebView2,
+    token: &mut EventRegistrationToken,
+  ) -> Result<ICoreWebView2DevToolsProtocolEventReceiver> {
+    const REMOTE_CSP: &str = "sandbox allow-forms allow-same-origin allow-scripts; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none'; worker-src 'none'; webrtc 'none'";
+
+    Self::call_devtools_method_and_wait(
+      webview,
+      "Network.enable",
+      "{}",
+      "WebView2 refused the network policy bootstrap",
+    )?;
+    Self::call_devtools_method_and_wait(
+      webview,
+      "Network.setBypassServiceWorker",
+      r#"{"bypass":true}"#,
+      "WebView2 refused the service-worker bypass policy",
+    )?;
+
+    let receiver = webview.GetDevToolsProtocolEventReceiver(w!("Fetch.requestPaused"))?;
+    let guarded_webview = webview.clone();
+    receiver.add_DevToolsProtocolEventReceived(
+      &DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+          return Err(windows::core::Error::new(
+            E_FAIL,
+            "missing Fetch event arguments",
+          ));
+        };
+        let mut raw = PWSTR::null();
+        unsafe { args.ParameterObjectAsJson(&mut raw)? };
+        let event: serde_json::Value = serde_json::from_str(&take_pwstr(raw))
+          .map_err(|_| windows::core::Error::new(E_FAIL, "invalid Fetch response event"))?;
+        let request_id = event
+          .get("requestId")
+          .and_then(serde_json::Value::as_str)
+          .ok_or_else(|| windows::core::Error::new(E_FAIL, "Fetch event omitted request id"))?;
+        let response_code = event
+          .get("responseStatusCode")
+          .and_then(serde_json::Value::as_u64)
+          .ok_or_else(|| {
+            windows::core::Error::new(E_FAIL, "Fetch event omitted response status")
+          })?;
+        let mut response_headers = event
+          .get("responseHeaders")
+          .and_then(serde_json::Value::as_array)
+          .cloned()
+          .ok_or_else(|| {
+            windows::core::Error::new(E_FAIL, "Fetch event omitted response headers")
+          })?;
+        response_headers.push(serde_json::json!({
+          "name": "Content-Security-Policy",
+          "value": REMOTE_CSP,
+        }));
+        let parameters = serde_json::json!({
+          "requestId": request_id,
+          "responseCode": response_code,
+          "responseHeaders": response_headers,
+        })
+        .to_string();
+        let parameters = HSTRING::from(parameters);
+        unsafe {
+          guarded_webview.CallDevToolsProtocolMethod(
+            w!("Fetch.continueResponse"),
+            &parameters,
+            &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|result, response| {
+              result?;
+              if response.contains("\"error\"") {
+                return Err(windows::core::Error::new(
+                  E_FAIL,
+                  "WebView2 refused the response sandbox policy",
+                ));
+              }
+              Ok(())
+            })),
+          )?;
+        }
+        Ok(())
+      })),
+      token,
+    )?;
+
+    Self::call_devtools_method_and_wait(
+      webview,
+      "Fetch.enable",
+      r#"{"patterns":[{"urlPattern":"http://*","resourceType":"Document","requestStage":"Response"},{"urlPattern":"https://*","resourceType":"Document","requestStage":"Response"}]}"#,
+      "WebView2 refused the response sandbox policy",
+    )?;
+
+    Ok(receiver)
+  }
+
+  #[inline]
   unsafe fn set_webview_settings(
     webview: &ICoreWebView2,
     attributes: &WebViewAttributes,
@@ -746,6 +1080,14 @@ impl InnerWebView {
     settings.SetIsZoomControlEnabled(attributes.zoom_hotkeys_enabled)?;
     settings.SetAreDevToolsEnabled(attributes.devtools)?;
     settings.SetIsScriptEnabled(!attributes.javascript_disabled)?;
+    if attributes.ipc_handler.is_none() {
+      settings.SetIsWebMessageEnabled(false)?;
+      settings.SetAreHostObjectsAllowed(false)?;
+    }
+    if pl_attrs.remote_content_hardening {
+      settings.SetAreDefaultContextMenusEnabled(false)?;
+      settings.SetAreDefaultScriptDialogsEnabled(false)?;
+    }
 
     if let Some(user_agent) = &attributes.user_agent {
       if let Ok(settings2) = settings.cast::<ICoreWebView2Settings2>() {
@@ -759,7 +1101,13 @@ impl InnerWebView {
       }
     }
 
-    if let Ok(settings4) = settings.cast::<ICoreWebView2Settings4>() {
+    if pl_attrs.remote_content_hardening {
+      let settings3 = settings.cast::<ICoreWebView2Settings3>()?;
+      settings3.SetAreBrowserAcceleratorKeysEnabled(false)?;
+      let settings4 = settings.cast::<ICoreWebView2Settings4>()?;
+      settings4.SetIsGeneralAutofillEnabled(false)?;
+      settings4.SetIsPasswordAutosaveEnabled(false)?;
+    } else if let Ok(settings4) = settings.cast::<ICoreWebView2Settings4>() {
       settings4.SetIsGeneralAutofillEnabled(attributes.general_autofill_enabled)?;
     }
 
@@ -785,12 +1133,21 @@ impl InnerWebView {
     attributes: &mut WebViewAttributes,
     token: &mut EventRegistrationToken,
     env: &ICoreWebView2Environment,
+    allow_window_close: bool,
   ) -> Result<()> {
-    // Close container HWND when `window.close` is called in JS
-    webview.add_WindowCloseRequested(
-      &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| DestroyWindow(hwnd))),
-      token,
-    )?;
+    // A remote document must not be able to invalidate the host's runtime
+    // state by destroying its container through `window.close()`.
+    if allow_window_close {
+      webview.add_WindowCloseRequested(
+        &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| DestroyWindow(hwnd))),
+        token,
+      )?;
+    } else {
+      webview.add_WindowCloseRequested(
+        &WindowCloseRequestedEventHandler::create(Box::new(|_, _| Ok(()))),
+        token,
+      )?;
+    }
 
     // Document title changed handler
     if let Some(document_title_changed_handler) = attributes.document_title_changed_handler.take() {
@@ -1922,6 +2279,27 @@ impl InnerWebView {
         .Profile()?
         .cast::<ICoreWebView2Profile2>()?
     };
+    Ok(ClearBrowsingDataCompletedHandler::wait_for_async_operation(
+      Box::new(move |handler| {
+        unsafe { profile.ClearBrowsingDataAll(&handler)? };
+        Ok(())
+      }),
+      Box::new(|result| result),
+    )?)
+  }
+
+  pub fn close_and_clear_all_browsing_data(&self) -> Result<()> {
+    let profile = unsafe {
+      self
+        .webview
+        .cast::<ICoreWebView2_13>()?
+        .Profile()?
+        .cast::<ICoreWebView2Profile2>()?
+    };
+    unsafe {
+      self.controller.SetIsVisible(false)?;
+      self.controller.Close()?;
+    }
     Ok(ClearBrowsingDataCompletedHandler::wait_for_async_operation(
       Box::new(move |handler| {
         unsafe { profile.ClearBrowsingDataAll(&handler)? };

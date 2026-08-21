@@ -112,6 +112,16 @@ fn adversarial_harness_covers_every_required_escape_attempt() {
         "Notification.requestPermission",
         "navigator.clipboard.readText",
         "navigator.clipboard.writeText",
+        "document.execCommand",
+        "chrome.webview.postMessage",
+        "hostObjects",
+        "getDisplayMedia",
+        "RTCPeerConnection",
+        "WebSocket",
+        "WebTransport",
+        "alert-dialog",
+        "print-dialog",
+        "window-close",
         "showOpenFilePicker",
         "input-file-picker",
         "tauri://",
@@ -137,11 +147,19 @@ fn remote_child_has_no_ipc_bootstrap_and_fails_closed_at_the_engine() {
     assert!(BROWSER_RUNTIME.contains("with_resource_request_handler"));
     assert!(BROWSER_RUNTIME.contains("with_file_chooser_disabled(true)"));
     assert!(BROWSER_RUNTIME.contains("with_external_uri_schemes_disabled(true)"));
+    assert!(BROWSER_RUNTIME.contains("with_remote_content_hardening(true)"));
     assert!(WRY_WINDOWS.contains("Page.setInterceptFileChooserDialog"));
     assert!(WRY_WINDOWS.contains("add_LaunchingExternalUriScheme"));
     assert!(WRY_WINDOWS.contains("SetCancel(true)"));
     assert!(WRY_WINDOWS.contains("COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL"));
     assert!(WRY_WINDOWS.contains("ClearBrowsingDataCompletedHandler::wait_for_async_operation"));
+    assert!(WRY_WINDOWS.contains("SetIsWebMessageEnabled(false)"));
+    assert!(WRY_WINDOWS.contains("SetAreHostObjectsAllowed(false)"));
+    assert!(WRY_WINDOWS.contains("SetAreDefaultScriptDialogsEnabled(false)"));
+    assert!(WRY_WINDOWS.contains("add_ScreenCaptureStarting"));
+    assert!(WRY_WINDOWS.contains("Network.setBlockedURLs"));
+    assert!(WRY_WINDOWS.contains("worker-src 'none'"));
+    assert!(WRY_WINDOWS.contains("close_and_clear_all_browsing_data"));
 }
 
 #[test]

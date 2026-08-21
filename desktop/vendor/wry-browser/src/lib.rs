@@ -1763,6 +1763,8 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   resource_request_handler: Option<Arc<dyn Fn(String) -> bool + Send + Sync>>,
   file_chooser_disabled: bool,
   external_uri_schemes_disabled: bool,
+  web_sockets_disabled: bool,
+  remote_content_hardening: bool,
 }
 
 #[cfg(windows)]
@@ -1782,6 +1784,8 @@ impl Default for PlatformSpecificWebViewAttributes {
       resource_request_handler: None,
       file_chooser_disabled: false,
       external_uri_schemes_disabled: false,
+      web_sockets_disabled: false,
+      remote_content_hardening: false,
     }
   }
 }
@@ -1900,6 +1904,19 @@ pub trait WebViewBuilderExtWindows {
   /// Creation fails closed if the installed WebView2 runtime cannot attach the
   /// interception before the first navigation.
   fn with_external_uri_schemes_disabled(self, disabled: bool) -> Self;
+
+  /// Prevent remote documents from opening WebSocket connections.
+  ///
+  /// Creation fails closed if the DevTools network policy cannot be installed
+  /// before the first navigation.
+  fn with_web_sockets_disabled(self, disabled: bool) -> Self;
+
+  /// Apply Buzz's fail-closed policy for an untrusted remote-only child.
+  ///
+  /// This rejects IPC/init scripts/custom protocols, suppresses native browser
+  /// prompts and screen capture, denies clipboard writes, and installs a CSP
+  /// sandbox before the first document is committed.
+  fn with_remote_content_hardening(self, enabled: bool) -> Self;
 }
 
 #[cfg(windows)]
@@ -1969,6 +1986,16 @@ impl WebViewBuilderExtWindows for WebViewBuilder<'_> {
 
   fn with_external_uri_schemes_disabled(mut self, disabled: bool) -> Self {
     self.platform_specific.external_uri_schemes_disabled = disabled;
+    self
+  }
+
+  fn with_web_sockets_disabled(mut self, disabled: bool) -> Self {
+    self.platform_specific.web_sockets_disabled = disabled;
+    self
+  }
+
+  fn with_remote_content_hardening(mut self, enabled: bool) -> Self {
+    self.platform_specific.remote_content_hardening = enabled;
     self
   }
 }
@@ -2297,6 +2324,12 @@ impl WebView {
   /// Clear all browsing data
   pub fn clear_all_browsing_data(&self) -> Result<()> {
     self.webview.clear_all_browsing_data()
+  }
+
+  /// Close the active document before clearing its dedicated WebView2 profile.
+  #[cfg(target_os = "windows")]
+  pub fn close_and_clear_all_browsing_data(&self) -> Result<()> {
+    self.webview.close_and_clear_all_browsing_data()
   }
 
   pub fn bounds(&self) -> Result<Rect> {

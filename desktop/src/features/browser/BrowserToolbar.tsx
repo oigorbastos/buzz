@@ -24,6 +24,7 @@ type BrowserToolbarProps = {
   onReload: () => void;
   onSelectPreset: (preset: BrowserPresetId) => void;
   presets: BrowserPreset[];
+  runtimeReady: boolean;
   selectedPreset: BrowserPresetId | null;
   surfaceLabel: string;
 };
@@ -40,6 +41,7 @@ export function BrowserToolbar({
   onReload,
   onSelectPreset,
   presets,
+  runtimeReady,
   selectedPreset,
   surfaceLabel,
 }: BrowserToolbarProps) {
@@ -97,7 +99,7 @@ export function BrowserToolbar({
         </Button>
         <Button
           aria-label="Recarregar"
-          disabled={busy || !hasPreset}
+          disabled={busy || !runtimeReady}
           onClick={onReload}
           size="icon"
           title="Recarregar"
@@ -107,7 +109,7 @@ export function BrowserToolbar({
         </Button>
         <Button
           aria-label="Início"
-          disabled={busy || !hasPreset}
+          disabled={busy || !runtimeReady}
           onClick={onHome}
           size="icon"
           title="Início"

@@ -257,12 +257,8 @@ pub async fn browser_action(
         }
         BrowserAction::CopyUrl { preset } => {
             let preset_config = resolve_active_preset(preset)?;
-            super::copy_text_to_clipboard(
-                preset_config.navigation.home().as_str().to_string(),
-                None,
-                app,
-            )
-            .await?;
+            let url = current_or_home_url(app.clone(), preset, &preset_config).await?;
+            super::copy_text_to_clipboard(url, None, app).await?;
             Ok(BrowserActionResult::Completed {
                 action: "copy_url",
                 preset,
@@ -270,8 +266,9 @@ pub async fn browser_action(
         }
         BrowserAction::OpenExternal { preset } => {
             let preset_config = resolve_active_preset(preset)?;
+            let url = current_or_home_url(app.clone(), preset, &preset_config).await?;
             app.opener()
-                .open_url(preset_config.navigation.home().as_str(), None::<&str>)
+                .open_url(url, None::<&str>)
                 .map_err(|_| "failed to open the approved preset externally".to_string())?;
             Ok(BrowserActionResult::Completed {
                 action: "open_external",
@@ -281,12 +278,23 @@ pub async fn browser_action(
     }
 }
 
+async fn current_or_home_url(
+    app: tauri::AppHandle,
+    preset: BrowserPresetId,
+    configured: &ConfiguredPreset,
+) -> Result<String, String> {
+    Ok(browser_runtime::current_url(app, preset)
+        .await?
+        .unwrap_or_else(|| configured.navigation.home().as_str().to_string()))
+}
+
 fn resolve_runtime_preset(id: BrowserPresetId) -> Result<RuntimePreset, String> {
     let preset = resolve_active_preset(id)?;
     Ok(RuntimePreset {
         id,
         home: preset.navigation.home().as_str().to_string(),
         navigation: preset.navigation,
+        profile: workspace_profile(),
     })
 }
 

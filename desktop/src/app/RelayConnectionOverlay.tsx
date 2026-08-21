@@ -66,6 +66,7 @@ export function RelayConnectionOverlay({
               : "bottom-3",
           )}
           exit={{ opacity: 0, y: 20 }}
+          data-testid="relay-connection-overlay"
           initial={{ opacity: 0, y: -20 }}
           key="relay-connection-overlay"
           transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}

@@ -318,9 +318,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --manifest-path desktop/vendor/wry-browser/Cargo.toml --target "$TARGET"
-          cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets
-          cargo test --manifest-path desktop/src-tauri/Cargo.toml
+          cargo check --manifest-path desktop/src-tauri/Cargo.toml --locked --target "$TARGET"
+          cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
 
       - name: Generate temporary non-updating Tauri config
         shell: bash

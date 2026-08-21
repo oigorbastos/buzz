@@ -58,7 +58,7 @@ function boundsKey(bounds: BrowserBounds) {
 function hasBlockingOverlay() {
   return Boolean(
     document.querySelector(
-      '[role="dialog"], [role="alertdialog"], [data-testid="community-change-overlay"], [data-radix-popper-content-wrapper], [data-state="open"][role="menu"], [data-state="open"][role="listbox"]',
+      '[role="dialog"], [role="alertdialog"], [data-testid="boot-splash-overlay"], [data-testid="onboarding-entering-curtain"], [data-testid="community-change-overlay"], [data-testid="relay-connection-overlay"], [data-testid="relay-error-overlay"], .buzz-huddle-shell[data-huddle-open="true"], [data-sonner-toast], [data-radix-popper-content-wrapper], [data-state="open"][role="menu"], [data-state="open"][role="listbox"]',
     ),
   );
 }
@@ -75,6 +75,10 @@ export function BrowserScreen() {
   const [busy, setBusy] = React.useState(false);
   const [retryGeneration, setRetryGeneration] = React.useState(0);
   const hostRef = React.useRef<HTMLDivElement>(null);
+  const lifecycleRef = React.useRef({
+    epoch: 0,
+    queue: Promise.resolve(),
+  });
 
   React.useEffect(() => {
     let cancelled = false;
@@ -147,8 +151,18 @@ export function BrowserScreen() {
 
     let cancelled = false;
     let mounted = false;
+    let childVisible = false;
     let lastBounds = "";
     let frame = 0;
+    const epoch = lifecycleRef.current.epoch + 1;
+    lifecycleRef.current.epoch = epoch;
+
+    const enqueue = (operation: () => Promise<void>) => {
+      const next = lifecycleRef.current.queue
+        .catch(() => undefined)
+        .then(operation);
+      lifecycleRef.current.queue = next.catch(() => undefined);
+    };
 
     const fail = (error: unknown) => {
       if (cancelled) return;
@@ -157,47 +171,85 @@ export function BrowserScreen() {
           ? error.message
           : "Não foi possível abrir o destino dentro do Buzz.",
       );
-      void hideBrowserChild().catch(() => undefined);
+      enqueue(async () => {
+        await hideBrowserChild().catch(() => undefined);
+        childVisible = false;
+      });
     };
 
-    const syncBounds = async () => {
+    const syncBounds = () => {
       frame = 0;
-      const bounds = elementBounds(host);
-      if (!bounds) return;
-      const key = boundsKey(bounds);
-      if (mounted && key === lastBounds) return;
-      lastBounds = key;
-      try {
-        const state = mounted
-          ? await setBrowserChildBounds(bounds)
-          : await mountBrowserChild(selectedPreset, bounds);
-        if (cancelled) return;
-        mounted = true;
-        setRuntimeError(null);
-        setRuntimeState(state);
-      } catch (error) {
-        fail(error);
-      }
+      enqueue(async () => {
+        if (cancelled || lifecycleRef.current.epoch !== epoch) return;
+        if (hasBlockingOverlay()) {
+          await hideBrowserChild().catch(() => undefined);
+          childVisible = false;
+          return;
+        }
+        const bounds = elementBounds(host);
+        if (!bounds) return;
+        const key = boundsKey(bounds);
+        if (mounted && childVisible && key === lastBounds) return;
+        lastBounds = key;
+        try {
+          const state =
+            mounted && childVisible
+              ? await setBrowserChildBounds(bounds)
+              : await mountBrowserChild(selectedPreset, bounds);
+          if (
+            cancelled ||
+            lifecycleRef.current.epoch !== epoch ||
+            hasBlockingOverlay()
+          ) {
+            await hideBrowserChild().catch(() => undefined);
+            childVisible = false;
+            return;
+          }
+          mounted = true;
+          childVisible = true;
+          setRuntimeError(null);
+          setRuntimeState(state);
+        } catch (error) {
+          fail(error);
+        }
+      });
     };
 
     const scheduleBounds = () => {
       if (frame !== 0) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => void syncBounds());
+      frame = requestAnimationFrame(syncBounds);
     };
 
     const observer = new ResizeObserver(scheduleBounds);
+    const overlayObserver = new MutationObserver(scheduleBounds);
     observer.observe(host);
+    overlayObserver.observe(document.body, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+      attributeFilter: [
+        "data-huddle-open",
+        "data-state",
+        "data-testid",
+        "role",
+      ],
+    });
     window.addEventListener("resize", scheduleBounds);
     window.addEventListener("scroll", scheduleBounds, true);
     scheduleBounds();
 
     return () => {
       cancelled = true;
+      lifecycleRef.current.epoch += 1;
       observer.disconnect();
+      overlayObserver.disconnect();
       window.removeEventListener("resize", scheduleBounds);
       window.removeEventListener("scroll", scheduleBounds, true);
       if (frame !== 0) cancelAnimationFrame(frame);
-      void hideBrowserChild().catch(() => undefined);
+      enqueue(async () => {
+        await hideBrowserChild().catch(() => undefined);
+        childVisible = false;
+      });
     };
   }, [retryGeneration, selectedPreset, status?.remote_content_enabled]);
 
@@ -217,35 +269,8 @@ export function BrowserScreen() {
     };
   }, [runtimeState?.mounted]);
 
-  React.useEffect(() => {
-    if (!runtimeState?.mounted) return;
-    let overlayVisible = false;
-    const syncVisibility = () => {
-      const next = hasBlockingOverlay();
-      if (next === overlayVisible) return;
-      overlayVisible = next;
-      if (next) {
-        void hideBrowserChild().catch(() => undefined);
-      } else if (hostRef.current) {
-        const bounds = elementBounds(hostRef.current);
-        const preset = selectedPreset ?? runtimeState.preset;
-        if (bounds && preset) {
-          void mountBrowserChild(preset, bounds).catch(() => undefined);
-        }
-      }
-    };
-    const observer = new MutationObserver(syncVisibility);
-    observer.observe(document.body, {
-      attributes: true,
-      childList: true,
-      subtree: true,
-      attributeFilter: ["data-state", "role"],
-    });
-    syncVisibility();
-    return () => observer.disconnect();
-  }, [runtimeState?.mounted, runtimeState?.preset, selectedPreset]);
-
   const selectPreset = React.useCallback((preset: BrowserPresetId) => {
+    setRuntimeState(null);
     setSelectedPreset(preset);
     recordBrowserMetric("preset_selected", preset);
   }, []);
@@ -316,6 +341,7 @@ export function BrowserScreen() {
           onReload={() => void performRuntimeAction(reloadBrowser)}
           onSelectPreset={selectPreset}
           presets={presets}
+          runtimeReady={Boolean(runtimeState?.mounted)}
           selectedPreset={selectedPreset}
           surfaceLabel={surfaceLabel}
         />
