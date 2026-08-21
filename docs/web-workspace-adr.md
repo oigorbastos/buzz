@@ -1,14 +1,13 @@
 # ADR: preview Web Workspace
 
-Status: accepted for implementation behind a closed preview gate (2026-08-21).
+Status: accepted for Windows canary behind the preview gate (2026-08-21).
 
 ## Decision
 
-Buzz Desktop gains one global `/browser` surface. Once the native security gate is
-green, it will be backed by one native child WebView (`browser-main`). It is a preset
-workspace, not a general browser. The trusted React renderer owns the toolbar; Rust
-owns policy and, only after that gate, the child lifecycle, bounds and dedicated
-profile. Local telemetry remains renderer-side and machine-local.
+Buzz Desktop gains one global `/browser` surface backed on Windows by one native
+child WebView (`browser-main`). It is a preset workspace, not a general browser. The
+trusted React renderer owns the toolbar; Rust owns policy, child lifecycle, bounds
+and the dedicated profile. Local telemetry remains renderer-side and machine-local.
 
 The implementation is based on fork commit `247ad412` without mixing the current
 upstream convergence into the security changes. Upstream convergence remains a
@@ -51,17 +50,18 @@ remain operator-only.
   its webview label.
 - `huddle-*` remains trusted local content and preserves the existing local
   capability set shared with `main`; only `browser-main` is deliberately excluded.
-- `browser-main` is untrusted remote content. It has no Tauri capability, app command,
-  remote URL capability, init script, postMessage bridge, host object or custom
-  protocol access.
+- `browser-main` is untrusted remote content. It is a raw Wry/WebView2 child outside
+  Tauri's webview manager and has no Tauri capability, app command, remote URL
+  capability, init script, postMessage bridge, host object or custom protocol access.
 - Rust accepts preset IDs, never renderer-provided URLs. Exact HTTP(S) origins and
   allowed top-level paths are compiled/validated fail-closed. Redirects use the same
   policy.
-- Popups, downloads and browser permissions are denied. External opening is possible
-  only after an explicit local-toolbar action.
-- If a future child passes the gate, cookies/history must stay in a dedicated
-  directory below Buzz `app_data_dir`; they must never enter relay, Nostr, community
-  state or logs. This closed-gate branch creates no child profile or remote cookie.
+- Every HTTP(S) resource request is restricted to the selected preset's exact
+  origin, including worker and WebSocket contexts exposed by WebView2. Popups,
+  downloads, file choosers, external URI schemes and browser permissions are denied.
+  External opening is possible only after an explicit local-toolbar action.
+- Cookies/history stay in a dedicated `web-workspace-webview2-v1` directory below
+  Buzz `app_local_data_dir`; they never enter relay, Nostr, community state or logs.
 - A native child cannot be covered by CSS. Route exit, identity/community transition,
   boot/onboarding, global overlay, dialog/sheet and huddle occlusion hide it at the
   native layer.
@@ -77,18 +77,20 @@ renderer/foundation is reviewable.
 
 ### Current gate outcome
 
-The reviewed Tauri 2.11.5 / Wry 0.55 baseline cannot prove fail-closed denial for
-every required WebView2 permission and file-picker path, nor expose the required
-history policy without an unsafe native bridge. The gate is therefore **closed** in
-this branch. No `browser-main` child is created and no remote URL is loaded. The
-preview route exposes only approved preset metadata, copy and explicit external-open;
-history controls are visibly disabled. This is a deliberate safe stopping point, not
-an internal-browser release.
+The stock Tauri 2.11.5 / Wry 0.55 child path remains rejected because it injects the
+Tauri IPC bootstrap before capability checks. The Windows canary instead uses a
+pinned, separately named Wry 0.56.1 source dependency with a narrow audited patch:
+the upstream IPC script is installed only when an IPC receiver exists, and Buzz never
+configures one. The patch also installs exact-origin resource interception,
+fail-closed file-chooser interception and external-scheme cancellation before the
+first navigation. Buzz production code adds no `unsafe`; native FFI stays inside the
+vendored library boundary.
 
-Before any future attempt to reopen the child, the adversarial harness must also probe
-loopback subresources against the authenticated media proxy. Top-level navigation
-policy and the `buzz-media://` label check do not by themselves prove that an untrusted
-page cannot scan `127.0.0.1` or reach a relay-auth proxy request lacking `Origin`.
+Static adversarial checks and the standalone Windows-target Wry compile are green.
+The portable Windows artifact remains a canary until the Gringo run exercises the
+fixture's IPC/internal-origin probes plus DPI, z-order, login persistence and clear
+data against the actual WebView2 runtime. Any failed probe closes the preview again;
+it does not justify relaxing CSP, adding an iframe fallback or exposing a bridge.
 
 ## Non-goals
 
@@ -101,8 +103,7 @@ hatch. Production deploy, merge and live Tailscale/ACL changes are outside this 
 
 The Gringo defaults are the Mission Control and session-monitor presets. Prata exposes
 only `/work` over its eventual HTTPS ingress and uses the separately compiled
-`collaborator` artifact. While the child gate is closed, both profiles use explicit
-external-open; no login occurs inside Buzz. Dogfood telemetry is machine-local and
-stores only preset/event counters and timestamps, never full URLs, query strings or
-page content. Final DPI, z-order, permissions, persistent-login, clear-data and
-revocation checks are external gates on Gringo/Prata.
+`collaborator` artifact. Dogfood telemetry is machine-local and stores only
+preset/event counters and timestamps, never full URLs, query strings or page content.
+Final DPI, z-order, permissions, persistent-login, clear-data and revocation checks
+are external gates on Gringo/Prata.

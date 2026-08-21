@@ -2,9 +2,8 @@ name: Windows Portable Build (Web Workspace preview)
 
 # Builds an unsigned, explicitly selected distribution profile. Pushes build
 # the operator preview; manual dispatch may build the collaborator preview only
-# when an exact HTTPS /work URL is supplied and validated. The
-# remote child gate remains closed; the artifact exposes only approved preset
-# metadata plus copy/open-external actions until a later WebView2 review.
+# when an exact HTTPS /work URL is supplied and validated. The resulting ZIP
+# is an unsigned canary with the isolated WebView2 child enabled on Windows.
 on:
   workflow_dispatch:
     inputs:
@@ -94,7 +93,9 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path desktop/vendor/wry-browser/Cargo.toml -- --check
 
       - name: Clippy (workspace, all targets)
         # Deliberately no `-D warnings`: this large fork carries pre-existing
@@ -272,6 +273,7 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
+          cargo fmt --manifest-path desktop/vendor/wry-browser/Cargo.toml -- --check
 
       - name: Run targeted Rust tests
         shell: bash
@@ -316,6 +318,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo check --manifest-path desktop/vendor/wry-browser/Cargo.toml --target "$TARGET"
           cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets
           cargo test --manifest-path desktop/src-tauri/Cargo.toml
 
@@ -405,20 +408,23 @@ jobs:
           PNPM=$PNPM_VERSION
           WEB_WORKSPACE_PROFILE=$BUZZ_BUILD_WEB_WORKSPACE_PROFILE
           LINUX_PREFLIGHT_GATE_01=cargo fmt --all -- --check
-          LINUX_PREFLIGHT_GATE_02=cargo clippy --workspace --all-targets
-          LINUX_PREFLIGHT_GATE_03=cargo test --workspace (skips only the 8 buzz-relay tests needing a live Postgres this job does not provision; the former git-sign-nostr and buzz-agent skips were fixed at the source and removed — see workflow comment)
+          LINUX_PREFLIGHT_GATE_02=cargo fmt --manifest-path desktop/vendor/wry-browser/Cargo.toml -- --check
+          LINUX_PREFLIGHT_GATE_03=cargo clippy --workspace --all-targets
+          LINUX_PREFLIGHT_GATE_04=cargo test --workspace (skips only the 8 buzz-relay tests needing a live Postgres this job does not provision; the former git-sign-nostr and buzz-agent skips were fixed at the source and removed — see workflow comment)
           WINDOWS_GATE_01=cargo fmt --all -- --check
           WINDOWS_GATE_02=cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
-          WINDOWS_GATE_03=cargo test -p buzz-acp
-          WINDOWS_GATE_04=cargo test -p buzz-cli lab --lib
-          WINDOWS_GATE_05=pnpm -C desktop check
-          WINDOWS_GATE_06=pnpm -C desktop check:file-sizes
-          WINDOWS_GATE_07=pnpm -C desktop typecheck
-          WINDOWS_GATE_08=pnpm -C desktop test
-          WINDOWS_GATE_09=pnpm -C desktop build:e2e
-          WINDOWS_GATE_10=pnpm -C desktop build
-          WINDOWS_GATE_11=cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets
-          WINDOWS_GATE_12=cargo test --manifest-path desktop/src-tauri/Cargo.toml
+          WINDOWS_GATE_03=cargo fmt --manifest-path desktop/vendor/wry-browser/Cargo.toml -- --check
+          WINDOWS_GATE_04=cargo test -p buzz-acp
+          WINDOWS_GATE_05=cargo test -p buzz-cli lab --lib
+          WINDOWS_GATE_06=pnpm -C desktop check
+          WINDOWS_GATE_07=pnpm -C desktop check:file-sizes
+          WINDOWS_GATE_08=pnpm -C desktop typecheck
+          WINDOWS_GATE_09=pnpm -C desktop test
+          WINDOWS_GATE_10=pnpm -C desktop build:e2e
+          WINDOWS_GATE_11=pnpm -C desktop build
+          WINDOWS_GATE_12=cargo check --manifest-path desktop/vendor/wry-browser/Cargo.toml --target x86_64-pc-windows-msvc
+          WINDOWS_GATE_13=cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets
+          WINDOWS_GATE_14=cargo test --manifest-path desktop/src-tauri/Cargo.toml
           SIDECAR_BUILD=cargo build --release --target x86_64-pc-windows-msvc -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh x86_64-pc-windows-msvc
           TAURI_COMMAND=pnpm -C desktop tauri build --target x86_64-pc-windows-msvc --no-bundle --no-sign --ci --config src-tauri/tauri.canary.conf.json

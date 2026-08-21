@@ -6,6 +6,8 @@ const LIB_RS: &str = include_str!("../src/lib.rs");
 const LOCKFILE: &str = include_str!("../Cargo.lock");
 const PERMISSION: &str = include_str!("../permissions/trusted-local-app-commands.toml");
 const ADVERSARIAL_HARNESS: &str = include_str!("fixtures/browser-adversarial.html");
+const BROWSER_RUNTIME: &str = include_str!("../src/commands/browser_runtime.rs");
+const WRY_WINDOWS: &str = include_str!("../../vendor/wry-browser/src/webview2/mod.rs");
 
 fn registered_app_commands() -> BTreeSet<String> {
     let (_, remainder) = LIB_RS
@@ -122,6 +124,24 @@ fn adversarial_harness_covers_every_required_escape_attempt() {
             "missing adversarial probe: {probe}"
         );
     }
+}
+
+#[test]
+fn remote_child_has_no_ipc_bootstrap_and_fails_closed_at_the_engine() {
+    assert!(WRY_WINDOWS.contains("if attributes.ipc_handler.is_some()"));
+    assert!(!BROWSER_RUNTIME.contains("with_ipc_handler"));
+    assert!(!BROWSER_RUNTIME.contains("with_initialization_script"));
+    assert!(BROWSER_RUNTIME.contains("with_permission_handler(|_| PermissionResponse::Deny)"));
+    assert!(BROWSER_RUNTIME.contains("with_new_window_req_handler(|_, _| NewWindowResponse::Deny)"));
+    assert!(BROWSER_RUNTIME.contains("with_download_started_handler(|_, _| false)"));
+    assert!(BROWSER_RUNTIME.contains("with_resource_request_handler"));
+    assert!(BROWSER_RUNTIME.contains("with_file_chooser_disabled(true)"));
+    assert!(BROWSER_RUNTIME.contains("with_external_uri_schemes_disabled(true)"));
+    assert!(WRY_WINDOWS.contains("Page.setInterceptFileChooserDialog"));
+    assert!(WRY_WINDOWS.contains("add_LaunchingExternalUriScheme"));
+    assert!(WRY_WINDOWS.contains("SetCancel(true)"));
+    assert!(WRY_WINDOWS.contains("COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL"));
+    assert!(WRY_WINDOWS.contains("ClearBrowsingDataCompletedHandler::wait_for_async_operation"));
 }
 
 #[test]

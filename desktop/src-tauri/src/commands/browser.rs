@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use tauri_plugin_opener::OpenerExt;
 use url::{Host, Url};
 
+use super::browser_runtime::{self, RuntimeOperation, RuntimePreset, RuntimeState};
+
 const MAIN_WEBVIEW_LABEL: &str = "main";
 const MAIN_WINDOW_LABEL: &str = "main";
 const DEV_RENDERER_PORT: u16 = 1420;
@@ -22,8 +24,57 @@ pub enum BrowserPresetId {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserAction {
     SecurityStatus,
-    CopyUrl { preset: BrowserPresetId },
-    OpenExternal { preset: BrowserPresetId },
+    Mount {
+        preset: BrowserPresetId,
+        bounds: BrowserBounds,
+    },
+    SetBounds {
+        bounds: BrowserBounds,
+    },
+    SelectPreset {
+        preset: BrowserPresetId,
+    },
+    Back,
+    Forward,
+    Reload,
+    Home {
+        preset: BrowserPresetId,
+    },
+    Show,
+    Hide,
+    Focus,
+    ClearData,
+    RuntimeState,
+    CopyUrl {
+        preset: BrowserPresetId,
+    },
+    OpenExternal {
+        preset: BrowserPresetId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct BrowserBounds {
+    pub(super) x: f64,
+    pub(super) y: f64,
+    pub(super) width: f64,
+    pub(super) height: f64,
+}
+
+impl BrowserBounds {
+    fn validate(self) -> Result<Self, String> {
+        let values = [self.x, self.y, self.width, self.height];
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("browser bounds must be finite".to_string());
+        }
+        if self.x < 0.0 || self.y < 0.0 || self.width < 1.0 || self.height < 1.0 {
+            return Err("browser bounds must describe a visible content area".to_string());
+        }
+        if values.iter().any(|value| *value > 20_000.0) {
+            return Err("browser bounds exceed the supported window size".to_string());
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -56,6 +107,14 @@ pub enum BrowserActionResult {
     Completed {
         action: &'static str,
         preset: BrowserPresetId,
+    },
+    RuntimeState {
+        action: &'static str,
+        mounted: bool,
+        visible: bool,
+        preset: Option<BrowserPresetId>,
+        can_go_back: bool,
+        can_go_forward: bool,
     },
 }
 
@@ -95,6 +154,13 @@ impl NavigationPolicy {
     pub(crate) fn allows(&self, candidate: &Url) -> bool {
         is_allowed_remote_navigation(&self.home, candidate, self.paths)
     }
+
+    pub(crate) fn allows_resource(&self, candidate: &Url) -> bool {
+        matches!(candidate.scheme(), "http" | "https")
+            && candidate.username().is_empty()
+            && candidate.password().is_none()
+            && candidate.origin() == self.home.origin()
+    }
 }
 
 #[tauri::command]
@@ -114,13 +180,80 @@ pub async fn browser_action(
                     .into_iter()
                     .map(|preset| preset.descriptor)
                     .collect(),
-                // Tauri 2.11.5/Wry 0.55 cannot deny every WebView2 permission
-                // or provide safe history controls. The child remains locked
-                // until a real Windows adversarial gate proves the boundary.
-                remote_content_enabled: false,
+                remote_content_enabled: cfg!(target_os = "windows"),
                 remote_child_has_capability: false,
                 app_manifest_command_count: 315,
             })
+        }
+        BrowserAction::Mount { preset, bounds } => {
+            let runtime_preset = resolve_runtime_preset(preset)?;
+            let state = browser_runtime::perform(
+                app,
+                RuntimeOperation::Mount {
+                    bounds: bounds.validate()?,
+                    preset,
+                },
+                Some(runtime_preset),
+            )
+            .await?;
+            Ok(runtime_state_result("mount", state))
+        }
+        BrowserAction::SetBounds { bounds } => {
+            let state = browser_runtime::perform(
+                app,
+                RuntimeOperation::SetBounds(bounds.validate()?),
+                None,
+            )
+            .await?;
+            Ok(runtime_state_result("set_bounds", state))
+        }
+        BrowserAction::SelectPreset { preset } => {
+            let runtime_preset = resolve_runtime_preset(preset)?;
+            let state = browser_runtime::perform(
+                app,
+                RuntimeOperation::SelectPreset(preset),
+                Some(runtime_preset),
+            )
+            .await?;
+            Ok(runtime_state_result("select_preset", state))
+        }
+        BrowserAction::Back => {
+            let state = browser_runtime::perform(app, RuntimeOperation::Back, None).await?;
+            Ok(runtime_state_result("back", state))
+        }
+        BrowserAction::Forward => {
+            let state = browser_runtime::perform(app, RuntimeOperation::Forward, None).await?;
+            Ok(runtime_state_result("forward", state))
+        }
+        BrowserAction::Reload => {
+            let state = browser_runtime::perform(app, RuntimeOperation::Reload, None).await?;
+            Ok(runtime_state_result("reload", state))
+        }
+        BrowserAction::Home { preset } => {
+            let runtime_preset = resolve_runtime_preset(preset)?;
+            let state =
+                browser_runtime::perform(app, RuntimeOperation::Home, Some(runtime_preset)).await?;
+            Ok(runtime_state_result("home", state))
+        }
+        BrowserAction::Show => {
+            let state = browser_runtime::perform(app, RuntimeOperation::Show, None).await?;
+            Ok(runtime_state_result("show", state))
+        }
+        BrowserAction::Hide => {
+            let state = browser_runtime::perform(app, RuntimeOperation::Hide, None).await?;
+            Ok(runtime_state_result("hide", state))
+        }
+        BrowserAction::Focus => {
+            let state = browser_runtime::perform(app, RuntimeOperation::Focus, None).await?;
+            Ok(runtime_state_result("focus", state))
+        }
+        BrowserAction::ClearData => {
+            let state = browser_runtime::perform(app, RuntimeOperation::ClearData, None).await?;
+            Ok(runtime_state_result("clear_data", state))
+        }
+        BrowserAction::RuntimeState => {
+            let state = browser_runtime::perform(app, RuntimeOperation::State, None).await?;
+            Ok(runtime_state_result("runtime_state", state))
         }
         BrowserAction::CopyUrl { preset } => {
             let preset_config = resolve_active_preset(preset)?;
@@ -145,6 +278,26 @@ pub async fn browser_action(
                 preset,
             })
         }
+    }
+}
+
+fn resolve_runtime_preset(id: BrowserPresetId) -> Result<RuntimePreset, String> {
+    let preset = resolve_active_preset(id)?;
+    Ok(RuntimePreset {
+        id,
+        home: preset.navigation.home().as_str().to_string(),
+        navigation: preset.navigation,
+    })
+}
+
+fn runtime_state_result(action: &'static str, state: RuntimeState) -> BrowserActionResult {
+    BrowserActionResult::RuntimeState {
+        action,
+        mounted: state.mounted,
+        visible: state.visible,
+        preset: state.preset,
+        can_go_back: state.can_go_back,
+        can_go_forward: state.can_go_forward,
     }
 }
 
@@ -345,7 +498,7 @@ fn path_matches(path: &str, root: &str) -> bool {
 mod tests {
     use super::{
         configured_presets_for, is_allowed_remote_navigation, validate_browser_caller_parts,
-        validate_remote_home, BrowserPresetId, NavigationPolicy, PresetPathPolicy,
+        validate_remote_home, BrowserBounds, BrowserPresetId, NavigationPolicy, PresetPathPolicy,
         WorkspaceProfile,
     };
     use url::Url;
@@ -482,6 +635,78 @@ mod tests {
             &url("https://sessions.example.test.evil/"),
             PresetPathPolicy::Sessions,
         ));
+    }
+
+    #[test]
+    fn resource_policy_allows_only_the_exact_selected_origin() {
+        let policy = NavigationPolicy::new(
+            "http://100.114.156.19:3002/mission",
+            PresetPathPolicy::MissionControl,
+        )
+        .unwrap();
+        for allowed in [
+            "http://100.114.156.19:3002/assets/app.js",
+            "http://100.114.156.19:3002/api/cases?limit=20",
+        ] {
+            assert!(policy.allows_resource(&url(allowed)));
+        }
+        for denied in [
+            "https://100.114.156.19:3002/assets/app.js",
+            "http://100.114.156.19/assets/app.js",
+            "http://127.0.0.1:8799/api/sessions",
+            "http://tauri.localhost/",
+            "file:///C:/Windows/win.ini",
+            "data:text/plain,probe",
+            "javascript:void(0)",
+            "ws://100.114.156.19:3002/socket",
+            "wss://example.com/socket",
+        ] {
+            assert!(
+                !policy.allows_resource(&url(denied)),
+                "unexpected allow: {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_bounds_reject_invalid_or_unbounded_geometry() {
+        assert!(BrowserBounds {
+            x: 12.5,
+            y: 80.0,
+            width: 900.0,
+            height: 600.0,
+        }
+        .validate()
+        .is_ok());
+
+        for bounds in [
+            BrowserBounds {
+                x: -1.0,
+                y: 0.0,
+                width: 900.0,
+                height: 600.0,
+            },
+            BrowserBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 600.0,
+            },
+            BrowserBounds {
+                x: 0.0,
+                y: f64::NAN,
+                width: 900.0,
+                height: 600.0,
+            },
+            BrowserBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 20_001.0,
+                height: 600.0,
+            },
+        ] {
+            assert!(bounds.validate().is_err());
+        }
     }
 
     #[test]

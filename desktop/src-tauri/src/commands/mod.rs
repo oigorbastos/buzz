@@ -12,6 +12,7 @@ mod agent_settings;
 mod agent_update_rollback;
 mod agents;
 mod browser;
+mod browser_runtime;
 mod canvas;
 mod channel_templates;
 mod channel_window;

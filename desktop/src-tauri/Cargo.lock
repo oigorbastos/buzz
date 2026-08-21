@@ -1169,6 +1169,7 @@ dependencies = [
  "webkit2gtk",
  "window-vibrancy",
  "windows-sys 0.61.2",
+ "wry 0.56.1",
  "zeroize",
  "zip 8.6.0",
 ]
@@ -10759,7 +10760,7 @@ dependencies = [
  "webkit2gtk",
  "webview2-com",
  "windows 0.61.3",
- "wry",
+ "wry 0.55.1",
 ]
 
 [[package]]
@@ -13238,6 +13239,23 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-version",
  "x11-dl",
+]
+
+[[package]]
+name = "wry"
+version = "0.56.1"
+dependencies = [
+ "cookie",
+ "dpi",
+ "dunce",
+ "http",
+ "once_cell",
+ "raw-window-handle",
+ "thiserror 2.0.18",
+ "webview2-com",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
+ "windows-version",
 ]
 
 [[package]]
