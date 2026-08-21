@@ -3,12 +3,17 @@ import {
   Bot,
   FlaskConical,
   FolderGit2,
+  Globe,
   Inbox,
   Zap,
 } from "lucide-react";
 
 import type { AppView } from "@/app/AppShell.helpers";
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
+import {
+  buildWorkspaceProfile,
+  workspaceSurfaceLabel,
+} from "@/features/browser/browserProfile";
 import { FeatureGate } from "@/shared/features";
 import type { Channel, SearchHit } from "@/shared/api/types";
 import {
@@ -41,6 +46,7 @@ type AppSidebarPinnedHeaderProps = {
 type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
+  onSelectBrowser: () => void;
   onSelectHome: () => void;
   onSelectLab: () => void;
   onSelectProjects: () => void;
@@ -91,6 +97,7 @@ export function AppSidebarPinnedHeader({
 export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
+  onSelectBrowser,
   onSelectHome,
   onSelectLab,
   onSelectProjects,
@@ -167,6 +174,24 @@ export function AppSidebarPrimaryMenu({
             </SidebarMenuButton>
           </SidebarMenuItem>
         </FeatureGate>
+        {buildWorkspaceProfile !== "disabled" ? (
+          <FeatureGate feature="browser">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-browser-view"
+                isActive={selectedView === "browser"}
+                onClick={onSelectBrowser}
+                tooltip={workspaceSurfaceLabel(buildWorkspaceProfile)}
+                type="button"
+              >
+                <Globe className="h-4 w-4" />
+                <SidebarMenuLabel>
+                  {workspaceSurfaceLabel(buildWorkspaceProfile)}
+                </SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
+        ) : null}
         <SidebarMenuItem>
           <SidebarMenuButton
             className="data-[active=true]:font-normal"

@@ -30,7 +30,7 @@
         } catch (error) {
           results[name] = {
             resolved: false,
-            error: error && error.name ? String(error.name) : "Error",
+            error: error?.name ? String(error.name) : "Error",
           };
         }
         output.textContent = JSON.stringify(results, null, 2);

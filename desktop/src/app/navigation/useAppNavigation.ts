@@ -107,6 +107,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goBrowser = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/browser",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goLabBoard = React.useCallback(
     (
       boardId: string,
@@ -367,6 +378,7 @@ export function useAppNavigation() {
     closeSettings,
     closeWorkflowDetail,
     goAgents,
+    goBrowser,
     goChannel,
     goForumPost,
     goHome,

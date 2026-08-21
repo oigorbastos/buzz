@@ -1,25 +1,61 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
+use tauri_plugin_opener::OpenerExt;
 use url::{Host, Url};
 
 const MAIN_WEBVIEW_LABEL: &str = "main";
 const MAIN_WINDOW_LABEL: &str = "main";
 const DEV_RENDERER_PORT: u16 = 1420;
+const DEFAULT_MISSION_CONTROL_URL: &str = "http://100.114.156.19:3002/mission";
+const DEFAULT_SESSIONS_URL: &str = "https://desktop-1lomp0a-1.taild6a99a.ts.net:8443/";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserPresetId {
+    MissionControl,
+    Sessions,
+    Work,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserAction {
     SecurityStatus,
+    CopyUrl { preset: BrowserPresetId },
+    OpenExternal { preset: BrowserPresetId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProfile {
+    Collaborator,
+    Disabled,
+    Operator,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowserPresetDescriptor {
+    id: BrowserPresetId,
+    label: &'static str,
+    subtitle: &'static str,
+    url_display: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserActionResult {
     SecurityStatus {
+        configured: bool,
+        profile: WorkspaceProfile,
+        presets: Vec<BrowserPresetDescriptor>,
         remote_content_enabled: bool,
         remote_child_has_capability: bool,
         app_manifest_command_count: usize,
+    },
+    Completed {
+        action: &'static str,
+        preset: BrowserPresetId,
     },
 }
 
@@ -34,6 +70,12 @@ pub(crate) enum PresetPathPolicy {
 pub(crate) struct NavigationPolicy {
     home: Url,
     paths: PresetPathPolicy,
+}
+
+#[derive(Clone, Debug)]
+struct ConfiguredPreset {
+    descriptor: BrowserPresetDescriptor,
+    navigation: NavigationPolicy,
 }
 
 impl NavigationPolicy {
@@ -57,20 +99,141 @@ impl NavigationPolicy {
 
 #[tauri::command]
 pub async fn browser_action(
+    app: tauri::AppHandle,
     webview: tauri::Webview,
     action: BrowserAction,
 ) -> Result<BrowserActionResult, String> {
     validate_browser_command_caller(&webview)?;
     match action {
-        BrowserAction::SecurityStatus => Ok(BrowserActionResult::SecurityStatus {
-            // Tauri 2.11.5/Wry 0.55 cannot deny every WebView2 permission or
-            // provide safe history controls. The child remains locked until a
-            // real Windows adversarial gate proves those boundaries.
-            remote_content_enabled: false,
-            remote_child_has_capability: false,
-            app_manifest_command_count: 315,
-        }),
+        BrowserAction::SecurityStatus => {
+            let presets = configured_presets();
+            Ok(BrowserActionResult::SecurityStatus {
+                configured: !presets.is_empty(),
+                profile: workspace_profile(),
+                presets: presets
+                    .into_iter()
+                    .map(|preset| preset.descriptor)
+                    .collect(),
+                // Tauri 2.11.5/Wry 0.55 cannot deny every WebView2 permission
+                // or provide safe history controls. The child remains locked
+                // until a real Windows adversarial gate proves the boundary.
+                remote_content_enabled: false,
+                remote_child_has_capability: false,
+                app_manifest_command_count: 315,
+            })
+        }
+        BrowserAction::CopyUrl { preset } => {
+            let preset_config = resolve_active_preset(preset)?;
+            super::copy_text_to_clipboard(
+                preset_config.navigation.home().as_str().to_string(),
+                None,
+                app,
+            )
+            .await?;
+            Ok(BrowserActionResult::Completed {
+                action: "copy_url",
+                preset,
+            })
+        }
+        BrowserAction::OpenExternal { preset } => {
+            let preset_config = resolve_active_preset(preset)?;
+            app.opener()
+                .open_url(preset_config.navigation.home().as_str(), None::<&str>)
+                .map_err(|_| "failed to open the approved preset externally".to_string())?;
+            Ok(BrowserActionResult::Completed {
+                action: "open_external",
+                preset,
+            })
+        }
     }
+}
+
+fn workspace_profile() -> WorkspaceProfile {
+    match option_env!("BUZZ_BUILD_WEB_WORKSPACE_PROFILE") {
+        Some("operator") => WorkspaceProfile::Operator,
+        Some("collaborator") => WorkspaceProfile::Collaborator,
+        _ => WorkspaceProfile::Disabled,
+    }
+}
+
+fn configured_presets() -> Vec<ConfiguredPreset> {
+    configured_presets_for(
+        workspace_profile(),
+        option_env!("BUZZ_BUILD_WEB_MISSION_CONTROL_URL"),
+        option_env!("BUZZ_BUILD_WEB_SESSIONS_URL"),
+        option_env!("BUZZ_BUILD_WEB_WORK_URL"),
+        cfg!(debug_assertions),
+    )
+}
+
+fn configured_presets_for(
+    profile: WorkspaceProfile,
+    mission_control_url: Option<&str>,
+    sessions_url: Option<&str>,
+    work_url: Option<&str>,
+    allow_insecure_work: bool,
+) -> Vec<ConfiguredPreset> {
+    match profile {
+        WorkspaceProfile::Disabled => Vec::new(),
+        WorkspaceProfile::Operator => [
+            configured_preset(
+                BrowserPresetId::MissionControl,
+                "Mission Control",
+                "Operação Alis",
+                mission_control_url.unwrap_or(DEFAULT_MISSION_CONTROL_URL),
+                PresetPathPolicy::MissionControl,
+            ),
+            configured_preset(
+                BrowserPresetId::Sessions,
+                "Sessions",
+                "Monitor de sessões LLM",
+                sessions_url.unwrap_or(DEFAULT_SESSIONS_URL),
+                PresetPathPolicy::Sessions,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        WorkspaceProfile::Collaborator => work_url
+            .and_then(|url| {
+                configured_preset(
+                    BrowserPresetId::Work,
+                    "Meu Trabalho",
+                    "Casos e próximos passos",
+                    url,
+                    PresetPathPolicy::Work,
+                )
+            })
+            .filter(|preset| allow_insecure_work || preset.navigation.home().scheme() == "https")
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn configured_preset(
+    id: BrowserPresetId,
+    label: &'static str,
+    subtitle: &'static str,
+    home: &str,
+    paths: PresetPathPolicy,
+) -> Option<ConfiguredPreset> {
+    let navigation = NavigationPolicy::new(home, paths).ok()?;
+    Some(ConfiguredPreset {
+        descriptor: BrowserPresetDescriptor {
+            id,
+            label,
+            subtitle,
+            url_display: navigation.home().as_str().to_string(),
+        },
+        navigation,
+    })
+}
+
+fn resolve_active_preset(id: BrowserPresetId) -> Result<ConfiguredPreset, String> {
+    configured_presets()
+        .into_iter()
+        .find(|preset| preset.descriptor.id == id)
+        .ok_or_else(|| "browser preset is not available in this distribution profile".to_string())
 }
 
 fn validate_browser_command_caller(webview: &tauri::Webview) -> Result<(), String> {
@@ -183,8 +346,9 @@ fn path_matches(path: &str, root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_remote_navigation, validate_browser_caller_parts, validate_remote_home,
-        NavigationPolicy, PresetPathPolicy,
+        configured_presets_for, is_allowed_remote_navigation, validate_browser_caller_parts,
+        validate_remote_home, BrowserPresetId, NavigationPolicy, PresetPathPolicy,
+        WorkspaceProfile,
     };
     use url::Url;
 
@@ -320,5 +484,53 @@ mod tests {
             &url("https://sessions.example.test.evil/"),
             PresetPathPolicy::Sessions,
         ));
+    }
+
+    #[test]
+    fn distribution_profiles_are_generic_and_fail_closed() {
+        assert!(configured_presets_for(
+            WorkspaceProfile::Disabled,
+            None,
+            None,
+            Some("https://mc.example.test/work"),
+            false,
+        )
+        .is_empty());
+
+        let operator = configured_presets_for(
+            WorkspaceProfile::Operator,
+            None,
+            None,
+            Some("https://mc.example.test/work"),
+            false,
+        );
+        assert_eq!(operator.len(), 2);
+        assert_eq!(operator[0].descriptor.id, BrowserPresetId::MissionControl);
+        assert_eq!(operator[1].descriptor.id, BrowserPresetId::Sessions);
+
+        let collaborator = configured_presets_for(
+            WorkspaceProfile::Collaborator,
+            None,
+            None,
+            Some("https://mc.example.test/work"),
+            false,
+        );
+        assert_eq!(collaborator.len(), 1);
+        assert_eq!(collaborator[0].descriptor.id, BrowserPresetId::Work);
+
+        for invalid in [
+            None,
+            Some("http://mc.example.test/work"),
+            Some("https://mc.example.test/mission"),
+        ] {
+            assert!(configured_presets_for(
+                WorkspaceProfile::Collaborator,
+                None,
+                None,
+                invalid,
+                false,
+            )
+            .is_empty());
+        }
     }
 }

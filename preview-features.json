@@ -26,6 +26,12 @@
       "platforms": ["desktop"]
     },
     {
+      "id": "browser",
+      "name": "Web Workspace",
+      "description": "Approved operational web surfaces without leaving Buzz",
+      "platforms": ["desktop"]
+    },
+    {
       "id": "forum",
       "name": "Forum Channels",
       "description": "Forum-style threaded channels for long-form discussions",

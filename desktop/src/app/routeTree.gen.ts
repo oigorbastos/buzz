@@ -11,6 +11,7 @@ import { Route as remindersRouteImport } from "./routes/reminders";
 import { Route as pulseRouteImport } from "./routes/pulse";
 import { Route as projectsRouteImport } from "./routes/projects";
 import { Route as labRouteImport } from "./routes/lab";
+import { Route as browserRouteImport } from "./routes/browser";
 import { Route as agentsRouteImport } from "./routes/agents";
 import { Route as indexRouteImport } from "./routes/index";
 import { Route as workflowsDotworkflowIdRouteImport } from "./routes/workflows.$workflowId";
@@ -48,6 +49,11 @@ const projectsRoute = projectsRouteImport.update({
 const labRoute = labRouteImport.update({
   id: "/lab",
   path: "/lab",
+  getParentRoute: () => rootRouteImport,
+} as any);
+const browserRoute = browserRouteImport.update({
+  id: "/browser",
+  path: "/browser",
   getParentRoute: () => rootRouteImport,
 } as any);
 const agentsRoute = agentsRouteImport.update({
@@ -95,6 +101,7 @@ const channelsDotchannelIdDotpostsDotpostIdRoute =
 export interface FileRoutesByFullPath {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
+  "/browser": typeof browserRoute;
   "/lab": typeof labRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
@@ -111,6 +118,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
+  "/browser": typeof browserRoute;
   "/lab": typeof labRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
@@ -128,6 +136,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport;
   "/": typeof indexRoute;
   "/agents": typeof agentsRoute;
+  "/browser": typeof browserRoute;
   "/lab": typeof labRoute;
   "/projects": typeof projectsRoute;
   "/pulse": typeof pulseRoute;
@@ -146,6 +155,7 @@ export interface FileRouteTypes {
   fullPaths:
     | "/"
     | "/agents"
+    | "/browser"
     | "/lab"
     | "/projects"
     | "/pulse"
@@ -162,6 +172,7 @@ export interface FileRouteTypes {
   to:
     | "/"
     | "/agents"
+    | "/browser"
     | "/lab"
     | "/projects"
     | "/pulse"
@@ -178,6 +189,7 @@ export interface FileRouteTypes {
     | "__root__"
     | "/"
     | "/agents"
+    | "/browser"
     | "/lab"
     | "/projects"
     | "/pulse"
@@ -195,6 +207,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   indexRoute: typeof indexRoute;
   agentsRoute: typeof agentsRoute;
+  browserRoute: typeof browserRoute;
   labRoute: typeof labRoute;
   projectsRoute: typeof projectsRoute;
   pulseRoute: typeof pulseRoute;
@@ -251,6 +264,13 @@ declare module "@tanstack/react-router" {
       path: "/lab";
       fullPath: "/lab";
       preLoaderRoute: typeof labRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/browser": {
+      id: "/browser";
+      path: "/browser";
+      fullPath: "/browser";
+      preLoaderRoute: typeof browserRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/agents": {
@@ -315,6 +335,7 @@ declare module "@tanstack/react-router" {
 const rootRouteChildren: RootRouteChildren = {
   indexRoute: indexRoute,
   agentsRoute: agentsRoute,
+  browserRoute: browserRoute,
   labRoute: labRoute,
   projectsRoute: projectsRoute,
   pulseRoute: pulseRoute,

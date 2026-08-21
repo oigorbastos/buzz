@@ -126,7 +126,9 @@ fn adversarial_harness_covers_every_required_escape_attempt() {
 
 #[test]
 fn tauri_stays_on_the_reviewed_security_release() {
-    let lock = LOCKFILE.parse::<toml::Value>().expect("Cargo.lock must parse");
+    let lock = LOCKFILE
+        .parse::<toml::Value>()
+        .expect("Cargo.lock must parse");
     let packages = lock
         .get("package")
         .and_then(toml::Value::as_array)

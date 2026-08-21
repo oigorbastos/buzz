@@ -72,6 +72,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_RELAY_RECONNECT_CMD");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_WEB_WORKSPACE_PROFILE");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_WEB_MISSION_CONTROL_URL");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_WEB_SESSIONS_URL");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_WEB_WORK_URL");
     println!("cargo:rerun-if-changed=permissions/trusted-local-app-commands.toml");
     println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
 

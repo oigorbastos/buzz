@@ -17,18 +17,26 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
  * switching), not just by the sidebar.
  */
 export function useSidebarNavHandlers() {
-  const { goAgents, goHome, goLab, goProjects, goPulse, goWorkflows } =
-    useAppNavigation();
+  const {
+    goAgents,
+    goBrowser,
+    goHome,
+    goLab,
+    goProjects,
+    goPulse,
+    goWorkflows,
+  } = useAppNavigation();
 
   return React.useMemo(
     () => ({
       onSelectAgents: () => void goAgents(),
+      onSelectBrowser: () => void goBrowser(),
       onSelectHome: () => void goHome(),
       onSelectLab: () => void goLab(),
       onSelectProjects: () => void goProjects(),
       onSelectPulse: () => void goPulse(),
       onSelectWorkflows: () => void goWorkflows(),
     }),
-    [goAgents, goHome, goLab, goProjects, goPulse, goWorkflows],
+    [goAgents, goBrowser, goHome, goLab, goProjects, goPulse, goWorkflows],
   );
 }

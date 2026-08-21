@@ -4,10 +4,11 @@ Status: accepted for implementation behind a closed preview gate (2026-08-21).
 
 ## Decision
 
-Buzz Desktop gains one global `/browser` surface backed by one native child WebView
-(`browser-main`). It is a preset workspace, not a general browser. The trusted React
-renderer owns the toolbar; Rust owns the child lifecycle, bounds, navigation policy,
-dedicated profile and local telemetry.
+Buzz Desktop gains one global `/browser` surface. Once the native security gate is
+green, it will be backed by one native child WebView (`browser-main`). It is a preset
+workspace, not a general browser. The trusted React renderer owns the toolbar; Rust
+owns policy and, only after that gate, the child lifecycle, bounds and dedicated
+profile. Local telemetry remains renderer-side and machine-local.
 
 The implementation is based on fork commit `247ad412` without mixing the current
 upstream convergence into the security changes. Upstream convergence remains a
@@ -53,6 +54,16 @@ URL policy tests pass, and an adversarial WebView2 harness proves that IPC, inte
 schemes, popups, downloads and camera/microphone/geolocation/notification requests fail
 closed. If the real Windows gate is not green, the preview remains locked and only the
 renderer/foundation is reviewable.
+
+### Current gate outcome
+
+The reviewed Tauri 2.11.5 / Wry 0.55 baseline cannot prove fail-closed denial for
+every required WebView2 permission and file-picker path, nor expose the required
+history policy without an unsafe native bridge. The gate is therefore **closed** in
+this branch. No `browser-main` child is created and no remote URL is loaded. The
+preview route exposes only approved preset metadata, copy and explicit external-open;
+history controls are visibly disabled. This is a deliberate safe stopping point, not
+an internal-browser release.
 
 ## Non-goals
 
