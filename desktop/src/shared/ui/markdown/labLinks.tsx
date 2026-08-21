@@ -1,7 +1,17 @@
+import { LockKeyhole } from "lucide-react";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useLabBoardsQuery } from "@/features/lab/hooks";
 import { type ParsedLabLink, parseLabLink } from "@/features/lab/lib/labLink";
+import { canReadBoard } from "@/features/lab/model";
+import { useUserProfileQuery } from "@/features/profile/hooks";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { cn } from "@/shared/lib/cn";
+import {
+  MENTION_CHIP_BASE_CLASSES,
+  MENTION_CHIP_HOVER_CLASSES,
+} from "@/shared/ui/mentionChip";
 
 import { LabLinkPill } from "./LabLinkPill";
 import { useMarkdownRuntime } from "./runtimeContext";
@@ -25,13 +35,82 @@ export function useOpenLabLink(): (link: ParsedLabLink) => void {
 }
 
 /**
- * Render an inline anchor for an explicit `[label](buzz://lab?…)` link that
- * navigates in-app instead of handing the URL to the OS. Returns `null` when
- * the href does not parse so the caller can fall through to its default
- * anchor. Mirrors `renderEntityLinkAnchor`.
+ * Resolve an explicit Lab reference against the ACL-filtered board list. The
+ * literal Markdown label is the fail-closed fallback while the query loads,
+ * after deletion, or when the reader cannot access the board.
+ */
+export function LabBoardReference({
+  children,
+  href,
+  link,
+  onOpenLabLink,
+}: {
+  children: React.ReactNode;
+  href: string;
+  link: ParsedLabLink;
+  onOpenLabLink: (link: ParsedLabLink) => void;
+}) {
+  const boardsQuery = useLabBoardsQuery();
+  const identityQuery = useIdentityQuery();
+  const currentProfileQuery = useUserProfileQuery(identityQuery.data?.pubkey);
+  const candidate = boardsQuery.isSuccess
+    ? boardsQuery.data.find((candidate) => candidate.boardId === link.boardId)
+    : undefined;
+  const board =
+    candidate &&
+    canReadBoard(
+      candidate,
+      identityQuery.data?.pubkey,
+      currentProfileQuery.data?.ownerPubkey,
+    )
+      ? candidate
+      : undefined;
+
+  if (!board) {
+    return (
+      <span
+        aria-disabled="true"
+        className={cn(
+          MENTION_CHIP_BASE_CLASSES,
+          "cursor-not-allowed opacity-60",
+        )}
+        data-lab-link=""
+        data-lab-link-state="unavailable"
+        title="Lab board unavailable"
+      >
+        <LockKeyhole
+          aria-hidden="true"
+          className="mr-1 inline-block h-3 w-3 align-[-0.08em]"
+        />
+        {children}
+      </span>
+    );
+  }
+
+  return (
+    <button
+      aria-label={`Open Lab board ${board.title}`}
+      className={cn(
+        MENTION_CHIP_BASE_CLASSES,
+        MENTION_CHIP_HOVER_CLASSES,
+        "cursor-pointer",
+      )}
+      data-lab-link=""
+      data-lab-link-state="resolved"
+      onClick={() => onOpenLabLink(link)}
+      title={href}
+      type="button"
+    >
+      {board.title}
+    </button>
+  );
+}
+
+/**
+ * Render an explicit `[label](buzz://lab?…)` as a UUID-resolved chip. Returns
+ * `null` for malformed hrefs so the generic anchor renderer can take over.
  */
 export function renderLabLinkAnchor({
-  anchorProps,
   children,
   href,
   onOpenLabLink,
@@ -47,17 +126,13 @@ export function renderLabLinkAnchor({
   if (!parsed.ok) return null;
 
   return (
-    <a
-      {...anchorProps}
-      className="font-medium text-primary underline underline-offset-4 transition-colors hover:text-primary/80 cursor-pointer"
+    <LabBoardReference
       href={href}
-      onClick={(event) => {
-        event.preventDefault();
-        onOpenLabLink(parsed.value);
-      }}
+      link={parsed.value}
+      onOpenLabLink={onOpenLabLink}
     >
       {children}
-    </a>
+    </LabBoardReference>
   );
 }
 

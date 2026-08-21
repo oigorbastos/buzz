@@ -1,9 +1,9 @@
 import * as React from "react";
 import { EditorContent } from "@tiptap/react";
-import { useChannelLinks } from "@/features/messages/lib/useChannelLinks";
+import { useComposerLinks } from "@/features/messages/lib/useComposerLinks";
 import { handleAgentSnapshotPaste } from "@/features/messages/lib/agentSnapshotClipboard";
 import { useComposerAutofocus } from "@/features/messages/lib/useComposerAutofocus";
-import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks";
+import type { ComposerLinkSuggestion } from "@/features/messages/lib/useComposerLinks";
 import { useDrafts } from "@/features/messages/lib/useDrafts";
 import { resolveSentDraftKey } from "@/features/messages/ui/draftSubmitKey";
 import { useEmojiAutocomplete } from "@/features/messages/lib/useEmojiAutocomplete";
@@ -41,7 +41,7 @@ import { useComposerSpoilerParticles } from "@/features/messages/lib/useComposer
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
 import { getBuzzCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
 import { cn } from "@/shared/lib/cn";
-import { ChannelAutocomplete } from "./ChannelAutocomplete";
+import { ComposerLinkAutocomplete } from "./ComposerLinkAutocomplete";
 import { ComposerReplyEditBanner } from "./ComposerReplyEditBanner";
 import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
 import { EmojiAutocomplete } from "./EmojiAutocomplete";
@@ -142,7 +142,8 @@ function MessageComposerImpl({
   const mentions = useMentions(channelId, undefined, profiles, {
     channelType,
   });
-  const channelLinks = useChannelLinks();
+  const composerLinks = useComposerLinks();
+  const channelLinks = composerLinks.channelLinks;
   const customEmoji = useCustomEmoji();
   const emojiAutocomplete = useEmojiAutocomplete(customEmoji);
   const notifyTyping = useTypingBroadcast(
@@ -219,7 +220,7 @@ function MessageComposerImpl({
   const isAutocompleteOpenRef = React.useRef(false);
   isAutocompleteOpenRef.current =
     mentions.isMentionOpen ||
-    channelLinks.isChannelOpen ||
+    composerLinks.isLinkOpen ||
     emojiAutocomplete.isEmojiAutocompleteOpen;
   const submitMessageRef = React.useRef<() => void>(() => {});
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
@@ -270,7 +271,7 @@ function MessageComposerImpl({
       setComposerContentFromText(text);
       setPreviewContent(linkPreviewContent);
       mentions.updateMentionQuery(text, cursor);
-      channelLinks.updateChannelQuery(text, cursor);
+      composerLinks.updateLinkQueries(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
       persistentMentionHydrationRef.current?.reconcile(text);
       if (text.trim().length > 0) {
@@ -426,14 +427,14 @@ function MessageComposerImpl({
       richText.getPlainTextAndCursor,
     ],
   );
-  const applyChannelInsert = React.useCallback(
-    (suggestion: ChannelSuggestion) => {
+  const applyLinkInsert = React.useCallback(
+    (suggestion: ComposerLinkSuggestion) => {
       const { cursor } = richText.getPlainTextAndCursor();
-      applyAutocompleteEdit(channelLinks.insertChannel(suggestion, cursor));
+      applyAutocompleteEdit(composerLinks.insertLink(suggestion, cursor));
     },
     [
       applyAutocompleteEdit,
-      channelLinks.insertChannel,
+      composerLinks.insertLink,
       richText.getPlainTextAndCursor,
     ],
   );
@@ -685,10 +686,10 @@ function MessageComposerImpl({
         }
         return;
       }
-      const channelResult = channelLinks.handleChannelKeyDown(event);
-      if (channelResult.handled) {
-        if (channelResult.suggestion) {
-          applyChannelInsert(channelResult.suggestion);
+      const linkResult = composerLinks.handleLinkKeyDown(event);
+      if (linkResult.handled) {
+        if (linkResult.suggestion) {
+          applyLinkInsert(linkResult.suggestion);
         }
         return;
       }
@@ -721,8 +722,8 @@ function MessageComposerImpl({
     [
       emojiAutocomplete.handleEmojiKeyDown,
       applyEmojiInsert,
-      channelLinks.handleChannelKeyDown,
-      applyChannelInsert,
+      composerLinks.handleLinkKeyDown,
+      applyLinkInsert,
       mentions.handleMentionKeyDown,
       applyMentionInsert,
       linkEditor.isCardOpen,
@@ -910,14 +911,9 @@ function MessageComposerImpl({
                   : []
               }
             />
-            <ChannelAutocomplete
-              onSelect={applyChannelInsert}
-              selectedIndex={channelLinks.channelSelectedIndex}
-              suggestions={
-                channelLinks.isChannelOpen
-                  ? channelLinks.channelSuggestions
-                  : []
-              }
+            <ComposerLinkAutocomplete
+              links={composerLinks}
+              onSelect={applyLinkInsert}
             />
             <MentionAutocomplete
               onFetchMore={mentions.fetchMoreSuggestions}

@@ -5,6 +5,8 @@ import { detectPrefixQuery } from "./detectPrefixQuery.ts";
 
 const CHANNELS = ["buzz-bugs", "buzz dev", "general"];
 const PEOPLE = ["alice", "bob jones"];
+const EMOJIS = ["smile", "party parrot"];
+const BOARDS = ["adaimon", "adaimon - weekly notes"];
 
 // Helper: detect at end-of-string (the usual cursor position while typing).
 const at = (prefix, text, names) =>
@@ -130,4 +132,50 @@ test("bare prefix after ( yields empty single-word query, not multi-word", () =>
 
 test("no prefix present → null", () => {
   assert.equal(at("#", "just text", CHANNELS), null);
+});
+
+// ── Variable-length prefixes and one-character non-regression ────────────────
+
+test("one-character #, @, and : prefixes preserve fast-path behavior", () => {
+  assert.deepEqual(at("#", "open #buzz", CHANNELS), {
+    query: "buzz",
+    startIndex: 5,
+  });
+  assert.deepEqual(at("@", "ping @alice", PEOPLE), {
+    query: "alice",
+    startIndex: 5,
+  });
+  assert.deepEqual(at(":", "react :smile", EMOJIS), {
+    query: "smile",
+    startIndex: 6,
+  });
+});
+
+test("one-character #, @, and : prefixes preserve multi-word behavior", () => {
+  assert.deepEqual(at("#", "open #buzz de", CHANNELS), {
+    query: "buzz de",
+    startIndex: 5,
+  });
+  assert.deepEqual(at("@", "ping @bob jo", PEOPLE), {
+    query: "bob jo",
+    startIndex: 5,
+  });
+  assert.deepEqual(at(":", "react :party pa", EMOJIS), {
+    query: "party pa",
+    startIndex: 6,
+  });
+});
+
+test("two-character [[ prefix reports the full fast-path replacement range", () => {
+  assert.deepEqual(at("[[", "see [[adaimon", BOARDS), {
+    query: "adaimon",
+    startIndex: 4,
+  });
+});
+
+test("two-character [[ prefix supports multi-word board titles", () => {
+  assert.deepEqual(at("[[", "see [[Adaimon - weekly", BOARDS), {
+    query: "Adaimon - weekly",
+    startIndex: 4,
+  });
 });

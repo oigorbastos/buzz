@@ -7,7 +7,7 @@
  * Detect whether the user is typing a prefix-based query (e.g. @name or #channel)
  * at the current cursor position.
  *
- * @param prefix - The trigger character (e.g. "@" or "#")
+ * @param prefix - The trigger prefix (e.g. "@", "#", or "[[")
  * @param value - The full text content
  * @param cursorPosition - The current cursor position in the text
  * @param knownNamesLower - Lower-cased known names for multi-word prefix matching
@@ -35,7 +35,7 @@ export function detectPrefixQuery(
   const simpleMatch = beforeCursor.match(simplePattern);
   if (simpleMatch) {
     const query = simpleMatch[1];
-    const startIndex = beforeCursor.length - query.length - 1; // -1 for prefix
+    const startIndex = beforeCursor.length - query.length - prefix.length;
     return { query, startIndex };
   }
 
@@ -44,12 +44,12 @@ export function detectPrefixQuery(
   const scanStart = Math.max(0, beforeCursor.length - 80);
   for (let i = beforeCursor.length - 1; i >= scanStart; i--) {
     const ch = beforeCursor[i];
-    if (ch === prefix) {
+    if (beforeCursor.slice(i, i + prefix.length) === prefix) {
       // Ensure prefix is at start or preceded by whitespace/opening bracket
       if (i > 0 && !isBoundaryChar(beforeCursor[i - 1])) {
         continue;
       }
-      const candidate = beforeCursor.slice(i + 1);
+      const candidate = beforeCursor.slice(i + prefix.length);
       if (candidate.length === 0) {
         break;
       }

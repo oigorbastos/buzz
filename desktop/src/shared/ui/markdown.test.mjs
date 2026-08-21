@@ -777,18 +777,21 @@ test("renderEntityLinkAnchor_directEntityLink_returnsAnchorRegardlessOfOrigin", 
 
 // ── renderLabLinkAnchor ──────────────────────────────────────────────────
 
-import { renderLabLinkAnchor } from "../ui/markdown/labLinks.tsx";
+import {
+  LabBoardReference,
+  renderLabLinkAnchor,
+} from "../ui/markdown/labLinks.tsx";
 
-test("renderLabLinkAnchor_validLabLink_returnsAnchor", () => {
+test("renderLabLinkAnchor_validLabLink_returnsBoardReference", () => {
   const el = renderLabLinkAnchor({
     anchorProps: {},
     children: React.createElement("span", null, "Board"),
     href: `buzz://lab?board=${BOARD_UUID}`,
     onOpenLabLink: () => {},
   });
-  assert.notEqual(el, null, "a valid buzz://lab link must produce an anchor");
-  const html = renderToStaticMarkup(el);
-  assert.match(html, /cursor-pointer/);
+  assert.notEqual(el, null, "a valid buzz://lab link must produce a reference");
+  assert.equal(el.type, LabBoardReference);
+  assert.deepEqual(el.props.link, { boardId: BOARD_UUID, revision: null });
 });
 
 test("renderLabLinkAnchor_callsOnOpenLabLinkWithParsedValue", () => {
@@ -801,9 +804,9 @@ test("renderLabLinkAnchor_callsOnOpenLabLinkWithParsedValue", () => {
       opened = link;
     },
   });
-  // Simulate the click handler directly — no DOM event dispatch needed to
-  // verify the parsed value that reaches the callback.
-  el.props.onClick({ preventDefault: () => {} });
+  // LabBoardReference owns ACL-aware clickability. Exercise the parsed value
+  // passed into that component; its real button click is covered separately.
+  el.props.onOpenLabLink(el.props.link);
   assert.deepEqual(opened, { boardId: BOARD_UUID, revision: 3 });
 });
 
