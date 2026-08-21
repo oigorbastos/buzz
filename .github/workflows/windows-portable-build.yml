@@ -1,36 +1,41 @@
-name: Windows Portable Build (buzz-alis-1.3)
+name: Windows Portable Build (Web Workspace preview)
 
-# Builds an unsigned, portable Windows distribution of the six Buzz
-# executables from codex/buzz-alis-1.3-integration (Lab boards desktop UI +
-# community-deletion backend port). This is a genuinely new workflow file
-# (never existed on any branch tip before this commit), which is what makes
-# GitHub auto-register it on push without a manual "I understand my
-# workflows" click in this fork's Actions settings.
-#
-# Structural reference: the retired one-shot recovery workflow
-# windows-lab-preview.yml (GitHub workflow id 329525697, file no longer
-# present on any branch). That workflow hard-pinned FEATURE_SHA/
-# LAB_BASE_SHA/PROVEN_LINUX_RUN_ID to one specific historical recovery
-# scenario and reused an already-proven Linux run instead of compiling.
-# This workflow drops all of that: it runs both the Linux gate and the
-# Windows build for real, against whatever commit is checked out, because
-# this is fresh code (including a large new Rust feature — the deletion
-# backend port) rather than a replay of prior, already-proven work.
+# Builds an unsigned, explicitly selected distribution profile. Pushes build
+# the operator preview; manual dispatch may build the collaborator preview only
+# when an exact HTTPS /work URL is supplied and validated. The
+# remote child gate remains closed; the artifact exposes only approved preset
+# metadata plus copy/open-external actions until a later WebView2 review.
 on:
   workflow_dispatch:
+    inputs:
+      workspace_profile:
+        description: Distribution profile to compile into Rust and the renderer
+        required: true
+        default: operator
+        type: choice
+        options:
+          - operator
+          - collaborator
+      work_url:
+        description: Exact HTTPS /work URL (required only for collaborator)
+        required: false
+        default: ""
+        type: string
   push:
     branches:
-      - codex/buzz-alis-1.3-integration
+      - codex/web-workspace
 
 permissions:
   contents: read
 
 concurrency:
-  group: buzz-alis-1.3-windows-portable-${{ github.ref }}
+  group: buzz-web-workspace-windows-portable-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   TARGET: x86_64-pc-windows-msvc
+  BUZZ_BUILD_WEB_WORKSPACE_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.workspace_profile || 'operator' }}
+  BUZZ_BUILD_WEB_WORK_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.workspace_profile == 'collaborator' && inputs.work_url || '' }}
 
 jobs:
   linux-preflight:
@@ -47,6 +52,38 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+
+      - name: Validate fail-closed distribution profile
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const profile = process.env.BUZZ_BUILD_WEB_WORKSPACE_PROFILE ?? "";
+          const rawWorkUrl = process.env.BUZZ_BUILD_WEB_WORK_URL ?? "";
+          if (profile === "operator") {
+            if (rawWorkUrl !== "") throw new Error("operator profile must not contain a Work URL");
+            process.exit(0);
+          }
+          if (profile !== "collaborator") throw new Error("unsupported workspace profile");
+          if (!rawWorkUrl) throw new Error("collaborator profile requires an exact HTTPS /work URL");
+          const url = new URL(rawWorkUrl);
+          const hostname = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+          const loopbackHost = hostname === "::1"
+            || hostname === "localhost"
+            || hostname.endsWith(".localhost")
+            || /^127(?:\.|$)/.test(hostname);
+          if (
+            url.protocol !== "https:"
+            || url.username
+            || url.password
+            || url.search
+            || url.hash
+            || url.pathname !== "/work"
+            || loopbackHost
+            || rawWorkUrl !== `${url.origin}/work`
+          ) {
+            throw new Error("Work URL must be exactly https://host[:port]/work on a non-loopback host, without credentials, query, or fragment");
+          }
+          NODE
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -197,7 +234,7 @@ jobs:
           # rustfmt is required explicitly: a prior iteration of this exact
           # build failed without it — the Windows toolchain doesn't ship it
           # by default even when the channel version matches.
-          components: rustfmt
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -231,7 +268,10 @@ jobs:
 
       - name: Check Rust formatting
         shell: bash
-        run: cargo fmt --all -- --check
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
 
       - name: Run targeted Rust tests
         shell: bash
@@ -245,6 +285,7 @@ jobs:
         run: |
           set -euo pipefail
           pnpm -C desktop check
+          pnpm -C desktop check:file-sizes
           pnpm -C desktop typecheck
           pnpm -C desktop test
 
@@ -271,9 +312,12 @@ jobs:
             test -f "desktop/src-tauri/binaries/$sidecar-$TARGET.exe"
           done
 
-      - name: Run managed-agent Nest test
+      - name: Run complete Tauri policy gates
         shell: bash
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml
 
       - name: Generate temporary non-updating Tauri config
         shell: bash
@@ -326,9 +370,9 @@ jobs:
             exit 1
           fi
 
-          PORTABLE_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-root"
-          EXTRACT_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-reextract"
-          RELEASE_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-release"
+          PORTABLE_ROOT="$RUNNER_TEMP/buzz-web-workspace-portable-root"
+          EXTRACT_ROOT="$RUNNER_TEMP/buzz-web-workspace-portable-reextract"
+          RELEASE_ROOT="$RUNNER_TEMP/buzz-web-workspace-portable-release"
           rm -rf "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
           mkdir -p "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
           cp "$APP_EXE" "$PORTABLE_ROOT/buzz-desktop.exe"
@@ -359,20 +403,24 @@ jobs:
           RUST=$RUST_VERSION
           NODE=$NODE_VERSION
           PNPM=$PNPM_VERSION
+          WEB_WORKSPACE_PROFILE=$BUZZ_BUILD_WEB_WORKSPACE_PROFILE
           LINUX_PREFLIGHT_GATE_01=cargo fmt --all -- --check
           LINUX_PREFLIGHT_GATE_02=cargo clippy --workspace --all-targets
           LINUX_PREFLIGHT_GATE_03=cargo test --workspace (skips only the 8 buzz-relay tests needing a live Postgres this job does not provision; the former git-sign-nostr and buzz-agent skips were fixed at the source and removed — see workflow comment)
           WINDOWS_GATE_01=cargo fmt --all -- --check
-          WINDOWS_GATE_02=cargo test -p buzz-acp
-          WINDOWS_GATE_03=cargo test -p buzz-cli lab --lib
-          WINDOWS_GATE_04=pnpm -C desktop check
-          WINDOWS_GATE_05=pnpm -C desktop typecheck
-          WINDOWS_GATE_06=pnpm -C desktop test
-          WINDOWS_GATE_07=pnpm -C desktop build:e2e
-          WINDOWS_GATE_08=pnpm -C desktop build
+          WINDOWS_GATE_02=cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
+          WINDOWS_GATE_03=cargo test -p buzz-acp
+          WINDOWS_GATE_04=cargo test -p buzz-cli lab --lib
+          WINDOWS_GATE_05=pnpm -C desktop check
+          WINDOWS_GATE_06=pnpm -C desktop check:file-sizes
+          WINDOWS_GATE_07=pnpm -C desktop typecheck
+          WINDOWS_GATE_08=pnpm -C desktop test
+          WINDOWS_GATE_09=pnpm -C desktop build:e2e
+          WINDOWS_GATE_10=pnpm -C desktop build
+          WINDOWS_GATE_11=cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets
+          WINDOWS_GATE_12=cargo test --manifest-path desktop/src-tauri/Cargo.toml
           SIDECAR_BUILD=cargo build --release --target x86_64-pc-windows-msvc -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh x86_64-pc-windows-msvc
-          NEST_TEST=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
           TAURI_COMMAND=pnpm -C desktop tauri build --target x86_64-pc-windows-msvc --no-bundle --no-sign --ci --config src-tauri/tauri.canary.conf.json
           TAURI_BUNDLE=none
           TAURI_SIGNING=disabled
@@ -404,7 +452,7 @@ jobs:
             sha256sum -c SHA256SUMS.txt
           )
 
-          ZIP_NAME="buzz-alis-1.3-windows-portable-x64.zip"
+          ZIP_NAME="buzz-web-workspace-${BUZZ_BUILD_WEB_WORKSPACE_PROFILE}-windows-portable-x64.zip"
           ZIP_PATH="$RELEASE_ROOT/$ZIP_NAME"
           (
             cd "$PORTABLE_ROOT"
@@ -499,7 +547,7 @@ jobs:
       - name: Upload the only build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-alis-1.3-windows-portable-x64
+          name: buzz-web-workspace-${{ env.BUZZ_BUILD_WEB_WORKSPACE_PROFILE }}-windows-portable-x64
           path: |
             ${{ steps.package.outputs.portable_zip }}
             ${{ steps.package.outputs.release_root }}/ZIP-SHA256.txt

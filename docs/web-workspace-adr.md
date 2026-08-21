@@ -13,7 +13,8 @@ profile. Local telemetry remains renderer-side and machine-local.
 The implementation is based on fork commit `247ad412` without mixing the current
 upstream convergence into the security changes. Upstream convergence remains a
 separate review because the fork is already materially divergent and currently has
-sidebar conflicts.
+textual conflicts in `AppSidebarPinnedHeader.tsx` and
+`ViewLoadingFallback.tsx`.
 
 The preview has two generic distribution profiles:
 
@@ -23,14 +24,33 @@ The preview has two generic distribution profiles:
 | `collaborator` | Meu Trabalho | Meu Trabalho | Meu Trabalho |
 | default/unconfigured | hidden | none | none |
 
-The profile only changes presentation. The remote server remains the authority for
-identity, role, axis and case access.
+The profile is a compile-time distribution policy, not a person selector. `operator`
+keeps the standard Buzz shell and still requires the `browser` preview override.
+`collaborator` is itself an explicit preview distribution: it skips Buzz
+identity/community onboarding, mounts a task-only shell and redirects every route
+except `/browser` back to that surface. It does not mount search, channels, Agents,
+Settings, terminal, relay diagnostics, community controls or their dialogs. This is
+UX containment; the remote server remains the authority for identity, role, axis and
+case access.
+
+Both build halves consume the single `BUZZ_BUILD_WEB_WORKSPACE_PROFILE` variable:
+Vite injects that exact value into the trusted renderer and Rust reads it with
+`option_env!`. The renderer also compares its compiled value with Rust's runtime
+security status and fails closed on any mismatch. Collaborator presets require HTTPS
+even in debug builds.
+
+The portable workflow compiles either profile from explicit dispatch inputs. A
+collaborator dispatch requires one canonical, non-loopback
+`https://host[:port]/work` URL; a compile-time Rust test requires exactly one Work
+preset, preventing a green artifact whose input was silently discarded. Push builds
+remain operator-only.
 
 ## Trust boundaries
 
 - `main` is the local privileged renderer. App and plugin capabilities are scoped to
   its webview label.
-- `huddle-*` remains local but receives only its own explicitly required capability.
+- `huddle-*` remains trusted local content and preserves the existing local
+  capability set shared with `main`; only `browser-main` is deliberately excluded.
 - `browser-main` is untrusted remote content. It has no Tauri capability, app command,
   remote URL capability, init script, postMessage bridge, host object or custom
   protocol access.
@@ -39,9 +59,9 @@ identity, role, axis and case access.
   policy.
 - Popups, downloads and browser permissions are denied. External opening is possible
   only after an explicit local-toolbar action.
-- Cookies/history stay in a dedicated directory below Buzz `app_data_dir`; they never
-  enter relay, Nostr, community state or logs. Sign-out and clear-data cover that
-  directory.
+- If a future child passes the gate, cookies/history must stay in a dedicated
+  directory below Buzz `app_data_dir`; they must never enter relay, Nostr, community
+  state or logs. This closed-gate branch creates no child profile or remote cookie.
 - A native child cannot be covered by CSS. Route exit, identity/community transition,
   boot/onboarding, global overlay, dialog/sheet and huddle occlusion hide it at the
   native layer.
@@ -65,6 +85,11 @@ preview route exposes only approved preset metadata, copy and explicit external-
 history controls are visibly disabled. This is a deliberate safe stopping point, not
 an internal-browser release.
 
+Before any future attempt to reopen the child, the adversarial harness must also probe
+loopback subresources against the authenticated media proxy. Top-level navigation
+policy and the `buzz-media://` label check do not by themselves prove that an untrusted
+page cannot scan `127.0.0.1` or reach a relay-auth proxy request lacking `Origin`.
+
 ## Non-goals
 
 No free address bar, tabs, extensions, internal downloads, page automation, token
@@ -75,7 +100,9 @@ hatch. Production deploy, merge and live Tailscale/ACL changes are outside this 
 ## Operations and measurement
 
 The Gringo defaults are the Mission Control and session-monitor presets. Prata exposes
-only `/work` over its eventual HTTPS ingress. Dogfood telemetry is machine-local and
+only `/work` over its eventual HTTPS ingress and uses the separately compiled
+`collaborator` artifact. While the child gate is closed, both profiles use explicit
+external-open; no login occurs inside Buzz. Dogfood telemetry is machine-local and
 stores only preset/event counters and timestamps, never full URLs, query strings or
 page content. Final DPI, z-order, permissions, persistent-login, clear-data and
 revocation checks are external gates on Gringo/Prata.
