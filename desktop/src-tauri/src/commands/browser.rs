@@ -162,7 +162,6 @@ fn configured_presets() -> Vec<ConfiguredPreset> {
         option_env!("BUZZ_BUILD_WEB_MISSION_CONTROL_URL"),
         option_env!("BUZZ_BUILD_WEB_SESSIONS_URL"),
         option_env!("BUZZ_BUILD_WEB_WORK_URL"),
-        cfg!(debug_assertions),
     )
 }
 
@@ -171,7 +170,6 @@ fn configured_presets_for(
     mission_control_url: Option<&str>,
     sessions_url: Option<&str>,
     work_url: Option<&str>,
-    allow_insecure_work: bool,
 ) -> Vec<ConfiguredPreset> {
     match profile {
         WorkspaceProfile::Disabled => Vec::new(),
@@ -204,7 +202,7 @@ fn configured_presets_for(
                     PresetPathPolicy::Work,
                 )
             })
-            .filter(|preset| allow_insecure_work || preset.navigation.home().scheme() == "https")
+            .filter(|preset| preset.navigation.home().scheme() == "https")
             .into_iter()
             .collect(),
     }
@@ -493,7 +491,6 @@ mod tests {
             None,
             None,
             Some("https://mc.example.test/work"),
-            false,
         )
         .is_empty());
 
@@ -502,7 +499,6 @@ mod tests {
             None,
             None,
             Some("https://mc.example.test/work"),
-            false,
         );
         assert_eq!(operator.len(), 2);
         assert_eq!(operator[0].descriptor.id, BrowserPresetId::MissionControl);
@@ -513,7 +509,6 @@ mod tests {
             None,
             None,
             Some("https://mc.example.test/work"),
-            false,
         );
         assert_eq!(collaborator.len(), 1);
         assert_eq!(collaborator[0].descriptor.id, BrowserPresetId::Work);
@@ -523,14 +518,23 @@ mod tests {
             Some("http://mc.example.test/work"),
             Some("https://mc.example.test/mission"),
         ] {
-            assert!(configured_presets_for(
-                WorkspaceProfile::Collaborator,
-                None,
-                None,
-                invalid,
-                false,
-            )
-            .is_empty());
+            assert!(
+                configured_presets_for(WorkspaceProfile::Collaborator, None, None, invalid,)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_distribution_profile_has_the_required_preset_count() {
+        let presets = super::configured_presets();
+        match super::workspace_profile() {
+            WorkspaceProfile::Disabled => assert!(presets.is_empty()),
+            WorkspaceProfile::Operator => assert_eq!(presets.len(), 2),
+            WorkspaceProfile::Collaborator => {
+                assert_eq!(presets.len(), 1);
+                assert_eq!(presets[0].descriptor.id, BrowserPresetId::Work);
+            }
         }
     }
 }

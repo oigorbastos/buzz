@@ -21,6 +21,10 @@ import { ThemeGrainientBackground } from "@/app/ThemeGrainientBackground";
 import { CommunityThemeController } from "@/shared/theme/CommunityThemeController";
 import { useReloadShortcut } from "@/app/useReloadShortcut";
 import { KnownAgentPubkeysProvider } from "@/features/agents/useKnownAgentPubkeys";
+import {
+  buildWorkspaceProfile,
+  isTaskOnlyDistribution,
+} from "@/features/browser/browserProfile";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { useMachineOnboardingState } from "@/features/onboarding/machineOnboarding";
@@ -718,6 +722,20 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
 }
 
 export function App() {
+  return isTaskOnlyDistribution(buildWorkspaceProfile) ? (
+    <TaskOnlyApp />
+  ) : (
+    <StandardApp />
+  );
+}
+
+function TaskOnlyApp() {
+  useReloadShortcut();
+  useInitialRenderReady();
+  return <RouterProvider router={router} />;
+}
+
+function StandardApp() {
   useReloadShortcut();
   useInitialRenderReady();
   const [sharedIdentity, setSharedIdentity] = useState<boolean | null>(null);

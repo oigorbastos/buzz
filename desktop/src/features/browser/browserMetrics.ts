@@ -15,6 +15,18 @@ export type BrowserMetrics = {
   last_event_at: number | null;
 };
 
+const METRIC_EVENTS: readonly BrowserMetricEvent[] = [
+  "opened_external",
+  "preset_selected",
+  "surface_opened",
+  "url_copied",
+];
+const PRESET_IDS: readonly BrowserPresetId[] = [
+  "mission-control",
+  "sessions",
+  "work",
+];
+
 export function emptyBrowserMetrics(): BrowserMetrics {
   return {
     version: 1,
@@ -29,25 +41,67 @@ export function emptyBrowserMetrics(): BrowserMetrics {
   };
 }
 
+function normalizedCounter(value: unknown): number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? (value as number)
+    : 0;
+}
+
+export function normalizeBrowserMetrics(value: unknown): BrowserMetrics {
+  const empty = emptyBrowserMetrics();
+  if (
+    !value ||
+    typeof value !== "object" ||
+    (value as { version?: unknown }).version !== 1
+  ) {
+    return empty;
+  }
+
+  const record = value as {
+    counters?: Record<string, unknown>;
+    by_preset?: Record<string, unknown>;
+    last_event_at?: unknown;
+  };
+  for (const event of METRIC_EVENTS) {
+    empty.counters[event] = normalizedCounter(record.counters?.[event]);
+  }
+  for (const preset of PRESET_IDS) {
+    const count = normalizedCounter(record.by_preset?.[preset]);
+    if (count > 0) empty.by_preset[preset] = count;
+  }
+  empty.last_event_at =
+    Number.isSafeInteger(record.last_event_at) &&
+    (record.last_event_at as number) >= 0
+      ? (record.last_event_at as number)
+      : null;
+  return empty;
+}
+
 export function reduceBrowserMetric(
   current: BrowserMetrics,
   event: BrowserMetricEvent,
   timestamp: number,
   preset?: BrowserPresetId,
 ): BrowserMetrics {
+  const normalized = normalizeBrowserMetrics(current);
+  const currentEventCount = normalized.counters[event];
   return {
     version: 1,
     counters: {
-      ...current.counters,
-      [event]: current.counters[event] + 1,
+      ...normalized.counters,
+      [event]: Math.min(currentEventCount + 1, Number.MAX_SAFE_INTEGER),
     },
     by_preset: preset
       ? {
-          ...current.by_preset,
-          [preset]: (current.by_preset[preset] ?? 0) + 1,
+          ...normalized.by_preset,
+          [preset]: Math.min(
+            (normalized.by_preset[preset] ?? 0) + 1,
+            Number.MAX_SAFE_INTEGER,
+          ),
         }
-      : current.by_preset,
-    last_event_at: timestamp,
+      : normalized.by_preset,
+    last_event_at:
+      Number.isSafeInteger(timestamp) && timestamp >= 0 ? timestamp : null,
   };
 }
 
@@ -59,9 +113,8 @@ export function recordBrowserMetric(
 ): void {
   try {
     const raw = storage.getItem(BROWSER_METRICS_STORAGE_KEY);
-    const parsed = raw ? (JSON.parse(raw) as BrowserMetrics) : null;
-    const current =
-      parsed?.version === 1 && parsed.counters ? parsed : emptyBrowserMetrics();
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    const current = normalizeBrowserMetrics(parsed);
     const next = reduceBrowserMetric(current, event, timestamp, preset);
     storage.setItem(BROWSER_METRICS_STORAGE_KEY, JSON.stringify(next));
   } catch {

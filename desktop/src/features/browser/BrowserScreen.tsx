@@ -11,7 +11,11 @@ import {
   openApprovedPresetExternally,
 } from "./browserClient";
 import { recordBrowserMetric } from "./browserMetrics";
-import { workspaceSurfaceLabel } from "./browserProfile";
+import {
+  buildWorkspaceProfile,
+  workspaceProfilesMatch,
+  workspaceSurfaceLabel,
+} from "./browserProfile";
 import type {
   BrowserPreset,
   BrowserPresetId,
@@ -43,6 +47,15 @@ export function BrowserScreen() {
     void getBrowserSecurityStatus()
       .then((status) => {
         if (cancelled) return;
+        if (!workspaceProfilesMatch(buildWorkspaceProfile, status.profile)) {
+          setSelectedPreset(null);
+          setLoadState({
+            kind: "error",
+            message:
+              "O perfil do renderer não corresponde à política nativa deste build.",
+          });
+          return;
+        }
         setLoadState({ kind: "ready", status });
         setSelectedPreset((current) =>
           status.presets.some((preset) => preset.id === current)

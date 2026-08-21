@@ -7,6 +7,7 @@ import { tanstackRouter } from "@tanstack/router-plugin/vite";
 
 const host = process.env.TAURI_DEV_HOST;
 const previewAllowedHost = process.env.BUZZ_PREVIEW_ALLOWED_HOST;
+const webWorkspaceProfile = process.env.BUZZ_BUILD_WEB_WORKSPACE_PROFILE ?? "";
 const indexHtml = readFileSync(
   new URL("./index.html", import.meta.url),
   "utf8",
@@ -24,6 +25,12 @@ const previewScriptPolicy = ["'self'", ...inlineScriptHashes].join(" ");
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
+  // This exact build variable is also consumed by Rust via option_env!. Keep
+  // Vite's public env namespace closed and expose only the normalized profile
+  // handshake needed by the trusted local renderer.
+  define: {
+    __BUZZ_BUILD_WEB_WORKSPACE_PROFILE__: JSON.stringify(webWorkspaceProfile),
+  },
   plugins: [
     tanstackRouter({
       target: "react",

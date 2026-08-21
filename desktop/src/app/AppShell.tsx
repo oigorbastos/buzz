@@ -98,8 +98,21 @@ import { AppShellTrayMenu } from "@/app/useAppShellTrayMenu";
 import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
 import { LazySettingsScreen } from "@/app/LazySettingsScreen";
 import { useSidebarNavHandlers } from "@/app/navigation/useSidebarNavHandlers";
+import { CollaboratorWorkspaceShell } from "@/features/browser/CollaboratorWorkspaceShell";
+import {
+  buildWorkspaceProfile,
+  isTaskOnlyDistribution,
+} from "@/features/browser/browserProfile";
 const EMPTY_CHANNELS: Channel[] = [];
 export function AppShell() {
+  return isTaskOnlyDistribution(buildWorkspaceProfile) ? (
+    <CollaboratorWorkspaceShell />
+  ) : (
+    <StandardAppShell />
+  );
+}
+
+function StandardAppShell() {
   useWebviewZoomShortcuts();
   useTauriWindowDrag();
   useWebviewScrollBoundaryLock();

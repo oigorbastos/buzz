@@ -18,7 +18,6 @@ export const Route = createFileRoute("/browser")({
 
 function BrowserRouteComponent() {
   const enabled = useFeatureEnabled("browser");
-  usePreviewFeatureWarning("browser");
   const canMount = canMountBrowserSurface(enabled, buildWorkspaceProfile);
 
   if (!canMount) {
@@ -46,7 +45,13 @@ function BrowserRouteComponent() {
         </div>
       }
     >
+      {buildWorkspaceProfile === "operator" ? <BrowserPreviewWarning /> : null}
       <BrowserScreen />
     </React.Suspense>
   );
+}
+
+function BrowserPreviewWarning() {
+  usePreviewFeatureWarning("browser");
+  return null;
 }
