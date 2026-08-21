@@ -82,8 +82,8 @@ mod platform {
     };
 
     use super::{
-        BrowserBounds, BrowserPresetId, NavigationPolicy, RuntimeOperation, RuntimePreset,
-        RuntimeState,
+        workspace_storage_partition, BrowserBounds, BrowserPresetId, NavigationPolicy,
+        RuntimeOperation, RuntimePreset, RuntimeState,
     };
 
     const CHILD_WEBVIEW_ID: &str = "browser-main";
@@ -384,8 +384,10 @@ mod platform {
         preset: Option<RuntimePreset>,
     ) -> Result<RuntimeState, String> {
         let window = app
-            .get_window("main")
-            .ok_or_else(|| "main window is unavailable".to_string())?;
+            .get_webview_window("main")
+            .ok_or_else(|| "main window is unavailable".to_string())?
+            .as_ref()
+            .window();
         let data_root = app
             .path()
             .app_local_data_dir()
@@ -458,7 +460,20 @@ mod platform {
     }
 }
 
-pub(super) use platform::{current_url, perform};
+pub(super) async fn perform(
+    app: tauri::AppHandle,
+    operation: RuntimeOperation,
+    preset: Option<RuntimePreset>,
+) -> Result<RuntimeState, String> {
+    platform::perform(app, operation, preset).await
+}
+
+pub(super) async fn current_url(
+    app: tauri::AppHandle,
+    expected_preset: BrowserPresetId,
+) -> Result<Option<String>, String> {
+    platform::current_url(app, expected_preset).await
+}
 
 #[cfg(test)]
 mod tests {
