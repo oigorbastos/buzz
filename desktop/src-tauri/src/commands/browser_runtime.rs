@@ -251,32 +251,23 @@ mod platform {
                 if requested.id != id {
                     return Err("browser preset identity mismatch".to_string());
                 }
-                if slot.is_none() {
-                    *slot = Some(BrowserRuntime::create(
-                        window,
-                        data_root.clone(),
-                        bounds,
-                        requested,
-                    )?);
-                } else if slot.as_ref().is_some_and(|runtime| runtime.preset != id) {
-                    let previous = slot.take().ok_or_else(|| {
-                        "browser child disappeared during preset change".to_string()
-                    })?;
-                    let _ = previous.webview.set_visible(false);
-                    drop(previous);
-                    *slot = Some(BrowserRuntime::create(
-                        window,
-                        data_root.clone(),
-                        bounds,
-                        requested,
-                    )?);
-                } else if let Some(runtime) = slot.as_mut() {
+                if let Some(runtime) = slot.as_mut() {
+                    if runtime.preset != id {
+                        runtime.select_preset(requested)?;
+                    }
                     runtime
                         .webview
                         .set_bounds(to_wry_bounds(bounds))
                         .map_err(|error| format!("failed to size browser child: {error}"))?;
                     runtime.bounds = bounds;
                     runtime.set_visible(true)?;
+                } else {
+                    *slot = Some(BrowserRuntime::create(
+                        window,
+                        data_root.clone(),
+                        bounds,
+                        requested,
+                    )?);
                 }
                 return slot
                     .as_ref()
@@ -295,27 +286,13 @@ mod platform {
                 if requested.id != id {
                     return Err("browser preset identity mismatch".to_string());
                 }
-                if slot.as_ref().is_some_and(|runtime| runtime.preset != id) {
-                    let bounds = slot
-                        .as_ref()
-                        .ok_or_else(|| "browser child is not mounted".to_string())?
-                        .bounds;
-                    let previous = slot.take().ok_or_else(|| {
-                        "browser child disappeared during preset change".to_string()
-                    })?;
-                    let _ = previous.webview.set_visible(false);
-                    drop(previous);
-                    *slot = Some(BrowserRuntime::create(
-                        window,
-                        data_root.clone(),
-                        bounds,
-                        requested,
-                    )?);
+                let runtime = slot
+                    .as_mut()
+                    .ok_or_else(|| "browser child is not mounted".to_string())?;
+                if runtime.preset != id {
+                    runtime.select_preset(requested)?;
                 }
-                return slot
-                    .as_ref()
-                    .ok_or_else(|| "browser child is not mounted".to_string())?
-                    .state();
+                return runtime.state();
             }
 
             if matches!(operation, RuntimeOperation::ClearData) {

@@ -163,6 +163,17 @@ fn remote_child_has_no_ipc_bootstrap_and_fails_closed_at_the_engine() {
 }
 
 #[test]
+fn preset_switch_reuses_the_single_native_child() {
+    assert_eq!(
+        BROWSER_RUNTIME.matches("BrowserRuntime::create(").count(),
+        1,
+        "preset changes must navigate the existing child instead of dropping live WebView2 callbacks"
+    );
+    assert!(BROWSER_RUNTIME.contains("runtime.select_preset(requested)?"));
+    assert!(!BROWSER_RUNTIME.contains("browser child disappeared during preset change"));
+}
+
+#[test]
 fn tauri_stays_on_the_reviewed_security_release() {
     let lock = LOCKFILE
         .parse::<toml::Value>()
