@@ -25,8 +25,10 @@ The Windows fork adds the following fail-closed controls:
   `WebResourceRequested` does not reliably intercept;
 - a response-stage document sandbox (`sandbox`, same-origin-only connections
   and forms, no workers or modals), with service-worker bypass enabled;
-- denial of screen capture, clipboard writes, autofill, notifications, Basic
-  auth, client certificates, invalid server certificates and Save As UI;
+- denial of screen capture, clipboard reads/writes, autofill, notifications,
+  Basic auth, client certificates, invalid server certificates and Save As UI;
+- a document `Permissions-Policy` that independently disables clipboard,
+  camera, microphone, geolocation and display capture for remote content;
 - suppression of remote `window.close()` and all default script dialogs;
 - completion-aware profile clearing so the local command returns only after
   the active document is closed and WebView2 reports that browsing data was

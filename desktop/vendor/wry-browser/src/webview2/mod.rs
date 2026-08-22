@@ -650,7 +650,7 @@ impl InnerWebView {
     }
 
     let security_csp_receiver = if remote_content_hardening {
-      Self::deny_clipboard_writes(&webview)?;
+      Self::deny_clipboard_access(&webview)?;
       unsafe { Self::attach_remote_native_prompt_guards(&webview, &mut token)? };
       Some(unsafe { Self::install_remote_response_policy(&webview, &mut token)? })
     } else {
@@ -869,8 +869,11 @@ impl InnerWebView {
   }
 
   #[inline]
-  fn deny_clipboard_writes(webview: &ICoreWebView2) -> Result<()> {
-    for permission in ["clipboardReadWrite", "clipboardSanitizedWrite"] {
+  fn deny_clipboard_access(webview: &ICoreWebView2) -> Result<()> {
+    // Browser.setPermission consumes Permissions API descriptor names here,
+    // not the legacy Browser.PermissionType enum values. Edge/WebView2 151
+    // rejects the old clipboardReadWrite/clipboardSanitizedWrite spellings.
+    for permission in ["clipboard-read", "clipboard-write"] {
       let parameters = serde_json::json!({
         "permission": { "name": permission },
         "setting": "denied",
@@ -880,7 +883,7 @@ impl InnerWebView {
         webview,
         "Browser.setPermission",
         &parameters,
-        "WebView2 refused the clipboard deny policy",
+        "WebView2 refused the clipboard access policy",
       )?;
     }
     Ok(())
@@ -1029,6 +1032,10 @@ impl InnerWebView {
         response_headers.push(serde_json::json!({
           "name": "Content-Security-Policy",
           "value": REMOTE_CSP,
+        }));
+        response_headers.push(serde_json::json!({
+          "name": "Permissions-Policy",
+          "value": "camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), geolocation=(), microphone=()",
         }));
         let parameters = serde_json::json!({
           "requestId": request_id,

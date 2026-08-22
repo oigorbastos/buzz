@@ -38,6 +38,12 @@ type LoadState =
   | { kind: "loading" }
   | { kind: "ready"; status: BrowserSecurityStatus };
 
+function browserErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return fallback;
+}
+
 function elementBounds(element: HTMLElement): BrowserBounds | null {
   const rect = element.getBoundingClientRect();
   if (rect.width < 1 || rect.height < 1) return null;
@@ -125,10 +131,10 @@ export function BrowserScreen() {
         if (cancelled) return;
         setLoadState({
           kind: "error",
-          message:
-            error instanceof Error
-              ? error.message
-              : "Não foi possível consultar a fronteira de segurança.",
+          message: browserErrorMessage(
+            error,
+            "Não foi possível consultar a fronteira de segurança.",
+          ),
         });
       });
 
@@ -167,9 +173,10 @@ export function BrowserScreen() {
     const fail = (error: unknown) => {
       if (cancelled) return;
       setRuntimeError(
-        error instanceof Error
-          ? error.message
-          : "Não foi possível abrir o destino dentro do Buzz.",
+        browserErrorMessage(
+          error,
+          "Não foi possível abrir o destino dentro do Buzz.",
+        ),
       );
       enqueue(async () => {
         await hideBrowserChild().catch(() => undefined);
@@ -290,9 +297,7 @@ export function BrowserScreen() {
         }
       } catch (error) {
         toast.error(
-          error instanceof Error
-            ? error.message
-            : "A ação do Web Workspace falhou.",
+          browserErrorMessage(error, "A ação do Web Workspace falhou."),
         );
       } finally {
         setBusy(false);
@@ -309,9 +314,7 @@ export function BrowserScreen() {
         setRuntimeState(next);
       } catch (error) {
         toast.error(
-          error instanceof Error
-            ? error.message
-            : "A navegação integrada falhou.",
+          browserErrorMessage(error, "A navegação integrada falhou."),
         );
       } finally {
         setBusy(false);
