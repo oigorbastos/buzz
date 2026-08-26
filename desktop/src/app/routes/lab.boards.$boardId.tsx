@@ -76,6 +76,7 @@ function LabBoardRouteComponent() {
     <React.Suspense fallback={<ViewLoadingFallback kind="lab" />}>
       <LabBoardView
         boardId={boardId}
+        key={`${boardId}:${revision ?? "live"}`}
         onBack={() => void navigate({ to: "/lab" })}
         onViewCurrentVersion={() =>
           void navigate({

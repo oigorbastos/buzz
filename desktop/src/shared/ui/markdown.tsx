@@ -73,7 +73,7 @@ import {
   useOpenLabLink,
 } from "./markdown/labLinks";
 import { createLinkPreviewImageLightbox } from "./markdown/LinkPreviewImageLightbox";
-import { MarkdownInput } from "./markdown/MarkdownInput";
+import { createTaskListItem, MarkdownInput } from "./markdown/MarkdownInput";
 import {
   MediaContextMenu,
   type MediaContextMenuPosition,
@@ -157,11 +157,7 @@ type ImageBlockProps = {
   src: string | undefined;
   thumbSrc?: string;
 };
-
-type WebKitGestureLikeEvent = Event & {
-  scale?: number;
-};
-
+type WebKitGestureLikeEvent = Event & { scale?: number };
 function ImageZoomOverlay({
   alt,
   galleryIndex = 0,
@@ -1560,7 +1556,7 @@ export function createMarkdownComponents(
       );
     },
     input: MarkdownInput,
-    li: ({ children }) => <li className={listItemClassName}>{children}</li>,
+    li: createTaskListItem(listItemClassName),
     ol: ({ children }) => (
       <ol className={cn("list-decimal", listClassName)}>{children}</ol>
     ),
@@ -1705,7 +1701,7 @@ export function createMarkdownComponents(
  * eight instances ever exist. Module-stable maps mean cached markdown element
  * trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "8";
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "9";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };
@@ -1749,6 +1745,7 @@ function MarkdownInner({
   linkPreviewsSuppressed = false,
   linkPreviewTags,
   onRemoveLinkPreviewsForEveryone,
+  onToggleTask,
   mentionNames,
   mentionPubkeysByName,
   searchQuery,
@@ -1805,6 +1802,7 @@ function MarkdownInner({
       onOpenEntityLink,
       onOpenLabLink,
       onOpenMessageLink,
+      onToggleTask,
       relayOrigin,
       snapshotSharedBy,
       onImportSnapshotFromUrl: (
@@ -1826,6 +1824,7 @@ function MarkdownInner({
       onOpenEntityLink,
       onOpenLabLink,
       onOpenMessageLink,
+      onToggleTask,
       relayOrigin,
       snapshotSharedBy,
       goAgents,
@@ -1940,7 +1939,8 @@ export const Markdown = React.memo(
     prev.configNudgeAuthorPubkey === next.configNudgeAuthorPubkey &&
     prev.searchQuery === next.searchQuery &&
     prev.snapshotSharedBy === next.snapshotSharedBy &&
-    prev.videoReviewContext === next.videoReviewContext,
+    prev.videoReviewContext === next.videoReviewContext &&
+    prev.onToggleTask === next.onToggleTask,
 );
 Markdown.displayName = "Markdown";
 export { SyntaxHighlightedCode } from "./markdown/CodeBlock";

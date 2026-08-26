@@ -32,7 +32,14 @@ afterEach(async () => {
 after(() => dom.window.close());
 
 function board(title, boardId = BOARD) {
-  return { access: "community", boardId, ownerPubkey: null, title };
+  return {
+    access: "community",
+    boardId,
+    ownerPubkey: null,
+    status: "active",
+    tags: [],
+    title,
+  };
 }
 
 function queryClientWith(boards) {
@@ -117,6 +124,22 @@ describe("LabBoardReference", () => {
     );
     fireEvent.click(screen.getByText("Old public label"));
     assert.equal(opened, 0);
+  });
+
+  it("keeps an explicit reference to a readable archived board clickable", async () => {
+    const { fireEvent, screen } = await import("@testing-library/react");
+    const queryClient = queryClientWith([
+      { ...board("Archived planning notes"), status: "archived" },
+    ]);
+    const opened = [];
+    await renderReference(queryClient, "Archived planning notes", (link) => {
+      opened.push(link);
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Archived planning notes/ }),
+    );
+    assert.deepEqual(opened, [{ boardId: BOARD, revision: null }]);
   });
 
   it("degrades to the literal label when a previously linked board is deleted", async () => {

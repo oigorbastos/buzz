@@ -18,6 +18,8 @@ const OWNER = "b".repeat(64);
 function board(overrides = {}) {
   return {
     boardId: BOARD,
+    status: "active",
+    tags: [],
     title: "Adaimon - weekly notes",
     access: "community",
     ownerPubkey: null,
@@ -73,10 +75,20 @@ describe("Lab board composer references", () => {
     assert.equal(parseLabLink(link.url).ok, true);
   });
 
-  it("offers only boards readable by the current identity or its owner", () => {
+  it("offers readable non-archived boards while retaining frozen boards", () => {
     const suggestions = getLabBoardSuggestions(
       [
         board({ boardId: "community", title: "Community plan" }),
+        board({
+          boardId: "archived",
+          status: "archived",
+          title: "Archived plan",
+        }),
+        board({
+          boardId: "frozen",
+          status: "frozen",
+          title: "Frozen plan",
+        }),
         board({
           boardId: "other-private",
           title: "Private secret",
@@ -97,10 +109,14 @@ describe("Lab board composer references", () => {
 
     assert.deepEqual(
       suggestions.map(({ boardId }) => boardId),
-      ["community", "owner-private"],
+      ["community", "frozen", "owner-private"],
     );
     assert.equal(
       suggestions.some(({ title }) => title === "Private secret"),
+      false,
+    );
+    assert.equal(
+      suggestions.some(({ boardId }) => boardId === "archived"),
       false,
     );
   });

@@ -46,6 +46,7 @@ import { LabMarkdownEditor } from "@/features/lab/ui/LabMarkdownEditor";
 import { LabPreviewBanner } from "@/features/lab/ui/LabPreviewBanner";
 import { LabTagInput } from "@/features/lab/ui/LabTagInput";
 import { RenameLabBoardDialog } from "@/features/lab/ui/RenameLabBoardDialog";
+import { useLabBoardTaskToggleBatch } from "@/features/lab/ui/useLabBoardTaskToggleBatch";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import {
@@ -112,11 +113,50 @@ export function LabBoardView({
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
 
   const board = boardQuery.data ?? null;
+  const canToggleTasks =
+    board !== null &&
+    !isEditing &&
+    viewingRevision === null &&
+    !isBoardLocked(board.status) &&
+    canEditBoard(
+      board,
+      identityQuery.data?.pubkey,
+      currentProfileQuery.data?.ownerPubkey,
+    );
+  const taskToggles = useLabBoardTaskToggleBatch({
+    board,
+    boardId,
+    enabled: canToggleTasks,
+    onMessage: setErrorMessage,
+    updateBoard: updateMutation.mutateAsync,
+  });
   // Defer the single large Markdown parse so navigating into a board commits
   // the surrounding chrome immediately (boards can hold up to 64 KB).
   const deferredContent = React.useDeferredValue(board?.content ?? "");
+  const [lastTaskToggleContent, setLastTaskToggleContent] = React.useState<
+    string | null
+  >(null);
+  // Keep the confirmed task state on screen until the deferred Markdown value
+  // catches up. Otherwise a successful checkbox update can briefly render the
+  // stale deferred source after its query cache has already refreshed.
+  React.useEffect(() => {
+    if (taskToggles.hasPending) {
+      setLastTaskToggleContent(taskToggles.optimisticContent);
+    }
+  }, [taskToggles.hasPending, taskToggles.optimisticContent]);
+  React.useEffect(() => {
+    if (!taskToggles.hasPending && deferredContent === (board?.content ?? "")) {
+      setLastTaskToggleContent(null);
+    }
+  }, [board?.content, deferredContent, taskToggles.hasPending]);
+  const markdownContent = taskToggles.hasPending
+    ? taskToggles.optimisticContent
+    : lastTaskToggleContent !== null &&
+        deferredContent !== (board?.content ?? "")
+      ? lastTaskToggleContent
+      : deferredContent;
 
-  function handleStartEditing(head: LabBoardHead) {
+  function startEditing(head: LabBoardHead) {
     // A rename is a CAS write against this same head, so it must never be
     // pending behind a draft whose `prev` it would invalidate.
     setIsRenameOpen(false);
@@ -127,6 +167,20 @@ export function LabBoardView({
     setEditBase(head);
     setErrorMessage(null);
     setIsEditing(true);
+  }
+
+  async function handleStartEditing() {
+    if (!(await taskToggles.flush())) return;
+    const latest = await boardQuery.refetch();
+    if (!latest.data) {
+      setErrorMessage("This board is no longer available for editing.");
+      return;
+    }
+    startEditing(latest.data);
+  }
+
+  async function handleBack() {
+    if (await taskToggles.flush()) onBack();
   }
 
   function handleCancelEditing() {
@@ -293,7 +347,9 @@ export function LabBoardView({
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-4 py-3">
         <Button
           data-testid="lab-board-back"
-          onClick={onBack}
+          onClick={() => {
+            void handleBack();
+          }}
           size="sm"
           type="button"
           variant="ghost"
@@ -346,7 +402,9 @@ export function LabBoardView({
         {!isEditing && !isLocked && canWrite && viewingRevision === null ? (
           <Button
             data-testid="lab-board-edit"
-            onClick={() => handleStartEditing(board)}
+            onClick={() => {
+              void handleStartEditing();
+            }}
             size="sm"
             type="button"
             variant="outline"
@@ -361,7 +419,11 @@ export function LabBoardView({
         {canRename ? (
           <Button
             data-testid="lab-board-rename"
-            disabled={renameMutation.isPending}
+            disabled={
+              renameMutation.isPending ||
+              taskToggles.hasPending ||
+              taskToggles.isFlushing
+            }
             onClick={() => setIsRenameOpen(true)}
             size="sm"
             type="button"
@@ -379,7 +441,11 @@ export function LabBoardView({
         {!isEditing && canModerate && archiveAction !== null ? (
           <Button
             data-testid={`lab-board-${archiveAction}`}
-            disabled={archiveMutation.isPending}
+            disabled={
+              archiveMutation.isPending ||
+              taskToggles.hasPending ||
+              taskToggles.isFlushing
+            }
             onClick={() =>
               handleSetArchived(board, archiveAction === "archive")
             }
@@ -502,7 +568,12 @@ export function LabBoardView({
             </p>
           ) : (
             <LabBoardHistory
-              canRestore={canWrite && !isLocked}
+              canRestore={
+                canWrite &&
+                !isLocked &&
+                !taskToggles.hasPending &&
+                !taskToggles.isFlushing
+              }
               currentRevision={board.revision}
               isRestoring={restoreMutation.isPending}
               onRestore={(revision) => handleRestore(board, revision)}
@@ -587,7 +658,14 @@ export function LabBoardView({
       ) : (
         <div className="p-4" data-testid="lab-board-content">
           {board.content ? (
-            <Markdown content={deferredContent} />
+            <Markdown
+              content={markdownContent}
+              onToggleTask={
+                canToggleTasks && !taskToggles.isFlushing
+                  ? taskToggles.onToggleTask
+                  : undefined
+              }
+            />
           ) : (
             <p className="text-sm text-muted-foreground">
               This board is empty.

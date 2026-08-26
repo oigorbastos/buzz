@@ -51,6 +51,8 @@ export type MarkdownRuntime = {
   /** Navigate to a Lab Board (`buzz://lab?board=…` deep link). */
   onOpenLabLink: (link: ParsedLabLink) => void;
   onOpenMessageLink: (link: ParsedMessageLink) => void;
+  /** Toggle a GFM task-list item identified by its one-based source line. */
+  onToggleTask?: (line: number, nextChecked: boolean) => void;
   /**
    * The resolved relay origin (e.g. `https://buzz.block.builderlab.xyz`),
    * or `null` when not yet resolved. Used by the anchor component to
@@ -91,6 +93,8 @@ export type MarkdownProps = {
   /** Inline content prepended inside the first rendered prose paragraph. */
   leadingInlineContent?: React.ReactNode;
   onRemoveLinkPreviewsForEveryone?: () => Promise<void>;
+  /** Enables task-list checkboxes for this Markdown mount only. */
+  onToggleTask?: (line: number, nextChecked: boolean) => void;
   searchQuery?: string;
   /** Display name shown in shared-agent card metadata. */
   snapshotSharedBy?: string;

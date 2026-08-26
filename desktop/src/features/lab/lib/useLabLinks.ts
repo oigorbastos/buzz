@@ -2,7 +2,7 @@ import * as React from "react";
 
 import { boardReference, type LabBoardHead } from "@/features/lab/api";
 import { useLabBoardsQuery } from "@/features/lab/hooks";
-import { canReadBoard } from "@/features/lab/model";
+import { filterLabBoards } from "@/features/lab/model";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
@@ -45,12 +45,14 @@ export function getLabBoardSuggestions(
   currentOwnerPubkey?: string | null,
 ): LabBoardSuggestion[] {
   const lowerQuery = query.toLowerCase();
-  return boards
-    .filter(
-      (board) =>
-        canReadBoard(board, currentPubkey, currentOwnerPubkey) &&
-        board.title.toLowerCase().includes(lowerQuery),
-    )
+  return filterLabBoards({
+    boards,
+    currentPubkey,
+    currentOwnerPubkey,
+    filter: "all",
+    tag: null,
+  })
+    .filter((board) => board.title.toLowerCase().includes(lowerQuery))
     .slice(0, 8)
     .map(({ boardId, title }) => ({ boardId, title }));
 }
@@ -70,15 +72,13 @@ export function useLabLinks() {
 
   const readableBoards = React.useMemo(
     () =>
-      (boardsQuery.data ?? [])
-        .filter((board) =>
-          canReadBoard(
-            board,
-            identityQuery.data?.pubkey,
-            currentProfileQuery.data?.ownerPubkey,
-          ),
-        )
-        .map(({ boardId, title }) => ({ boardId, title })),
+      filterLabBoards({
+        boards: boardsQuery.data ?? [],
+        currentPubkey: identityQuery.data?.pubkey,
+        currentOwnerPubkey: currentProfileQuery.data?.ownerPubkey,
+        filter: "all",
+        tag: null,
+      }).map(({ boardId, title }) => ({ boardId, title })),
     [
       boardsQuery.data,
       identityQuery.data?.pubkey,
