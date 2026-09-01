@@ -1,13 +1,14 @@
 import * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
 import { cn } from "@/shared/lib/cn";
 import { performSidebarDefaultHaptic } from "@/shared/lib/haptics";
 import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
 import { useIsMobile } from "@/shared/hooks/use-mobile";
+import { SIDEBAR_WIDTH_MIN } from "@/shared/layout/sidebarLayout";
 import { Button } from "@/shared/ui/button";
+import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
 import { Input } from "@/shared/ui/input";
 import { Separator } from "@/shared/ui/separator";
 import {
@@ -31,7 +32,6 @@ const SIDEBAR_WIDTH_DEFAULT = 300;
 const SIDEBAR_WIDTH_DEFAULT_HAPTIC_THRESHOLD = 2;
 const SIDEBAR_WIDTH_DEFAULT_SNAP_DISTANCE = 8;
 const SIDEBAR_WIDTH_DEFAULT_MAGNET_DISTANCE = 28;
-const SIDEBAR_WIDTH_MIN = 220;
 const SIDEBAR_WIDTH_MAX = 420;
 const SIDEBAR_WIDTH_MOBILE = "288px";
 const SIDEBAR_WIDTH_ICON = "48px";
@@ -396,7 +396,7 @@ const SidebarTrigger = React.forwardRef<
   React.ElementRef<typeof Button>,
   React.ComponentProps<typeof Button>
 >(({ className, onClick, ...props }, ref) => {
-  const { toggleSidebar, open } = useSidebar();
+  const { open, toggleSidebar } = useSidebar();
 
   return (
     <Button
@@ -411,7 +411,7 @@ const SidebarTrigger = React.forwardRef<
       }}
       {...props}
     >
-      {open ? <PanelLeftClose /> : <PanelLeftOpen />}
+      <DrawerPanelIcon side={open ? "left" : "right"} />
       <span className="sr-only">Toggle Sidebar</span>
     </Button>
   );

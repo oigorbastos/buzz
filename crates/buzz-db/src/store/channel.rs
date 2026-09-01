@@ -1,4 +1,4 @@
-//! Channel CRUD and membership management.
+//! Channel lifecycle and metadata persistence.
 //!
 //! Channels have two visibility modes:
 //! - `open`: searchable, anyone can join
@@ -9,12 +9,25 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::error::{DbError, Result};
+use crate::Db;
 use buzz_core::CommunityId;
+use buzz_datastore_tracing::datastore_span;
 
 // Re-export the canonical enum definitions from buzz-core.
 // These live in core (zero I/O deps) so the SDK can share them
 // without pulling in sqlx/tokio.
 pub use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+
+// Keep the established channel module paths compatible while membership SQL
+// and invariants live in their dedicated store module.
+pub use crate::channel_members::{
+    add_member, get_accessible_channel_ids, get_accessible_channels, get_bot_members,
+    get_member_count, get_member_counts_bulk, get_member_role, get_members, get_members_bulk,
+    get_users_bulk, is_member, list_large_channel_rosters_needing_reconciliation,
+    lock_member_snapshot, membership_pairs, remove_member, verify_channel_roster_fence_behavior,
+    verify_channel_roster_fence_catalog, AccessibleChannel, BotChannelEntry, BotMemberRecord,
+    LargeChannelRoster, LockedMemberSnapshot, MemberRecord, UserRecord,
+};
 
 /// A channel row as returned from the database.
 #[derive(Debug, Clone)]
@@ -315,7 +328,7 @@ pub async fn set_canvas(
     Ok(())
 }
 
-/// Lists a community's active channels, optionally filtered by visibility.
+/// Lists channels in a community, optionally filtered by visibility string.
 pub async fn list_channels(
     pool: &PgPool,
     community_id: CommunityId,
@@ -730,10 +743,176 @@ pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<Reaped
         .collect()
 }
 
+impl Db {
+    /// Creates a new channel, bootstraps the creator as owner, and returns the record.
+    #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "create_channel", system = "postgresql")]
+    pub async fn create_channel(
+        &self,
+        community_id: CommunityId,
+        name: &str,
+        channel_type: ChannelType,
+        visibility: ChannelVisibility,
+        description: Option<&str>,
+        created_by: &[u8],
+        ttl_seconds: Option<i32>,
+    ) -> Result<ChannelRecord> {
+        create_channel(
+            &self.pool,
+            community_id,
+            name,
+            channel_type,
+            visibility,
+            description,
+            created_by,
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// Creates a channel with a client-supplied UUID.
+    ///
+    /// Returns `(record, true)` if newly created, `(record, false)` if already exists.
+    #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "create_channel_with_id", system = "postgresql")]
+    pub async fn create_channel_with_id(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        name: &str,
+        channel_type: ChannelType,
+        visibility: ChannelVisibility,
+        description: Option<&str>,
+        created_by: &[u8],
+        ttl_seconds: Option<i32>,
+    ) -> Result<(ChannelRecord, bool)> {
+        create_channel_with_id(
+            &self.pool,
+            community_id,
+            channel_id,
+            name,
+            channel_type,
+            visibility,
+            description,
+            created_by,
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// Fetches a channel record by ID.
+    #[datastore_span(name = "get_channel", system = "postgresql")]
+    pub async fn get_channel(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<ChannelRecord> {
+        get_channel(&self.pool, community_id, channel_id).await
+    }
+
+    /// Returns the canvas content for a channel, if any.
+    #[datastore_span(name = "get_canvas", system = "postgresql")]
+    pub async fn get_canvas(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<Option<String>> {
+        get_canvas(&self.pool, community_id, channel_id).await
+    }
+
+    /// Sets or clears the canvas content for a channel.
+    #[datastore_span(name = "set_canvas", system = "postgresql")]
+    pub async fn set_canvas(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        canvas: Option<&str>,
+    ) -> Result<()> {
+        set_canvas(&self.pool, community_id, channel_id, canvas).await
+    }
+
+    /// Lists channels, optionally filtered by visibility.
+    #[datastore_span(name = "list_channels", system = "postgresql")]
+    pub async fn list_channels(
+        &self,
+        community_id: CommunityId,
+        visibility: Option<&str>,
+    ) -> Result<Vec<ChannelRecord>> {
+        list_channels(&self.pool, community_id, visibility).await
+    }
+
+    /// Updates a channel's name and/or description.
+    #[datastore_span(name = "update_channel", system = "postgresql")]
+    pub async fn update_channel(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        updates: ChannelUpdate,
+    ) -> Result<ChannelRecord> {
+        update_channel(&self.pool, community_id, channel_id, updates).await
+    }
+
+    /// Sets the topic for a channel.
+    #[datastore_span(name = "set_topic", system = "postgresql")]
+    pub async fn set_topic(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        topic: &str,
+        set_by: &[u8],
+    ) -> Result<()> {
+        set_topic(&self.pool, community_id, channel_id, topic, set_by).await
+    }
+
+    /// Sets the purpose for a channel.
+    #[datastore_span(name = "set_purpose", system = "postgresql")]
+    pub async fn set_purpose(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        purpose: &str,
+        set_by: &[u8],
+    ) -> Result<()> {
+        set_purpose(&self.pool, community_id, channel_id, purpose, set_by).await
+    }
+
+    /// Archives a channel.
+    #[datastore_span(name = "archive_channel", system = "postgresql")]
+    pub async fn archive_channel(&self, community_id: CommunityId, channel_id: Uuid) -> Result<()> {
+        archive_channel(&self.pool, community_id, channel_id).await
+    }
+
+    /// Unarchives a channel.
+    #[datastore_span(name = "unarchive_channel", system = "postgresql")]
+    pub async fn unarchive_channel(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<()> {
+        unarchive_channel(&self.pool, community_id, channel_id).await
+    }
+
+    /// Soft-delete a channel.
+    #[datastore_span(name = "soft_delete_channel", system = "postgresql")]
+    pub async fn soft_delete_channel(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<bool> {
+        soft_delete_channel(&self.pool, community_id, channel_id).await
+    }
+
+    /// Archive ephemeral channels whose TTL deadline has passed.
+    #[datastore_span(name = "reap_expired_ephemeral_channels", system = "postgresql")]
+    pub async fn reap_expired_ephemeral_channels(&self) -> Result<Vec<ReapedEphemeralChannel>> {
+        reap_expired_ephemeral_channels(&self.pool).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::user::{ensure_user, set_agent_owner};
+    use crate::user::ensure_user;
     use nostr::Keys;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
@@ -837,40 +1016,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn get_users_bulk_is_scoped_when_pubkey_exists_in_multiple_communities() {
-        let pool = setup_pool().await;
-        let community_a = make_test_community(&pool).await;
-        let community_b = make_test_community(&pool).await;
-        let community_a = CommunityId::from_uuid(community_a);
-        let community_b = CommunityId::from_uuid(community_b);
-        let pubkey = random_pubkey();
-
-        sqlx::query(
-            "INSERT INTO users (community_id, pubkey, display_name) VALUES ($1, $2, $3), ($4, $5, $6)",
-        )
-        .bind(community_a.as_uuid())
-        .bind(&pubkey)
-        .bind("community-a-profile")
-        .bind(community_b.as_uuid())
-        .bind(&pubkey)
-        .bind("community-b-profile")
-        .execute(&pool)
-        .await
-        .expect("insert same pubkey in two communities");
-
-        let users = get_users_bulk(&pool, community_a, std::slice::from_ref(&pubkey))
-            .await
-            .expect("bulk fetch users");
-
-        assert_eq!(users.len(), 1);
-        assert_eq!(
-            users[0].display_name.as_deref(),
-            Some("community-a-profile")
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn get_channel_is_scoped_when_channel_uuid_collides_across_communities() {
         let pool = setup_pool().await;
         let community_a = make_test_community(&pool).await;
@@ -916,83 +1061,6 @@ mod tests {
             .any(|row| row.id == channel_id && row.name == "community-b-channel"));
     }
 
-    /// Agent owner (non-admin) can remove their own bot from a channel.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn test_agent_owner_can_remove_bot() {
-        let pool = setup_pool().await;
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let owner_pk = random_pubkey();
-        let agent_pk = random_pubkey();
-
-        // Create users and set agent ownership
-        ensure_user(&pool, community, &owner_pk)
-            .await
-            .expect("ensure owner");
-        ensure_user(&pool, community, &agent_pk)
-            .await
-            .expect("ensure agent");
-        set_agent_owner(&pool, community, &agent_pk, &owner_pk)
-            .await
-            .expect("set agent owner");
-
-        // Create a channel owned by someone else entirely
-        let channel_owner_pk = random_pubkey();
-        ensure_user(&pool, community, &channel_owner_pk)
-            .await
-            .expect("ensure channel owner");
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "test-bot-remove",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &channel_owner_pk,
-            None,
-        )
-        .await
-        .expect("create channel");
-
-        // Add owner and agent as regular members
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &owner_pk,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("add owner as member");
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &agent_pk,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("add agent as member");
-
-        // Owner should be able to remove their agent
-        remove_member(&pool, community, channel.id, &agent_pk, &owner_pk)
-            .await
-            .expect("agent owner should be able to remove their bot");
-
-        // Verify the agent is no longer a member
-        assert!(
-            !is_member(&pool, community, channel.id, &agent_pk)
-                .await
-                .expect("is_member check"),
-            "agent should no longer be a member"
-        );
-    }
-
-    /// Unarchiving an expired ephemeral channel renews its TTL lease so the
-    /// reaper does not immediately archive it again.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn test_unarchive_expired_ephemeral_channel_renews_ttl_deadline() {
@@ -1103,1054 +1171,4 @@ mod tests {
             "reaper should carry the archived row's community id and host"
         );
     }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn accessible_channel_ids_are_not_truncated_at_one_thousand() {
-        let database_url =
-            std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect to test DB");
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let viewer = random_pubkey();
-        let channel_count = 1_001;
-
-        sqlx::query(
-            r#"
-            INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
-            SELECT gen_random_uuid(), $1, 'high-volume-' || n, 'stream', 'open', $2
-            FROM generate_series(1, $3) n
-            "#,
-        )
-        .bind(community_id)
-        .bind(&viewer)
-        .bind(channel_count)
-        .execute(&pool)
-        .await
-        .expect("insert high-volume open channels");
-
-        let channel_ids = get_accessible_channel_ids(&pool, community, &viewer)
-            .await
-            .expect("load accessible channel ids");
-        assert_eq!(channel_ids.len(), channel_count as usize);
-    }
-
-    /// `get_members` must return the complete roster, not a truncated prefix.
-    ///
-    /// The relay builds the kind 39002 (NIP-29 group members) snapshot and every
-    /// admin role lookup from this list, so a cap silently hides late joiners:
-    /// their clients never discover the channel, and an owner past the cutoff
-    /// reads as a non-member.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn get_members_returns_full_roster_beyond_1000() {
-        let database_url =
-            std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect to test DB");
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let creator = random_pubkey();
-
-        // create_test_channel also inserts the creator as the first (owner) member.
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "high-volume-roster",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &creator,
-            None,
-        )
-        .await
-        .expect("create test channel");
-
-        // Bulk-insert additional members with strictly increasing `joined_at`, so
-        // member N lands at roster position N (the creator holds position 0).
-        // The final member is an owner joining well past the old 1000-row cutoff.
-        let extra_members = 1_500;
-        sqlx::query(
-            r#"
-            INSERT INTO channel_members (community_id, channel_id, pubkey, role, joined_at)
-            SELECT
-                $1,
-                $2,
-                decode(lpad(to_hex(n), 64, '0'), 'hex'),
-                (CASE WHEN n = $3 THEN 'owner' ELSE 'member' END)::member_role,
-                NOW() + (n || ' seconds')::interval
-            FROM generate_series(1, $3) n
-            "#,
-        )
-        .bind(community_id)
-        .bind(channel.id)
-        .bind(extra_members)
-        .execute(&pool)
-        .await
-        .expect("insert high-volume channel members");
-
-        let members = get_members(&pool, community, channel.id)
-            .await
-            .expect("load channel members");
-
-        assert_eq!(
-            members.len(),
-            extra_members as usize + 1,
-            "get_members truncated the roster"
-        );
-
-        // The last joiner sits at the final roster position — past any
-        // 1000-row cap — which also pins the documented `joined_at` ordering.
-        let late_owner = hex::decode(format!("{:064x}", extra_members)).expect("hex pubkey");
-        let late = members.last().expect("roster is non-empty");
-        assert_eq!(
-            late.pubkey, late_owner,
-            "member who joined after the 1000th must be present and ordered last"
-        );
-        assert_eq!(
-            late.role, "owner",
-            "role of a late-joining owner must resolve correctly"
-        );
-    }
-
-    /// A random non-admin, non-owner user cannot remove someone else's bot.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn test_random_user_cannot_remove_bot() {
-        let pool = setup_pool().await;
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let owner_pk = random_pubkey();
-        let agent_pk = random_pubkey();
-        let random_pk = random_pubkey();
-
-        // Create users and set agent ownership
-        ensure_user(&pool, community, &owner_pk)
-            .await
-            .expect("ensure owner");
-        ensure_user(&pool, community, &agent_pk)
-            .await
-            .expect("ensure agent");
-        ensure_user(&pool, community, &random_pk)
-            .await
-            .expect("ensure random");
-        set_agent_owner(&pool, community, &agent_pk, &owner_pk)
-            .await
-            .expect("set agent owner");
-
-        // Create a channel
-        let channel_owner_pk = random_pubkey();
-        ensure_user(&pool, community, &channel_owner_pk)
-            .await
-            .expect("ensure channel owner");
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "test-bot-no-remove",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &channel_owner_pk,
-            None,
-        )
-        .await
-        .expect("create channel");
-
-        // Add random user and agent as regular members
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &random_pk,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("add random as member");
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &agent_pk,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("add agent as member");
-
-        // Random user should NOT be able to remove the agent
-        let result = remove_member(&pool, community, channel.id, &agent_pk, &random_pk).await;
-        assert!(
-            result.is_err(),
-            "random user should not be able to remove someone else's bot"
-        );
-    }
-
-    /// SECURITY REPRO (Dawn, kind:9000 demotion report): an unprivileged plain
-    /// member calls add_member with role=Member against the channel OWNER.
-    /// If this succeeds, add_member has no demotion authorization and no
-    /// last-owner guard.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn repro_unprivileged_member_can_demote_owner() {
-        let pool = setup_pool().await;
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let victim_owner = random_pubkey();
-        let attacker = random_pubkey();
-
-        for pk in [&victim_owner, &attacker] {
-            ensure_user(&pool, community, pk)
-                .await
-                .expect("ensure user");
-        }
-
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "repro-demote-owner",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &victim_owner,
-            None,
-        )
-        .await
-        .expect("create channel");
-
-        // create_test_channel already seeds the creator as 'owner', mirroring
-        // create_channel's own INSERT (channel.rs:131-145).
-        let role_of = |members: Vec<MemberRecord>, pk: Vec<u8>| -> Option<String> {
-            members.into_iter().find(|m| m.pubkey == pk).map(|m| m.role)
-        };
-        let before = role_of(
-            get_members(&pool, community, channel.id)
-                .await
-                .expect("members"),
-            victim_owner.clone(),
-        );
-        assert_eq!(
-            before.as_deref(),
-            Some("owner"),
-            "victim must start as owner"
-        );
-
-        // Attacker: plain member, not owner/admin.
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &attacker,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("attacker self-joins open channel");
-
-        // The attack: attacker is `invited_by` and demotes the owner.
-        let res = add_member(
-            &pool,
-            community,
-            channel.id,
-            &victim_owner,
-            MemberRole::Member,
-            Some(&attacker),
-        )
-        .await;
-
-        let after = role_of(
-            get_members(&pool, community, channel.id)
-                .await
-                .expect("members"),
-            victim_owner.clone(),
-        );
-        let owners = get_members(&pool, community, channel.id)
-            .await
-            .expect("members")
-            .into_iter()
-            .filter(|m| m.role == "owner")
-            .count();
-
-        assert!(
-            res.is_err(),
-            "unprivileged member must not be able to demote the owner"
-        );
-        assert_eq!(after.as_deref(), Some("owner"), "owner role must survive");
-        assert_eq!(owners, 1, "channel must still have its owner");
-    }
-
-    /// SECURITY REPRO (Dawn): same demotion on a PRIVATE channel, where the
-    /// attacker is a plain member. The report claims any member suffices here.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn repro_private_channel_member_can_demote_owner() {
-        let pool = setup_pool().await;
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let victim_owner = random_pubkey();
-        let attacker = random_pubkey();
-
-        for pk in [&victim_owner, &attacker] {
-            ensure_user(&pool, community, pk)
-                .await
-                .expect("ensure user");
-        }
-
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "repro-demote-owner-private",
-            ChannelType::Stream,
-            ChannelVisibility::Private,
-            None,
-            &victim_owner,
-            None,
-        )
-        .await
-        .expect("create private channel");
-
-        // Owner invites the attacker as a plain member (legitimate).
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &attacker,
-            MemberRole::Member,
-            Some(&victim_owner),
-        )
-        .await
-        .expect("owner invites attacker");
-
-        // Attack: plain member demotes the owner.
-        let res = add_member(
-            &pool,
-            community,
-            channel.id,
-            &victim_owner,
-            MemberRole::Member,
-            Some(&attacker),
-        )
-        .await;
-
-        let members = get_members(&pool, community, channel.id)
-            .await
-            .expect("members");
-        let victim_role = members
-            .iter()
-            .find(|m| m.pubkey == victim_owner)
-            .map(|m| m.role.clone());
-        let owners = members.iter().filter(|m| m.role == "owner").count();
-
-        assert!(
-            res.is_err(),
-            "plain member must not be able to demote the owner on a private channel"
-        );
-        assert_eq!(
-            victim_role.as_deref(),
-            Some("owner"),
-            "owner role must survive"
-        );
-        assert_eq!(owners, 1, "channel must still have its owner");
-    }
-
-    /// The fix must not break legitimate role management: an owner demoting a
-    /// co-owner (while another owner remains) must still succeed, and promotion
-    /// by an owner must still succeed.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn owner_can_still_manage_roles_after_demotion_guard() {
-        let pool = setup_pool().await;
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let owner = random_pubkey();
-        let other = random_pubkey();
-
-        for pk in [&owner, &other] {
-            ensure_user(&pool, community, pk)
-                .await
-                .expect("ensure user");
-        }
-
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "roles-still-manageable",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &owner,
-            None,
-        )
-        .await
-        .expect("create channel");
-
-        // Owner promotes `other` to owner — allowed (actor is elevated).
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &other,
-            MemberRole::Owner,
-            Some(&owner),
-        )
-        .await
-        .expect("owner may promote to owner");
-
-        // Owner demotes the co-owner back to member — allowed: actor is elevated
-        // and another owner remains, so the last-owner guard does not trip.
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &other,
-            MemberRole::Member,
-            Some(&owner),
-        )
-        .await
-        .expect("owner may demote a co-owner while another owner remains");
-
-        let members = get_members(&pool, community, channel.id)
-            .await
-            .expect("members");
-        let role_of = |pk: &Vec<u8>| {
-            members
-                .iter()
-                .find(|m| &m.pubkey == pk)
-                .map(|m| m.role.clone())
-        };
-        assert_eq!(role_of(&other).as_deref(), Some("member"));
-        assert_eq!(role_of(&owner).as_deref(), Some("owner"));
-
-        // Idempotent re-add at the SAME role must stay unguarded even from a
-        // non-elevated actor — the huddle bot-add path depends on this.
-        let bot = random_pubkey();
-        ensure_user(&pool, community, &bot)
-            .await
-            .expect("ensure bot");
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &bot,
-            MemberRole::Bot,
-            Some(&owner),
-        )
-        .await
-        .expect("add bot");
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &bot,
-            MemberRole::Bot,
-            Some(&other),
-        )
-        .await
-        .expect("re-adding at the same role must remain idempotent");
-
-        // But the last owner cannot be demoted, even by themselves.
-        let err = add_member(
-            &pool,
-            community,
-            channel.id,
-            &owner,
-            MemberRole::Member,
-            Some(&owner),
-        )
-        .await
-        .expect_err("last owner must not be demotable");
-        println!("last-owner demotion rejected: {err}");
-    }
-
-    /// Isolates the actor-authorization guard from the last-owner guard.
-    ///
-    /// `repro_unprivileged_member_can_demote_owner` demotes the *sole* owner, so
-    /// the last-owner guard alone is enough to reject it: stubbing out the actor
-    /// check leaves that test green and the authorization hole invisible. Here a
-    /// second owner remains, so the last-owner guard cannot fire and only the
-    /// actor check stands between an unprivileged member and a co-owner's role.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn unprivileged_member_cannot_demote_a_co_owner() {
-        let pool = setup_pool().await;
-        let community_id = make_test_community(&pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let owner = random_pubkey();
-        let co_owner = random_pubkey();
-        let attacker = random_pubkey();
-
-        for pk in [&owner, &co_owner, &attacker] {
-            ensure_user(&pool, community, pk)
-                .await
-                .expect("ensure user");
-        }
-
-        let channel = create_test_channel(
-            &pool,
-            community_id,
-            "co-owner-demotion-authz",
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &owner,
-            None,
-        )
-        .await
-        .expect("create channel");
-
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &co_owner,
-            MemberRole::Owner,
-            Some(&owner),
-        )
-        .await
-        .expect("owner may promote a co-owner");
-
-        add_member(
-            &pool,
-            community,
-            channel.id,
-            &attacker,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("attacker self-joins the open channel");
-
-        // Two owners remain, so the last-owner guard cannot reject this. Only
-        // the actor-authorization check can.
-        let err = add_member(
-            &pool,
-            community,
-            channel.id,
-            &co_owner,
-            MemberRole::Member,
-            Some(&attacker),
-        )
-        .await
-        .expect_err("an unprivileged member must not demote a co-owner");
-        println!("co-owner demotion by unprivileged actor rejected: {err}");
-
-        let members = get_members(&pool, community, channel.id)
-            .await
-            .expect("members");
-        let role_of = |pk: &Vec<u8>| {
-            members
-                .iter()
-                .find(|m| &m.pubkey == pk)
-                .map(|m| m.role.clone())
-        };
-        assert_eq!(
-            role_of(&co_owner).as_deref(),
-            Some("owner"),
-            "co-owner must keep their role"
-        );
-        assert_eq!(
-            members.iter().filter(|m| m.role == "owner").count(),
-            2,
-            "both owners must survive"
-        );
-    }
-
-    /// Sets up an open channel with exactly two owners, returning
-    /// `(community, channel_id, owner_a, owner_b)`.
-    async fn channel_with_two_owners(
-        pool: &PgPool,
-        name: &str,
-    ) -> (CommunityId, Uuid, Vec<u8>, Vec<u8>) {
-        let community_id = make_test_community(pool).await;
-        let community = CommunityId::from_uuid(community_id);
-        let owner_a = random_pubkey();
-        let owner_b = random_pubkey();
-        for pk in [&owner_a, &owner_b] {
-            ensure_user(pool, community, pk).await.expect("ensure user");
-        }
-
-        let channel = create_test_channel(
-            pool,
-            community_id,
-            name,
-            ChannelType::Stream,
-            ChannelVisibility::Open,
-            None,
-            &owner_a,
-            None,
-        )
-        .await
-        .expect("create channel");
-
-        add_member(
-            pool,
-            community,
-            channel.id,
-            &owner_b,
-            MemberRole::Owner,
-            Some(&owner_a),
-        )
-        .await
-        .expect("promote second owner");
-
-        (community, channel.id, owner_a, owner_b)
-    }
-
-    /// The lock must be shared with `remove_member`: a demotion racing an owner
-    /// removal goes through a separate count/update path, so both must serialize
-    /// on the same key or they can jointly empty the owner set.
-    ///
-    /// Deterministic rather than timing-based: an outer transaction takes the
-    /// per-channel membership key first, then each membership writer must block
-    /// until it is released. Verified by mutation — dropping the lock from either
-    /// function makes that call return immediately and fails this test.
-    #[tokio::test]
-    #[ignore]
-    async fn membership_writes_serialize_on_the_shared_channel_lock() {
-        let pool = setup_pool().await;
-        let (community, channel_id, owner_a, owner_b) =
-            channel_with_two_owners(&pool, "membership-lock-shared").await;
-
-        for label in ["add_member", "remove_member"] {
-            // Hold the same advisory key an in-tree membership write would take.
-            let mut holder = pool.begin().await.expect("begin lock holder");
-            acquire_channel_membership_lock(&mut holder, community, channel_id)
-                .await
-                .expect("holder acquires membership key");
-
-            let pool2 = pool.clone();
-            let (target, actor) = (owner_a.clone(), owner_b.clone());
-            let mut writer = tokio::spawn(async move {
-                match label {
-                    "add_member" => add_member(
-                        &pool2,
-                        community,
-                        channel_id,
-                        &target,
-                        MemberRole::Member,
-                        Some(&actor),
-                    )
-                    .await
-                    .map(|_| ()),
-                    _ => remove_member(&pool2, community, channel_id, &target, &actor).await,
-                }
-            });
-
-            // While the key is held, the writer must make no progress.
-            let blocked =
-                tokio::time::timeout(std::time::Duration::from_millis(750), &mut writer).await;
-            assert!(
-                blocked.is_err(),
-                "{label} completed while the channel membership key was held — \
-                 it is not serializing on the shared lock"
-            );
-            println!("{label} blocked on the held membership key, as required");
-
-            // Releasing the key lets it proceed.
-            holder.rollback().await.expect("release membership key");
-            tokio::time::timeout(std::time::Duration::from_secs(10), writer)
-                .await
-                .expect("writer must proceed once the key is released")
-                .expect("writer task panicked")
-                .expect("writer must succeed after the key is released");
-
-            // Restore two owners for the next iteration.
-            add_member(
-                &pool,
-                community,
-                channel_id,
-                &owner_a,
-                MemberRole::Owner,
-                Some(&owner_b),
-            )
-            .await
-            .expect("restore second owner");
-        }
-    }
-
-    /// Every *mutable* authorization read must sit behind the membership lock.
-    /// A remover that reads its elevated role before acquiring the lock can be
-    /// demoted by a concurrent writer and still proceed on the stale role.
-    ///
-    /// Deterministic: the holder takes the key, `remove_member` blocks on it, the
-    /// holder then demotes the remover and commits. Once the key is released the
-    /// remover must re-read its (now unprivileged) role and be rejected.
-    #[tokio::test]
-    #[ignore]
-    async fn remove_member_rejects_an_actor_demoted_while_it_waited() {
-        let pool = setup_pool().await;
-        let (community, channel_id, owner_a, owner_b) =
-            channel_with_two_owners(&pool, "stale-actor-role").await;
-        // owner_b removes a plain member, so the last-owner guard is not what
-        // rejects this — only the actor's own role can.
-        let victim = random_pubkey();
-        ensure_user(&pool, community, &victim)
-            .await
-            .expect("ensure victim");
-        add_member(
-            &pool,
-            community,
-            channel_id,
-            &victim,
-            MemberRole::Member,
-            Some(&owner_a),
-        )
-        .await
-        .expect("add victim");
-
-        let mut holder = pool.begin().await.expect("begin lock holder");
-        acquire_channel_membership_lock(&mut holder, community, channel_id)
-            .await
-            .expect("holder acquires membership key");
-
-        let pool2 = pool.clone();
-        let (actor, target) = (owner_b.clone(), victim.clone());
-        let mut remover = tokio::spawn(async move {
-            remove_member(&pool2, community, channel_id, &target, &actor).await
-        });
-
-        // Must be waiting on the key, not already authorized past it.
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(750), &mut remover)
-                .await
-                .is_err(),
-            "remove_member must block on the membership key before authorizing"
-        );
-
-        // Demote the waiting actor to a plain member and release the key.
-        sqlx::query(
-            "UPDATE channel_members SET role = 'member' \
-             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
-        )
-        .bind(community.as_uuid())
-        .bind(channel_id)
-        .bind(&owner_b)
-        .execute(&mut *holder)
-        .await
-        .expect("demote the waiting actor");
-        holder.commit().await.expect("commit demotion");
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), remover)
-            .await
-            .expect("remover must proceed once the key is released")
-            .expect("remover task panicked");
-
-        let err = result.expect_err("a demoted actor must not remove another member");
-        println!("stale-role removal rejected: {err}");
-
-        // The victim must still be an active member.
-        let members = get_members(&pool, community, channel_id)
-            .await
-            .expect("members");
-        assert!(
-            members.iter().any(|m| m.pubkey == victim),
-            "victim must not have been removed by a demoted actor"
-        );
-    }
-
-    /// A soft-removed row keeps its stored `role`, but that role is history,
-    /// not live authority — `removed_at` says it is no longer in force. So
-    /// reactivation must land at the baseline the caller was authorized for,
-    /// never at the role the row happens to remember.
-    ///
-    /// Regression for the sharper vulnerability the alternative would create:
-    /// an owner kicked by another owner self-rejoins through the kind:9021
-    /// path (`Member`, no inviter) and must come back as a plain member. If
-    /// `add_member` inferred authority from the removed row, soft-deleted
-    /// ownership would be a resurrection token.
-    ///
-    /// Two owners on purpose, so the last-owner guard can never be what
-    /// decides the outcome — only role resolution can.
-    #[tokio::test]
-    #[ignore]
-    async fn kicked_owner_rejoins_as_member_not_owner() {
-        let pool = setup_pool().await;
-        let (community, channel_id, owner_a, owner_b) =
-            channel_with_two_owners(&pool, "kicked-owner-rejoin").await;
-
-        // owner_a kicks owner_b (allowed: owner_a remains as the last owner).
-        remove_member(&pool, community, channel_id, &owner_b, &owner_a)
-            .await
-            .expect("an owner may remove another owner");
-
-        let stored: String = sqlx::query_scalar(
-            "SELECT role::text FROM channel_members \
-             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
-        )
-        .bind(community.as_uuid())
-        .bind(channel_id)
-        .bind(&owner_b)
-        .fetch_one(&pool)
-        .await
-        .expect("stored role survives soft removal");
-        assert_eq!(
-            stored, "owner",
-            "the removed row still remembers `owner` — which is exactly why \
-             authorization must not read it"
-        );
-
-        // The kind:9021 self-rejoin path: `Member`, no inviter.
-        add_member(
-            &pool,
-            community,
-            channel_id,
-            &owner_b,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("a removed member may rejoin an open channel");
-
-        let rejoined = get_member_role(&pool, community, channel_id, &owner_b)
-            .await
-            .expect("read role after rejoin");
-        assert_eq!(
-            rejoined.as_deref(),
-            Some("member"),
-            "a kicked owner must rejoin at baseline privilege, not regain ownership"
-        );
-    }
-
-    /// The other side of the same boundary: reactivation may reach an elevated
-    /// role, but only because a *currently* elevated granter asked for it.
-    #[tokio::test]
-    #[ignore]
-    async fn removed_owner_is_restored_only_by_a_current_owner() {
-        let pool = setup_pool().await;
-        let (community, channel_id, owner_a, owner_b) =
-            channel_with_two_owners(&pool, "removed-owner-restore").await;
-
-        remove_member(&pool, community, channel_id, &owner_b, &owner_a)
-            .await
-            .expect("an owner may remove another owner");
-
-        // An unprivileged member cannot re-add them at `owner`.
-        let rando = random_pubkey();
-        ensure_user(&pool, community, &rando)
-            .await
-            .expect("ensure rando");
-        add_member(
-            &pool,
-            community,
-            channel_id,
-            &rando,
-            MemberRole::Member,
-            None,
-        )
-        .await
-        .expect("rando self-joins open channel");
-        let denied = add_member(
-            &pool,
-            community,
-            channel_id,
-            &owner_b,
-            MemberRole::Owner,
-            Some(&rando),
-        )
-        .await;
-        assert!(
-            matches!(denied, Err(DbError::AccessDenied(_))),
-            "an unprivileged actor must not re-add anyone at `owner`, got {denied:?}"
-        );
-
-        // The remaining owner can.
-        add_member(
-            &pool,
-            community,
-            channel_id,
-            &owner_b,
-            MemberRole::Owner,
-            Some(&owner_a),
-        )
-        .await
-        .expect("a current owner may restore ownership");
-        let restored = get_member_role(&pool, community, channel_id, &owner_b)
-            .await
-            .expect("read role after restore");
-        assert_eq!(restored.as_deref(), Some("owner"));
-    }
 }
-
-// Db facade methods moved from the runtime module.
-use crate::{channel, Db};
-use buzz_datastore_tracing::datastore_span;
-
-impl Db {
-    /// Creates a new channel, bootstraps the creator as owner, and returns the record.
-    #[allow(clippy::too_many_arguments)]
-    #[datastore_span(name = "create_channel", system = "postgresql")]
-    pub async fn create_channel(
-        &self,
-        community_id: CommunityId,
-        name: &str,
-        channel_type: channel::ChannelType,
-        visibility: channel::ChannelVisibility,
-        description: Option<&str>,
-        created_by: &[u8],
-        ttl_seconds: Option<i32>,
-    ) -> Result<channel::ChannelRecord> {
-        channel::create_channel(
-            &self.pool,
-            community_id,
-            name,
-            channel_type,
-            visibility,
-            description,
-            created_by,
-            ttl_seconds,
-        )
-        .await
-    }
-
-    /// Creates a channel with a client-supplied UUID.
-    ///
-    /// Returns `(record, true)` if newly created, `(record, false)` if already exists.
-    #[allow(clippy::too_many_arguments)]
-    #[datastore_span(name = "create_channel_with_id", system = "postgresql")]
-    pub async fn create_channel_with_id(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        name: &str,
-        channel_type: channel::ChannelType,
-        visibility: channel::ChannelVisibility,
-        description: Option<&str>,
-        created_by: &[u8],
-        ttl_seconds: Option<i32>,
-    ) -> Result<(channel::ChannelRecord, bool)> {
-        channel::create_channel_with_id(
-            &self.pool,
-            community_id,
-            channel_id,
-            name,
-            channel_type,
-            visibility,
-            description,
-            created_by,
-            ttl_seconds,
-        )
-        .await
-    }
-
-    /// Fetches a channel record by ID.
-    #[datastore_span(name = "get_channel", system = "postgresql")]
-    pub async fn get_channel(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<channel::ChannelRecord> {
-        channel::get_channel(&self.pool, community_id, channel_id).await
-    }
-
-    /// Returns the canvas content for a channel, if any.
-    #[datastore_span(name = "get_canvas", system = "postgresql")]
-    pub async fn get_canvas(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<Option<String>> {
-        channel::get_canvas(&self.pool, community_id, channel_id).await
-    }
-
-    /// Sets or clears the canvas content for a channel.
-    #[datastore_span(name = "set_canvas", system = "postgresql")]
-    pub async fn set_canvas(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        canvas: Option<&str>,
-    ) -> Result<()> {
-        channel::set_canvas(&self.pool, community_id, channel_id, canvas).await
-    }
-
-    /// Lists channels, optionally filtered by visibility.
-    #[datastore_span(name = "list_channels", system = "postgresql")]
-    pub async fn list_channels(
-        &self,
-        community_id: CommunityId,
-        visibility: Option<&str>,
-    ) -> Result<Vec<channel::ChannelRecord>> {
-        channel::list_channels(&self.pool, community_id, visibility).await
-    }
-
-    /// Updates a channel's name and/or description.
-    #[datastore_span(name = "update_channel", system = "postgresql")]
-    pub async fn update_channel(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        updates: channel::ChannelUpdate,
-    ) -> Result<channel::ChannelRecord> {
-        channel::update_channel(&self.pool, community_id, channel_id, updates).await
-    }
-
-    /// Sets the topic for a channel.
-    #[datastore_span(name = "set_topic", system = "postgresql")]
-    pub async fn set_topic(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        topic: &str,
-        set_by: &[u8],
-    ) -> Result<()> {
-        channel::set_topic(&self.pool, community_id, channel_id, topic, set_by).await
-    }
-
-    /// Sets the purpose for a channel.
-    #[datastore_span(name = "set_purpose", system = "postgresql")]
-    pub async fn set_purpose(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        purpose: &str,
-        set_by: &[u8],
-    ) -> Result<()> {
-        channel::set_purpose(&self.pool, community_id, channel_id, purpose, set_by).await
-    }
-
-    /// Archives a channel.
-    #[datastore_span(name = "archive_channel", system = "postgresql")]
-    pub async fn archive_channel(&self, community_id: CommunityId, channel_id: Uuid) -> Result<()> {
-        channel::archive_channel(&self.pool, community_id, channel_id).await
-    }
-
-    /// Unarchives a channel.
-    #[datastore_span(name = "unarchive_channel", system = "postgresql")]
-    pub async fn unarchive_channel(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<()> {
-        channel::unarchive_channel(&self.pool, community_id, channel_id).await
-    }
-
-    /// Soft-delete a channel.
-    #[datastore_span(name = "soft_delete_channel", system = "postgresql")]
-    pub async fn soft_delete_channel(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<bool> {
-        channel::soft_delete_channel(&self.pool, community_id, channel_id).await
-    }
-
-    /// Archive ephemeral channels whose TTL deadline has passed.
-    #[datastore_span(name = "reap_expired_ephemeral_channels", system = "postgresql")]
-    pub async fn reap_expired_ephemeral_channels(
-        &self,
-    ) -> Result<Vec<channel::ReapedEphemeralChannel>> {
-        channel::reap_expired_ephemeral_channels(&self.pool).await
-    }
-}
-
-#[cfg(test)]
-use crate::channel_members::acquire_channel_membership_lock;
-pub use crate::channel_members::{
-    add_member, get_accessible_channel_ids, get_accessible_channels, get_bot_members,
-    get_member_count, get_member_counts_bulk, get_member_role, get_members, get_members_bulk,
-    get_users_bulk, is_member, membership_pairs, remove_member, AccessibleChannel, BotChannelEntry,
-    BotMemberRecord, MemberRecord, UserRecord,
-};

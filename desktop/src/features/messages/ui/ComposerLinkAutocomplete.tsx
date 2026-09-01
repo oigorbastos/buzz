@@ -9,11 +9,13 @@ import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks"
 import { ChannelAutocomplete } from "./ChannelAutocomplete";
 
 type ComposerLinkAutocompleteProps = {
+  composerOwnsFocus: boolean;
   links: UseComposerLinksResult;
   onSelect: (suggestion: ComposerLinkSuggestion) => void;
 };
 
 export function ComposerLinkAutocomplete({
+  composerOwnsFocus,
   links,
   onSelect,
 }: ComposerLinkAutocompleteProps) {
@@ -26,16 +28,19 @@ export function ComposerLinkAutocomplete({
 
   return (
     <>
-      <LabBoardAutocomplete
-        onSelect={selectLabBoard}
-        selectedIndex={links.labLinks.labBoardSelectedIndex}
-        suggestions={
-          links.labLinks.isLabBoardOpen
-            ? links.labLinks.labBoardSuggestions
-            : []
-        }
-      />
+      {composerOwnsFocus ? (
+        <LabBoardAutocomplete
+          onSelect={selectLabBoard}
+          selectedIndex={links.labLinks.labBoardSelectedIndex}
+          suggestions={
+            links.labLinks.isLabBoardOpen
+              ? links.labLinks.labBoardSuggestions
+              : []
+          }
+        />
+      ) : null}
       <ChannelAutocomplete
+        composerOwnsFocus={composerOwnsFocus}
         onSelect={selectChannel}
         selectedIndex={links.channelLinks.channelSelectedIndex}
         suggestions={

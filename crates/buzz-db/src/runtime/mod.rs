@@ -1,10 +1,8 @@
-//! Database runtime infrastructure: pools, read routing, migrations and sessions.
-
 pub mod migration;
+pub(crate) mod observability;
 pub mod replica_fence;
 
 use crate::{deletion, event, DbError, EventQuery, Result};
-use buzz_core::{CommunityId, StoredEvent};
 use buzz_datastore_tracing::datastore_span;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
@@ -12,37 +10,14 @@ use sqlx::{PgPool, QueryBuilder};
 use std::time::Duration;
 use uuid::Uuid;
 
-pub(crate) fn event_replacement_lock_key(
-    community_id: CommunityId,
-    kind: i32,
-    pubkey: &[u8],
-    coordinate: Option<&[u8]>,
-) -> i64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let kind_bytes = kind.to_le_bytes();
-    for bytes in [
-        community_id.as_uuid().as_bytes().as_slice(),
-        kind_bytes.as_slice(),
-        pubkey,
-    ] {
-        for byte in bytes {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    if let Some(coordinate) = coordinate {
-        for byte in coordinate {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    hash as i64
-}
+use buzz_core::{CommunityId, StoredEvent};
 
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
-/// Called after event insertion. Failures are logged but do not block event storage.
-/// Uses `INSERT ... ON CONFLICT DO NOTHING` so duplicate inserts are silently skipped.
+/// This pool-owning wrapper propagates failures to its caller. Replacement writes
+/// use the transaction-bound helper below so event storage and mention indexing
+/// commit or roll back together. Duplicate inserts are silently skipped with
+/// `INSERT ... ON CONFLICT DO NOTHING`.
 pub async fn insert_mentions(
     pool: &PgPool,
     community_id: CommunityId,
@@ -328,7 +303,7 @@ pub(crate) mod route_proof {
         }
     }
 }
-pub(crate) use route_proof::ChannelScoped;
+use route_proof::ChannelScoped;
 
 /// The predicate one routed read must satisfy (see [`Db::route_read`]).
 ///
@@ -479,6 +454,16 @@ pub struct DbConfig {
     /// than the staleness gate never routes anyway, so a larger budget
     /// would only misrepresent the config.
     pub replica_read_max_age_ms: u64,
+    /// Session `lock_timeout` in milliseconds for writer connections (env
+    /// `BUZZ_DB_LOCK_TIMEOUT_MS`). `0` disables the timeout.
+    pub lock_timeout_ms: u64,
+    /// Session `idle_in_transaction_session_timeout` in milliseconds for
+    /// writer connections (env `BUZZ_DB_IDLE_TXN_TIMEOUT_MS`). `0` disables.
+    pub idle_txn_timeout_ms: u64,
+    /// Session `statement_timeout` in milliseconds for writer connections
+    /// (env `BUZZ_DB_STATEMENT_TIMEOUT_MS`). `0` disables it and is the
+    /// default because migrations and backfills may legitimately run long.
+    pub statement_timeout_ms: u64,
 }
 
 impl Default for DbConfig {
@@ -496,7 +481,44 @@ impl Default for DbConfig {
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
             replica_read_max_age_ms: 0,
+            lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
+            idle_txn_timeout_ms: DEFAULT_IDLE_TXN_TIMEOUT_MS,
+            statement_timeout_ms: 0,
         }
+    }
+}
+
+/// Default writer `lock_timeout` in milliseconds.
+pub const DEFAULT_LOCK_TIMEOUT_MS: u64 = 5_000;
+
+/// Default writer `idle_in_transaction_session_timeout` in milliseconds.
+pub const DEFAULT_IDLE_TXN_TIMEOUT_MS: u64 = 60_000;
+
+impl DbConfig {
+    /// Overlay writer session timeouts from the shared `BUZZ_DB_*_TIMEOUT_MS`
+    /// environment variables. Missing or invalid values retain the existing
+    /// configuration; explicit zeroes pass through to disable a timeout.
+    ///
+    /// This belongs in `buzz-db` so relay, admin, deletion, and audit writers
+    /// share one policy. The separately deployed push gateway owns its own
+    /// database and session policy.
+    pub fn with_session_timeouts_from_env(mut self) -> Self {
+        fn parse(key: &str) -> Option<u64> {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        }
+
+        if let Some(value) = parse("BUZZ_DB_LOCK_TIMEOUT_MS") {
+            self.lock_timeout_ms = value;
+        }
+        if let Some(value) = parse("BUZZ_DB_IDLE_TXN_TIMEOUT_MS") {
+            self.idle_txn_timeout_ms = value;
+        }
+        if let Some(value) = parse("BUZZ_DB_STATEMENT_TIMEOUT_MS") {
+            self.statement_timeout_ms = value;
+        }
+        self
     }
 }
 
@@ -511,7 +533,7 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
-        let pool = Self::connect_pool(config, &config.database_url).await?;
+        let pool = Self::connect_writer_pool(config).await?;
         let read_max_connections = config
             .read_max_connections
             .unwrap_or(config.max_connections);
@@ -536,20 +558,44 @@ impl Db {
     /// SQLx stores one `after_connect` hook, so the floor guard and transaction
     /// isolation assertion must remain in this single closure. Registering a
     /// second hook replaces the first and silently disarms the floor trigger.
-    async fn connect_pool(config: &DbConfig, url: &str) -> Result<PgPool> {
+    /// Additional writer pools, including the relay audit pool, must use this
+    /// constructor so they inherit the timeout, floor-guard, and isolation
+    /// policy installed by [`Db::new`].
+    pub async fn connect_writer_pool(config: &DbConfig) -> Result<PgPool> {
+        let lock_timeout_ms = config.lock_timeout_ms;
+        let idle_txn_timeout_ms = config.idle_txn_timeout_ms;
+        let statement_timeout_ms = config.statement_timeout_ms;
         let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
-            .after_connect(|conn, _meta| {
+            .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     // `SET` cannot take bind parameters; `set_config` can.
                     sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
                         .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
                         .execute(&mut *conn)
                         .await?;
+                    // `lock_timeout` fails the waiting statement; it does not
+                    // cancel the holder. `idle_in_transaction_session_timeout`
+                    // reaps only holders idling inside an open transaction,
+                    // while actively executing holders are bounded only by
+                    // `statement_timeout` (off by default). Bare values are
+                    // milliseconds. Migration/schema-destruction connections
+                    // reset lock and statement timeouts before their intentional
+                    // long wait (see `with_exclusive_schema_destruction_lock`).
+                    sqlx::query(
+                        "SELECT set_config('lock_timeout', $1, false), \
+                                set_config('idle_in_transaction_session_timeout', $2, false), \
+                                set_config('statement_timeout', $3, false)",
+                    )
+                    .bind(lock_timeout_ms.to_string())
+                    .bind(idle_txn_timeout_ms.to_string())
+                    .bind(statement_timeout_ms.to_string())
+                    .execute(&mut *conn)
+                    .await?;
                     let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
                         .fetch_one(&mut *conn)
                         .await?;
@@ -564,7 +610,7 @@ impl Db {
                     Ok(())
                 })
             });
-        Ok(options.connect(url).await?)
+        Ok(options.connect(&config.database_url).await?)
     }
 
     /// Reader acquire timeout — deliberately far below the writer's
@@ -622,7 +668,7 @@ impl Db {
         };
         let aurora_identity = self.reader_aurora_identity.clone();
         tokio::spawn(async move {
-            match read_pool.acquire().await {
+            match observability::acquire(&read_pool, observability::PoolRole::Reader).await {
                 Ok(mut conn) => {
                     tracing::info!("read replica reachable at boot");
                     match replica_fence::reader_supports_aurora_identity(&mut conn).await {
@@ -764,7 +810,7 @@ impl Db {
         // `read_pool` separately would spend a second budget whenever the
         // capability is uncached — i.e. after a failed boot ping, which is
         // precisely the reader-unavailable case the bound must hold for.
-        let conn = match read_pool.acquire().await {
+        let conn = match observability::acquire(read_pool, observability::PoolRole::Reader).await {
             Ok(conn) => conn,
             Err(sqlx::Error::PoolTimedOut) => {
                 tracing::warn!("reader pool acquire timed out; routing to writer");
@@ -924,7 +970,11 @@ impl Db {
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        self.pool.begin().await.map_err(Into::into)
+        let connection =
+            observability::acquire(&self.pool, observability::PoolRole::Writer).await?;
+        sqlx::Transaction::begin(connection, None)
+            .await
+            .map_err(Into::into)
     }
 
     /// Insert an event while holding and validating an admitted serving-write

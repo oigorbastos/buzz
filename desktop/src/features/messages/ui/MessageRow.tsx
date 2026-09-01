@@ -1,6 +1,5 @@
 import * as React from "react";
 import { AlertTriangle } from "lucide-react";
-
 import {
   depthGuideActionsEqual,
   numberArrayEqual,
@@ -59,18 +58,18 @@ import {
 import { MessageTimestamp } from "./MessageTimestamp";
 import { SentFromThreadLine } from "./SentFromThreadLine";
 import { WaveMessageAttachment } from "./WaveMessageAttachment";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-
+import { getAgentAddressMentionPubkeys } from "@/features/messages/lib/agentAddressMention.mjs";
+import { getVisibleAgentAddressPubkeys } from "@/features/messages/lib/getVisibleAgentAddressPubkeys";
+import { MessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
+import { MessageStatusMetadata } from "./MessageStatusMetadata";
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
 const DiffMessageExpanded = React.lazy(() => import("./DiffMessageExpanded"));
-
 export type ThreadDepthGuideAction = {
   active?: boolean;
   depth: number;
   label: string;
   message: TimelineMessage;
 };
-
 export const MessageRow = React.memo(
   function MessageRow({
     channelId = null,
@@ -273,21 +272,34 @@ export const MessageRow = React.memo(
       (message.pubkey && isKnownAgentPubkey(message.pubkey))
         ? "bot"
         : message.role;
+    const isAuthorAgent =
+      message.isAgent === true || profilePopoverRole === "bot";
     const agentMentionPubkeysByName = React.useMemo(() => {
       if (!mentionPubkeysByName) {
         return undefined;
       }
-
       const values: Record<string, string> = {};
       for (const [name, pubkey] of Object.entries(mentionPubkeysByName)) {
         if (isKnownAgentPubkey(pubkey)) {
           values[name] = pubkey;
         }
       }
-
       return Object.keys(values).length > 0 ? values : undefined;
     }, [isKnownAgentPubkey, mentionPubkeysByName]);
-
+    const addressedAgentPubkeys = React.useMemo(() => {
+      return getVisibleAgentAddressPubkeys(
+        message.body,
+        getAgentAddressMentionPubkeys(message.tags).filter(isKnownAgentPubkey),
+        mentionPubkeysByName,
+      );
+    }, [isKnownAgentPubkey, mentionPubkeysByName, message.body, message.tags]);
+    const agentAddressPrefix =
+      addressedAgentPubkeys.length > 0 ? (
+        <MessageAgentAddressPrefix
+          profiles={profiles}
+          pubkeys={addressedAgentPubkeys}
+        />
+      ) : undefined;
     const imetaByUrl = React.useMemo(
       () => (message.tags ? parseImetaTags(message.tags) : undefined),
       [message.tags],
@@ -392,6 +404,7 @@ export const MessageRow = React.memo(
                   setExpandedDiffId(message.id);
                 }}
                 repoUrl={getTag("repo")}
+                searchQuery={searchQuery}
                 truncated={getTag("truncated") === "true"}
               />
             </React.Suspense>
@@ -415,6 +428,7 @@ export const MessageRow = React.memo(
                 fallbackText={waveMessage.fallbackText}
                 huddleMemberPubkeys={huddleMemberPubkeys}
                 huddleMemberPubkeysPending={huddleMemberPubkeysPending}
+                searchQuery={searchQuery}
               />
             );
           }
@@ -439,6 +453,7 @@ export const MessageRow = React.memo(
               messageId={message.id}
               linkPreviewsSuppressed={linkPreviewsSuppressed}
               linkPreviewTags={message.tags}
+              leadingInlineContent={agentAddressPrefix}
               onRemoveLinkPreviewsForEveryone={removeLinkPreviewsForEveryone}
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}
@@ -462,7 +477,9 @@ export const MessageRow = React.memo(
 
     const isThreadReplyLayout = layoutVariant === "thread-reply";
     const guideBleedRem = isThreadReplyLayout ? 0.25 : 0;
-    const avatarButtonRadiusClass = "rounded-full";
+    const avatarButtonRadiusClass = isAuthorAgent
+      ? "rounded-[30%]"
+      : "rounded-full";
 
     const showRespondToIndicator =
       message.respondTo === "anyone" || message.respondTo === "allowlist";
@@ -474,6 +491,7 @@ export const MessageRow = React.memo(
           avatarUrl={message.avatarUrl ?? null}
           className="shrink-0"
           displayName={message.author}
+          shape={isAuthorAgent ? "squircle" : "circle"}
           testId="message-avatar"
         />
         {showRespondToIndicator &&
@@ -601,24 +619,10 @@ export const MessageRow = React.memo(
 
     const statusMetadataNode =
       message.pending || message.edited ? (
-        <>
-          {message.pending ? (
-            <p
-              className="font-normal text-muted-foreground/70"
-              data-testid="message-send-status"
-            >
-              Sending…
-            </p>
-          ) : null}
-          {message.edited ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <p className="text-muted-foreground/70">(edited)</p>
-              </TooltipTrigger>
-              <TooltipContent>This message has been edited</TooltipContent>
-            </Tooltip>
-          ) : null}
-        </>
+        <MessageStatusMetadata
+          edited={message.edited}
+          pending={message.pending}
+        />
       ) : null;
 
     const inlineMetadataNode = (
@@ -902,27 +906,13 @@ export const MessageRow = React.memo(
           data-testid="message-row"
           onAnimationEnd={handleEntranceAnimationEnd}
         >
-          {isThreadReplyLayout ? (
-            <>
-              {avatarGutterNode}
-              <div className="flex min-w-0 flex-1 flex-col">
-                {headerNode}
-                <div className={bodyContainerClass} data-testid="message-body">
-                  {messageBodyNode}
-                </div>
-              </div>
-            </>
-          ) : (
-            <>
-              {avatarGutterNode}
-              <div className="flex min-w-0 flex-1 flex-col">
-                {headerNode}
-                <div className={bodyContainerClass} data-testid="message-body">
-                  {messageBodyNode}
-                </div>
-              </div>
-            </>
-          )}
+          {avatarGutterNode}
+          <div className="flex min-w-0 flex-1 flex-col">
+            {headerNode}
+            <div className={bodyContainerClass} data-testid="message-body">
+              {messageBodyNode}
+            </div>
+          </div>
           {actionBarNode}
         </article>
       </div>

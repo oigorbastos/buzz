@@ -9,10 +9,7 @@ import {
   VideoReviewTimecodeChip,
 } from "@/shared/ui/VideoReviewTimecodeButton";
 
-type VideoReviewCommentMarkdownProps = Omit<
-  MarkdownProps,
-  "leadingInlineContent"
-> & {
+type VideoReviewCommentMarkdownProps = MarkdownProps & {
   videoReviewCommentRootId?: string;
 };
 
@@ -20,6 +17,7 @@ type VideoReviewCommentMarkdownProps = Omit<
 export function VideoReviewCommentMarkdown({
   content,
   interactive = true,
+  leadingInlineContent: suppliedLeadingInlineContent,
   onToggleTask,
   videoReviewCommentRootId,
   ...markdownProps
@@ -48,7 +46,7 @@ export function VideoReviewCommentMarkdown({
     [onToggleTask, reviewTimecode?.sourceLineOffset],
   );
   const leadingInlineContent = React.useMemo(() => {
-    if (!reviewTimecode) return undefined;
+    if (!reviewTimecode) return suppliedLeadingInlineContent;
 
     const timecode =
       interactive && openVideoReviewAt ? (
@@ -63,24 +61,24 @@ export function VideoReviewCommentMarkdown({
           timecode={reviewTimecode.timecode}
         />
       );
-    return <>{timecode} </>;
-  }, [handleTimecodeClick, interactive, openVideoReviewAt, reviewTimecode]);
-
-  if (!reviewTimecode) {
     return (
-      <Markdown
-        {...markdownProps}
-        content={content}
-        interactive={interactive}
-        onToggleTask={onToggleTask}
-      />
+      <>
+        {suppliedLeadingInlineContent}
+        {timecode}{" "}
+      </>
     );
-  }
+  }, [
+    handleTimecodeClick,
+    interactive,
+    openVideoReviewAt,
+    reviewTimecode,
+    suppliedLeadingInlineContent,
+  ]);
 
   return (
     <Markdown
       {...markdownProps}
-      content={reviewTimecode.text || "\u200B"}
+      content={reviewTimecode ? reviewTimecode.text || "\u200B" : content}
       interactive={interactive}
       leadingInlineContent={leadingInlineContent}
       onToggleTask={onToggleTask ? handleToggleTask : undefined}

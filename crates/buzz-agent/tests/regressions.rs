@@ -5,358 +5,16 @@
 //!   - cancellation leaves history valid for the next prompt
 //!   - empty-content assistant turn doesn't poison OpenAI history
 
-use std::collections::VecDeque;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 
-struct CapturingLlm {
-    url: String,
-    captured: Arc<Mutex<Vec<Value>>>,
-}
-
-async fn spawn_capturing_llm(responses: Vec<Value>) -> CapturingLlm {
-    spawn_capturing_llm_with_status(responses.into_iter().map(|v| (200u16, v)).collect()).await
-}
-
-/// A release valve the fake provider waits on before answering one chosen
-/// request, so a test can pin an event to a point *inside* a turn rather than
-/// racing it.
-///
-/// A `watch` rather than a `Notify`: the test may open the gate before the
-/// server task reaches its wait, and a `watch` receiver reads the current value
-/// first, so an early open is remembered instead of lost.
-struct ResponseGate(tokio::sync::watch::Sender<bool>);
-
-impl ResponseGate {
-    /// Let the withheld response through. Idempotent.
-    fn open(&self) {
-        let _ = self.0.send(true);
-    }
-}
-
-/// Like `spawn_capturing_llm`, but the response to request `gate_index`
-/// (0-based, counted across the whole session) is withheld until the returned
-/// [`ResponseGate`] is opened. The request is still captured immediately, so
-/// the agent parks mid-turn — exactly where a test needs the turn to sit still.
-async fn spawn_capturing_llm_gated(
-    responses: Vec<Value>,
-    gate_index: usize,
-) -> (CapturingLlm, ResponseGate) {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let llm = spawn_capturing_llm_with_status_gated(
-        responses.into_iter().map(|v| (200u16, v)).collect(),
-        Some((gate_index, rx)),
-    )
-    .await;
-    (llm, ResponseGate(tx))
-}
-
-/// Like `spawn_capturing_llm` but each canned response carries its own HTTP
-/// status, so a test can serve a real provider rejection (e.g. a context-window
-/// 400) instead of only success bodies.
-async fn spawn_capturing_llm_with_status(responses: Vec<(u16, Value)>) -> CapturingLlm {
-    spawn_capturing_llm_with_status_gated(responses, None).await
-}
-
-async fn spawn_capturing_llm_with_status_gated(
-    responses: Vec<(u16, Value)>,
-    gate: Option<(usize, tokio::sync::watch::Receiver<bool>)>,
-) -> CapturingLlm {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
-    let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let cap2 = captured.clone();
-    // The agent issues one request at a time, so a plain counter is enough to
-    // name "the Nth request of the session".
-    let seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            let queue = queue.clone();
-            let captured = cap2.clone();
-            let gate = gate.clone();
-            let seq = seq.clone();
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 8192];
-                // Read until headers complete.
-                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match sock.read(&mut tmp).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                    }
-                    if buf.len() > 4_000_000 {
-                        return;
-                    }
-                }
-                // Parse Content-Length and read body.
-                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-                let headers = &buf[..header_end];
-                let mut body_len = 0usize;
-                for line in headers.split(|b| *b == b'\n') {
-                    let line = std::str::from_utf8(line).unwrap_or("");
-                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        body_len = rest.trim().trim_end_matches('\r').parse().unwrap_or(0);
-                    }
-                }
-                while buf.len() < header_end + body_len {
-                    match sock.read(&mut tmp).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                    }
-                }
-                if let Ok(req) = serde_json::from_slice::<Value>(&buf[header_end..]) {
-                    captured.lock().await.push(req);
-                }
-                // Hold this response if it is the gated one, so the turn parks
-                // here until the test says to let it go.
-                let idx = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Some((gate_index, mut open)) = gate {
-                    if idx == gate_index {
-                        while !*open.borrow() {
-                            if open.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let (status, body) = queue
-                    .lock()
-                    .await
-                    .pop_front()
-                    .unwrap_or_else(|| (200, json!({ "error": "no canned response" })));
-                let body_s = serde_json::to_string(&body).unwrap();
-                let reason = match status {
-                    200 => "OK",
-                    400 => "Bad Request",
-                    _ => "Error",
-                };
-                let resp = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body_s.len(), body_s,
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            });
-        }
-    });
-    CapturingLlm { url, captured }
-}
-
-/// How long a stderr assertion may wait for the log line it is about.
-///
-/// Scheduler-scale, not work-scale: by the time the response a log line
-/// precedes has been read off stdout, that line is already sitting in the
-/// stderr pipe — this only has to cover how long the pump task takes to be
-/// polled and drain it. Generous anyway, because overshooting costs nothing: a
-/// line that never arrives still fails the caller's `assert!`, just 5s later.
-const STDERR_SETTLE: Duration = Duration::from_secs(5);
-
-/// How long the harness lets an MCP server finish `initialize` + `tools/list`.
-///
-/// Work-scale, not scheduler-scale — the opposite of [`STDERR_SETTLE`].
-/// `spawn_one` puts this one bound on both stages, and
-/// `tool_metadata_caps_enforced` deliberately makes the second stage
-/// expensive: 200 tools x 100 KB of description is ~20 MB of JSON to
-/// serialize, push through a pipe, and parse back. That is ~0.7s on an idle
-/// box, so the 2s this used to be left barely 3x of headroom — and lost it
-/// routinely once the CPUs were busy: 14 of 40 rounds at `--test-threads 16`
-/// against saturated cores. Timing that same `session/new` over 40 such
-/// rounds put the median at 1.8s and the worst case at 3.1s, i.e. the old
-/// bound cut straight through the middle of the distribution.
-///
-/// Nothing asserts this bound except `mcp_init_timeout_kills_child`, which
-/// hangs `initialize` on purpose and opts back down to
-/// [`MCP_INIT_TIMEOUT_HANG_SECS`] locally. Everywhere else it is pure
-/// impatience, and firing it does not make a test stricter — it makes it
-/// wrong: `session/new` comes back an error, so a test written to check
-/// metadata *caps* never reaches a single cap assertion.
-///
-/// Generous, because overshooting costs nothing: an MCP server that never
-/// answers still fails the test, just later. Kept under the 15s
-/// [`Harness::recv`] deadline so that failure is still the agent's own
-/// "timeout after 10s" rather than an opaque "recv timeout".
-const MCP_INIT_TIMEOUT_SECS: &str = "10";
-
-/// The short budget for the one test that asserts the init timeout *fires*.
-///
-/// `mcp_init_timeout_kills_child` hangs `initialize` forever, so this is how
-/// long it sits there before the agent gives up; it then asserts the round
-/// trip took under 8s, which this has to stay comfortably below.
-const MCP_INIT_TIMEOUT_HANG_SECS: &str = "2";
-
-struct Harness {
-    child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
-    stderr: Arc<StdMutex<String>>,
-    next_id: i64,
-}
-
-impl Harness {
-    async fn spawn_with_env(base_url: &str, extra: &[(&str, &str)]) -> Self {
-        let bin = env!("CARGO_BIN_EXE_buzz-agent");
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.env("BUZZ_AGENT_PROVIDER", "openai")
-            .env("OPENAI_COMPAT_API_KEY", "test")
-            .env("OPENAI_COMPAT_MODEL", "fake-model")
-            .env("OPENAI_COMPAT_BASE_URL", base_url)
-            .env("BUZZ_AGENT_LLM_TIMEOUT_SECS", "5")
-            .env("BUZZ_AGENT_TOOL_TIMEOUT_SECS", "5")
-            .env("BUZZ_AGENT_MAX_ROUNDS", "8")
-            .env("BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS", MCP_INIT_TIMEOUT_SECS);
-        for (k, v) in extra {
-            cmd.env(k, v);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().expect("spawn buzz-agent");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let stderr = child.stderr.take().unwrap();
-        let stderr_buf = Arc::new(StdMutex::new(String::new()));
-        let stderr_out = Arc::clone(&stderr_buf);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = match reader.read_line(&mut line).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut out) = stderr_out.lock() {
-                    out.push_str(&line);
-                }
-            }
-        });
-        Self {
-            child,
-            stdin,
-            stdout,
-            stderr: stderr_buf,
-            next_id: 1,
-        }
-    }
-
-    async fn spawn(base_url: &str) -> Self {
-        Self::spawn_with_env(base_url, &[]).await
-    }
-
-    async fn send(&mut self, method: &str, params: Value) -> i64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await;
-        id
-    }
-
-    async fn notify(&mut self, method: &str, params: Value) {
-        self.write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-            .await;
-    }
-
-    async fn write(&mut self, msg: Value) {
-        let mut s = serde_json::to_string(&msg).unwrap();
-        s.push('\n');
-        self.stdin.write_all(s.as_bytes()).await.unwrap();
-        self.stdin.flush().await.unwrap();
-    }
-
-    async fn recv(&mut self) -> Value {
-        let mut line = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(15), self.stdout.read_line(&mut line))
-            .await
-            .expect("recv timeout")
-            .expect("read line");
-        assert!(n > 0, "agent EOF");
-        serde_json::from_str(&line).expect("non-JSON line")
-    }
-
-    async fn recv_until<F: FnMut(&Value) -> bool>(&mut self, mut pred: F) -> Value {
-        loop {
-            let v = self.recv().await;
-            if pred(&v) {
-                return v;
-            }
-        }
-    }
-
-    async fn shutdown(mut self) {
-        drop(self.stdin);
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
-        let _ = self.child.start_kill();
-    }
-
-    /// Whatever the pump task has drained from the child's stderr *so far*.
-    ///
-    /// Fine for failure messages, and for asserting a line is ABSENT. For
-    /// asserting a line is PRESENT, use [`Harness::stderr_containing`] or
-    /// [`Harness::stderr_when`] — a bare snapshot is a race.
-    fn stderr_text(&self) -> String {
-        self.stderr.lock().map(|s| s.clone()).unwrap_or_default()
-    }
-
-    /// Wait (up to [`STDERR_SETTLE`]) for the captured stderr to satisfy
-    /// `ready`, then return that capture — settled or not, so the caller's own
-    /// `assert!` is still what fails, with its own message and the full text.
-    ///
-    /// Stderr arrives over a different pipe than the JSON-RPC responses on
-    /// stdout, drained by a separate task. A line the agent logged *before* the
-    /// response it produced can therefore still be undrained when that response
-    /// is read, so asserting on [`Harness::stderr_text`] straight after
-    /// `recv_until` only passes because the pump happened to be polled in time.
-    /// Under heavy CPU contention — a fully parallel `cargo test --workspace`
-    /// — it loses that coin flip and a correct agent looks like a broken one.
-    /// So poll for the line, the same way `recv_until` waits on stdout.
-    ///
-    /// The pump appends in pipe order, which is emission order, so anything the
-    /// agent logged *before* the line waited on is also present in the returned
-    /// text. That makes corroborating assertions on earlier lines (counting
-    /// rungs, checking a preceding WARN) safe against the same race.
-    async fn stderr_when<F: FnMut(&str) -> bool>(&self, mut ready: F) -> String {
-        let deadline = Instant::now() + STDERR_SETTLE;
-        loop {
-            let text = self.stderr_text();
-            if ready(&text) || Instant::now() >= deadline {
-                return text;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// [`Harness::stderr_when`] for the common case: wait for one line to show
-    /// up, then hand back the whole capture to assert against.
-    async fn stderr_containing(&self, needle: &str) -> String {
-        self.stderr_when(|text| text.contains(needle)).await
-    }
-}
-
-fn openai_text(content: &str) -> Value {
-    json!({
-        "id": "cc-1", "object": "chat.completion", "model": "fake-model",
-        "choices": [{
-            "index": 0,
-            "message": { "role": "assistant", "content": content },
-            "finish_reason": "stop",
-        }],
-    })
-}
+mod common;
+use common::{
+    approve_permission, openai_text, openai_tool_call, spawn_capturing_llm,
+    spawn_capturing_llm_gated, spawn_capturing_llm_with_status, Harness,
+};
 
 /// Like [`openai_text`] but attaches a `usage` block so tests can drive the
 /// token-based handoff gate. `prompt_tokens` is the input-token count the
@@ -388,23 +46,6 @@ fn openai_max_tokens(content: &str, tool_calls: Value) -> Value {
             "completion_tokens": 100,
             "total_tokens": 110,
         },
-    })
-}
-
-fn openai_tool_call(id: &str, name: &str, args: Value) -> Value {
-    json!({
-        "id": "cc-2", "object": "chat.completion", "model": "fake-model",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant", "content": null,
-                "tool_calls": [{
-                    "id": id, "type": "function",
-                    "function": { "name": name, "arguments": args.to_string() },
-                }],
-            },
-            "finish_reason": "tool_calls",
-        }],
     })
 }
 
@@ -474,22 +115,14 @@ async fn assistant_text_preserved_across_prompts() {
 /// MCP init that hangs forever must time out, surface an error, and the child
 /// process must be killed (not lingering).
 ///
-/// The only test that asserts the init timeout *fires*, so it is the only one
-/// that wants it short — hence the local [`MCP_INIT_TIMEOUT_HANG_SECS`]
-/// instead of the harness default. Nothing here is racing real work: the fake
-/// server never answers `initialize` at all, so no amount of CPU contention
-/// can make this bound legitimately overrun.
+/// The common harness uses a generous initialization default for real metadata
+/// responses; this is the one test that intentionally overrides it with a
+/// short budget because its fake server never answers `initialize`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_init_timeout_kills_child() {
     let llm = spawn_capturing_llm(vec![]).await;
-    let mut h = Harness::spawn_with_env(
-        &llm.url,
-        &[(
-            "BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS",
-            MCP_INIT_TIMEOUT_HANG_SECS,
-        )],
-    )
-    .await;
+    let mut h =
+        Harness::spawn_with_env(&llm.url, &[("BUZZ_AGENT_MCP_INIT_TIMEOUT_SECS", "2")]).await;
 
     let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
     h.send(
@@ -827,13 +460,7 @@ async fn per_turn_tool_call_cap_enforced() {
     loop {
         let v = h.recv().await;
         if v.get("method") == Some(&json!("session/request_permission")) {
-            let id = v["id"].clone();
-            h.write(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } },
-            }))
-            .await;
+            h.write(approve_permission(&v)).await;
             continue;
         }
         if v.get("method") == Some(&json!("session/update"))
@@ -1009,7 +636,7 @@ async fn hook_stop_blocks_premature_end() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
         )
         .await;
-    let r = h.recv_until(|v| v["id"] == json!(p)).await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
     assert!(r.get("result").is_some(), "errored: {r}");
     assert_eq!(r["result"]["stopReason"], "end_turn");
 
@@ -1087,7 +714,7 @@ async fn hook_stop_budget_exhausted() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
         )
         .await;
-    let r = h.recv_until(|v| v["id"] == json!(p)).await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
     assert!(r.get("result").is_some(), "errored: {r}");
     assert_eq!(r["result"]["stopReason"], "end_turn");
 
@@ -1668,7 +1295,7 @@ async fn stale_usage_plus_history_growth_triggers_handoff() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
         )
         .await;
-    let _ = h.recv_until(|v| v["id"] == json!(p)).await;
+    let _ = h.recv_until_approving(|v| v["id"] == json!(p)).await;
     // req1 (tool_call) + summarize (handoff) + req2 (done) = 3. Without the
     // growth estimate we'd see only 2 (stale 8500 < 9000, no handoff).
     let captured = llm.captured.lock().await.len();
@@ -1939,7 +1566,7 @@ async fn cancel_sends_notifications_cancelled_to_any_mcp_server() {
         .await;
 
     // Wait for tool call to be in-progress.
-    h.recv_until(|v| {
+    h.recv_until_approving(|v| {
         v.get("params")
             .and_then(|p| p.get("update"))
             .and_then(|u| u.get("status"))
@@ -2054,13 +1681,7 @@ async fn prompt_to_completion(h: &mut Harness, sid: &str) -> Value {
     loop {
         let v = h.recv().await;
         if v.get("method") == Some(&json!("session/request_permission")) {
-            let id = v["id"].clone();
-            h.write(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } },
-            }))
-            .await;
+            h.write(approve_permission(&v)).await;
             continue;
         }
         if v["id"] == json!(p) {
@@ -2817,7 +2438,9 @@ async fn max_tokens_recovery_can_proceed_to_tool_call() {
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
         )
         .await;
-    let reply = h.recv_until(|v| v["id"] == json!(prompt_id)).await;
+    let reply = h
+        .recv_until_approving(|v| v["id"] == json!(prompt_id))
+        .await;
     assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
     let requests = llm.captured.lock().await;
     assert_eq!(requests.len(), 3);
@@ -3501,9 +3124,8 @@ async fn reactive_reset_clears_usage_baseline_so_the_gate_is_not_blind() {
     .await
     .expect("turn 2 must return");
     assert!(r1.get("error").is_none(), "turn 2 should recover: {r1}");
-    // Both lines, not just the WARN: the count below is the baseline for turn
-    // 3's delta, so it must be read after turn 2's own `handoff #` line lands
-    // — otherwise a baseline of 0 makes the delta assertion vacuous.
+    // The count below is the baseline for turn 3's delta, so wait for both
+    // the reactive warning and turn 2's handoff line before capturing it.
     let stderr = h
         .stderr_when(|text| {
             text.contains("provider reported context overflow; forcing handoff")
@@ -3531,9 +3153,8 @@ async fn reactive_reset_clears_usage_baseline_so_the_gate_is_not_blind() {
     .await
     .expect("turn 3 must return");
     assert!(r2.get("error").is_none(), "turn 3 should succeed: {r2}");
-    // Waiting for the count to grow is not circular: if turn 3 genuinely fails
-    // to hand off, no new line ever appears, the wait runs out, and the
-    // assertion below fails exactly as it should — just [`STDERR_SETTLE`] later.
+    // If turn 3 fails to hand off, this wait returns its final capture and the
+    // delta assertion below fails; it does not turn absence into success.
     let stderr = h
         .stderr_when(|text| text.matches("handoff #").count() > handoffs_after_turn2)
         .await;
@@ -3696,23 +3317,9 @@ async fn handoff_cap_binds_within_a_single_turn() {
         });
         v
     };
-    // Turn 2 round 0's tool-call response — request index 2, counting turn 1's
-    // seed — is withheld until the steer below has been accepted.
-    //
-    // The same race as `steer_folds_into_active_turn_without_cancelling` in
-    // fake_llm.rs, an order of magnitude slower. The steer has to be queued
-    // before round 1's `drain_steers()`, and nothing made that true except
-    // this turn being long: a summarize call, then a tool call. Long is not
-    // ordered, and under load the turn still won — 4 of 40 runs finished turn
-    // 2 before the steer was processed at all, so the loop below broke on the
-    // prompt result with `steer_accepted` still false.
-    //
-    // Parking the turn inside round 0's provider call fixes the order rather
-    // than lengthening the odds. `steer_session` queues the blocks *before* it
-    // replies, so once the reply that opens this gate has been read, the steer
-    // is already in the queue round 1 drains. Nothing the test proves changes:
-    // the steer still lands before round 1, which is exactly where it has to
-    // be for the cap — not the steer path — to be what blocks the handoff.
+    // The turn-2 tool response is withheld until the steer has been accepted.
+    // This pins the steer before round 1 drains it instead of relying on load-
+    // dependent timing to make a sufficiently long turn.
     let (llm, round0_tool_call) = spawn_capturing_llm_gated(
         vec![
             openai_text_with_usage("seed", 950), // turn 1: seed high usage
@@ -3823,19 +3430,14 @@ async fn handoff_cap_binds_within_a_single_turn() {
                 "steer must reference the live run id"
             );
             steer_accepted = true;
-            // Queued for sure now — let round 0 finish so round 1 folds it in.
+            // The steer is queued now, so let round 0 finish and round 1 fold
+            // it in while the handoff cap remains the condition under test.
             round0_tool_call.open();
             continue;
         }
 
         if v.get("method") == Some(&json!("session/request_permission")) {
-            let id = v["id"].clone();
-            h.write(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } },
-            }))
-            .await;
+            h.write(approve_permission(&v)).await;
             continue;
         }
         if v["id"] == json!(p2) {
@@ -3982,13 +3584,7 @@ async fn failed_summarize_burns_handoff_attempt_budget() {
     loop {
         let v = h.recv().await;
         if v.get("method") == Some(&json!("session/request_permission")) {
-            let id = v["id"].clone();
-            h.write(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } },
-            }))
-            .await;
+            h.write(approve_permission(&v)).await;
             continue;
         }
         if v["id"] == json!(p2) {
@@ -3997,8 +3593,8 @@ async fn failed_summarize_burns_handoff_attempt_budget() {
         }
     }
 
-    // Anchored on the LATER of the two lines (round 1's cap WARN): the round-0
-    // summarize-failure WARN precedes it, so one wait settles both assertions.
+    // The cap warning is emitted after the failed-summarize warning, so this
+    // single wait settles both assertions.
     let stderr = h.stderr_containing("handoff cap reached").await;
     // Round 0: the failed summarize should warn about the failure.
     assert!(

@@ -1,10 +1,15 @@
-//! Community allowlist persistence.
+//! Community-scoped authentication allowlist persistence.
+//!
+//! This store is distinct from NIP-43 relay membership. Membership backfill
+//! orchestration remains with the relay-membership invariant owner.
 
-use crate::{Db, Result};
 use buzz_core::CommunityId;
 use buzz_datastore_tracing::datastore_span;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
+
+use crate::error::Result;
+use crate::Db;
 
 /// An entry in the pubkey allowlist.
 #[derive(Debug, Clone)]
@@ -104,5 +109,101 @@ impl Db {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
+
+    async fn setup_db() -> Db {
+        let database_url =
+            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect to test DB");
+        Db::from_pool(pool)
+    }
+
+    async fn make_community(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let host = format!("communities-of-channels-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(host)
+            .execute(pool)
+            .await
+            .expect("insert community");
+        id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn allowlist_is_scoped_to_community() {
+        let db = setup_db().await;
+        let community_a = CommunityId::from_uuid(make_community(&db.pool).await);
+        let community_b = CommunityId::from_uuid(make_community(&db.pool).await);
+        let pubkey = [7u8; 32];
+        let added_by = [9u8; 32];
+
+        assert!(db
+            .add_to_allowlist(community_a, &pubkey, &added_by, Some("a-only"))
+            .await
+            .expect("add allowlist row"));
+        assert!(!db
+            .add_to_allowlist(community_a, &pubkey, &added_by, Some("duplicate"))
+            .await
+            .expect("duplicate allowlist row is idempotent"));
+
+        assert!(
+            db.is_pubkey_allowed(community_a, &pubkey)
+                .await
+                .expect("allowlist check A"),
+            "pubkey added to A must be allowed in A"
+        );
+        assert!(
+            !db.is_pubkey_allowed(community_b, &pubkey)
+                .await
+                .expect("allowlist check B"),
+            "pubkey added only to A must not be allowed in B"
+        );
+        assert!(db
+            .has_allowlist_entries(community_a)
+            .await
+            .expect("A has entries"));
+        assert!(!db
+            .has_allowlist_entries(community_b)
+            .await
+            .expect("B has no entries"));
+
+        let listed = db
+            .list_allowlist(community_a)
+            .await
+            .expect("list A allowlist");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].pubkey, pubkey);
+
+        assert!(
+            !db.remove_from_allowlist(community_b, &pubkey)
+                .await
+                .expect("remove from B is no-op"),
+            "removing from B must not delete A's row"
+        );
+        assert!(db
+            .is_pubkey_allowed(community_a, &pubkey)
+            .await
+            .expect("A still allowed after B remove"));
+        assert!(db
+            .remove_from_allowlist(community_a, &pubkey)
+            .await
+            .expect("remove from A"));
+        assert!(!db
+            .is_pubkey_allowed(community_a, &pubkey)
+            .await
+            .expect("A not allowed after remove"));
     }
 }

@@ -11,6 +11,8 @@ use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::Db;
+use buzz_datastore_tracing::datastore_span;
 
 /// Namespace for the per-community push-gate advisory lock. Must match the
 /// key built inside the `enqueue_push_match_job` trigger (migration 0023):
@@ -25,10 +27,13 @@ async fn acquire_push_gate_lock(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community: CommunityId,
 ) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("{PUSH_GATE_LOCK_NAMESPACE}{}", community.as_uuid()))
-        .execute(&mut **tx)
-        .await?;
+    crate::observability::observe_advisory_lock(
+        crate::observability::LockType::PushGate,
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{PUSH_GATE_LOCK_NAMESPACE}{}", community.as_uuid()))
+            .execute(&mut **tx),
+    )
+    .await?;
     Ok(())
 }
 
@@ -54,7 +59,7 @@ async fn backfill_push_match_jobs(
         "INSERT INTO push_match_queue (community_id, event_id) \
          SELECT community_id, id FROM events \
          WHERE community_id = $1 \
-           AND kind IN (7, 9, 1059, 40007, 46010) \
+           AND kind IN (9, 40002, 45001, 45003) \
            AND deleted_at IS NULL \
            AND received_at > now() - make_interval(secs => $2) \
          ON CONFLICT DO NOTHING",
@@ -157,6 +162,8 @@ pub struct ClaimedWake {
     pub class: String,
     /// Delivery deadline, in Unix seconds.
     pub expires_at: i64,
+    /// Time this durable wake entered the relay outbox.
+    pub queued_at: DateTime<Utc>,
     /// Attempt number, starting at one for the first claim.
     pub attempt: i32,
 }
@@ -220,24 +227,42 @@ pub async fn accept_lease_event(
     max_active_leases: i64,
 ) -> Result<AcceptLeaseOutcome> {
     let author = event.pubkey.as_bytes();
-    let mut tx = pool.begin().await?;
+    let (mut tx, transaction_timer) = crate::observability::begin_transaction(
+        pool,
+        crate::observability::TransactionOperation::AcceptPushLeaseEvent,
+    )
+    .await?;
+    transaction_timer
+        .observe(async {
     let mut address_lock = Vec::with_capacity(16 + author.len() + installation_id.len());
     address_lock.extend_from_slice(community.as_uuid().as_bytes());
     address_lock.extend_from_slice(author);
     address_lock.extend_from_slice(installation_id.as_bytes());
-    let address_lock = i64::from_le_bytes(Sha256::digest(&address_lock)[..8].try_into().unwrap());
+    let address_digest = Sha256::digest(&address_lock);
+    let mut address_lock_bytes = [0_u8; 8];
+    address_lock_bytes.copy_from_slice(&address_digest[..8]);
+    let address_lock = i64::from_le_bytes(address_lock_bytes);
     let mut author_lock = Vec::with_capacity(16 + author.len());
     author_lock.extend_from_slice(community.as_uuid().as_bytes());
     author_lock.extend_from_slice(author);
-    let author_lock = i64::from_le_bytes(Sha256::digest(&author_lock)[..8].try_into().unwrap());
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(address_lock)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(author_lock)
-        .execute(&mut *tx)
-        .await?;
+    let author_digest = Sha256::digest(&author_lock);
+    let mut author_lock_bytes = [0_u8; 8];
+    author_lock_bytes.copy_from_slice(&author_digest[..8]);
+    let author_lock = i64::from_le_bytes(author_lock_bytes);
+    crate::observability::observe_advisory_lock(
+        crate::observability::LockType::PushGate,
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(address_lock)
+            .execute(&mut *tx),
+    )
+    .await?;
+    crate::observability::observe_advisory_lock(
+        crate::observability::LockType::PushGate,
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(author_lock)
+            .execute(&mut *tx),
+    )
+    .await?;
     // T1b: an activation can flip the community from "no eligible lease" to
     // "eligible", so it must serialize against the trigger's shared gate lock.
     // Acquired after the address/author locks to keep one global lock order.
@@ -392,6 +417,8 @@ pub async fn accept_lease_event(
     }
     tx.commit().await?;
     Ok(AcceptLeaseOutcome::Accepted)
+        })
+        .await
 }
 
 fn constraint_acceptance_outcome(error: &sqlx::Error) -> Option<AcceptLeaseOutcome> {
@@ -597,10 +624,10 @@ pub async fn enqueue_wake(
         }],
     )
     .await?;
-    Ok(outcomes
+    outcomes
         .into_iter()
         .next()
-        .expect("one outcome per request"))
+        .ok_or_else(|| crate::DbError::InvalidData("missing wake enqueue outcome".into()))
 }
 
 /// Set-wise counterpart of [`enqueue_wake`]: one transaction and a constant
@@ -1066,7 +1093,8 @@ pub async fn claim_due_wakes(
           AND l.endpoint_hash = o.endpoint_hash
         RETURNING o.community_id, o.id, o.claim_id, o.event_id, c.channel_id,
                   o.author, o.installation_id, o.lease_generation,
-                  l.endpoint_grant, o.class, o.expires_at, o.attempts
+                  l.endpoint_grant, o.class, o.expires_at, o.created_at AS queued_at,
+                  o.attempts
         "#,
     )
     .bind(community.as_uuid())
@@ -1094,7 +1122,8 @@ pub async fn revalidate_wake_for_send(
         r#"
         SELECT o.community_id, o.id, o.claim_id, o.event_id, e.channel_id,
                o.author, o.installation_id, o.lease_generation,
-               l.endpoint_grant, o.class, o.expires_at, o.attempts
+               l.endpoint_grant, o.class, o.expires_at, o.created_at AS queued_at,
+               o.attempts
         FROM push_wake_outbox o
         JOIN push_leases l
           ON l.community_id = o.community_id
@@ -1257,8 +1286,180 @@ fn row_to_claimed_wake(row: sqlx::postgres::PgRow) -> Result<ClaimedWake> {
         endpoint_grant: row.try_get("endpoint_grant")?,
         class: row.try_get("class")?,
         expires_at: row.try_get("expires_at")?,
+        queued_at: row.try_get("queued_at")?,
         attempt: row.try_get("attempts")?,
     })
+}
+
+impl Db {
+    /// Exclusively claim a batch of due matcher jobs from one community.
+    #[datastore_span(name = "claim_due_push_match_batch", system = "postgresql")]
+    pub async fn claim_due_push_match_batch(
+        &self,
+        limit: i64,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Option<crate::push::ClaimedMatchBatch>> {
+        crate::push::claim_due_match_batch(&self.pool, limit, lease_until).await
+    }
+
+    /// Load active endpoint-enabled leases eligible for push matching.
+    #[datastore_span(name = "active_push_match_leases", system = "postgresql")]
+    pub async fn active_push_match_leases(
+        &self,
+        community: CommunityId,
+    ) -> Result<Vec<crate::push::MatchLease>> {
+        crate::push::active_match_leases(&self.pool, community).await
+    }
+
+    /// Complete matcher jobs from one claimed batch while the fence holds.
+    #[datastore_span(name = "complete_push_match_batch", system = "postgresql")]
+    pub async fn complete_push_match_batch(
+        &self,
+        community: CommunityId,
+        claim_id: uuid::Uuid,
+        event_ids: &[Vec<u8>],
+    ) -> Result<u64> {
+        crate::push::complete_match_batch(&self.pool, community, claim_id, event_ids).await
+    }
+
+    /// Release fenced matcher claims from one batch for retry.
+    #[datastore_span(name = "retry_push_match_batch", system = "postgresql")]
+    pub async fn retry_push_match_batch(
+        &self,
+        community: CommunityId,
+        claim_id: uuid::Uuid,
+        event_ids: &[Vec<u8>],
+        next: DateTime<Utc>,
+    ) -> Result<u64> {
+        crate::push::retry_match_batch(&self.pool, community, claim_id, event_ids, next).await
+    }
+
+    /// Delete exhausted matcher jobs (periodic sweep, off the claim path).
+    #[datastore_span(name = "reap_exhausted_push_matches", system = "postgresql")]
+    pub async fn reap_exhausted_push_matches(&self) -> Result<u64> {
+        crate::push::reap_exhausted_matches(&self.pool).await
+    }
+
+    /// Idempotently enqueue a wake for a matched lease and event.
+    #[datastore_span(name = "enqueue_push_wake", system = "postgresql")]
+    pub async fn enqueue_push_wake(
+        &self,
+        community: CommunityId,
+        author: &[u8],
+        installation_id: &str,
+        wake: crate::push::NewWake<'_>,
+    ) -> Result<crate::push::EnqueueWakeOutcome> {
+        crate::push::enqueue_wake(&self.pool, community, author, installation_id, wake).await
+    }
+
+    /// Set-wise [`Self::enqueue_push_wake`]: one transaction per batch.
+    #[datastore_span(name = "enqueue_push_wakes", system = "postgresql")]
+    pub async fn enqueue_push_wakes(
+        &self,
+        community: CommunityId,
+        requests: &[crate::push::WakeRequest],
+    ) -> Result<Vec<crate::push::EnqueueWakeOutcome>> {
+        crate::push::enqueue_wakes(&self.pool, community, requests).await
+    }
+
+    /// Exclusively claim due wake jobs for one community.
+    #[datastore_span(name = "claim_due_push_wakes", system = "postgresql")]
+    pub async fn claim_due_push_wakes(
+        &self,
+        community: CommunityId,
+        limit: i64,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Vec<crate::push::ClaimedWake>> {
+        crate::push::claim_due_wakes(&self.pool, community, limit, lease_until).await
+    }
+
+    /// Revalidate a wake's claim, source event, and current lease before send.
+    #[datastore_span(name = "revalidate_push_wake", system = "postgresql")]
+    pub async fn revalidate_push_wake(
+        &self,
+        community: CommunityId,
+        id: Uuid,
+        claim_id: Uuid,
+    ) -> Result<crate::push::RevalidateWakeOutcome> {
+        crate::push::revalidate_wake_for_send(&self.pool, community, id, claim_id).await
+    }
+
+    /// Mark a fenced wake claim delivered.
+    #[datastore_span(name = "complete_push_wake", system = "postgresql")]
+    pub async fn complete_push_wake(
+        &self,
+        community: CommunityId,
+        id: Uuid,
+        claim_id: Uuid,
+    ) -> Result<bool> {
+        crate::push::complete_wake(&self.pool, community, id, claim_id).await
+    }
+
+    /// Release a fenced wake claim for retry at the supplied time.
+    #[datastore_span(name = "retry_push_wake", system = "postgresql")]
+    pub async fn retry_push_wake(
+        &self,
+        community: CommunityId,
+        id: Uuid,
+        claim_id: Uuid,
+        next: DateTime<Utc>,
+    ) -> Result<bool> {
+        crate::push::retry_wake(&self.pool, community, id, claim_id, next).await
+    }
+
+    /// Mark a fenced wake claim terminally failed.
+    #[datastore_span(name = "fail_push_wake", system = "postgresql")]
+    pub async fn fail_push_wake(
+        &self,
+        community: CommunityId,
+        id: Uuid,
+        claim_id: Uuid,
+    ) -> Result<bool> {
+        crate::push::fail_wake(&self.pool, community, id, claim_id).await
+    }
+
+    /// Disable an endpoint only if the specified lease generation is current.
+    #[datastore_span(name = "disable_push_endpoint", system = "postgresql")]
+    pub async fn disable_push_endpoint(
+        &self,
+        community: CommunityId,
+        author: &[u8],
+        installation_id: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        crate::push::disable_endpoint_generation(
+            &self.pool,
+            community,
+            author,
+            installation_id,
+            generation,
+        )
+        .await
+    }
+
+    /// Atomically persist a validated kind:30350 event and its effective lease.
+    #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "accept_push_lease_event", system = "postgresql")]
+    pub async fn accept_push_lease_event(
+        &self,
+        community: CommunityId,
+        event: &nostr::Event,
+        installation_id: &str,
+        version: crate::push::LeaseVersion<'_>,
+        active: Option<crate::push::ActiveLease<'_>>,
+        max_active_leases: i64,
+    ) -> Result<crate::push::AcceptLeaseOutcome> {
+        crate::push::accept_lease_event(
+            &self.pool,
+            community,
+            event,
+            installation_id,
+            version,
+            active,
+            max_active_leases,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1271,7 +1472,7 @@ mod tests {
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into());
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into()); // sadscan:disable np.postgres.1 -- local test-only credentials
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");
@@ -2507,180 +2708,5 @@ mod tests {
         .await
         .expect("count queue rows per event");
         assert!(per_event.iter().all(|count| *count == 1));
-    }
-}
-
-// Db facade methods moved from the runtime module.
-use crate::{push, Db};
-use buzz_datastore_tracing::datastore_span;
-
-impl Db {
-    /// Exclusively claim a batch of due matcher jobs from one community.
-    #[datastore_span(name = "claim_due_push_match_batch", system = "postgresql")]
-    pub async fn claim_due_push_match_batch(
-        &self,
-        limit: i64,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Option<push::ClaimedMatchBatch>> {
-        push::claim_due_match_batch(&self.pool, limit, lease_until).await
-    }
-
-    /// Load active endpoint-enabled leases eligible for push matching.
-    #[datastore_span(name = "active_push_match_leases", system = "postgresql")]
-    pub async fn active_push_match_leases(
-        &self,
-        community: CommunityId,
-    ) -> Result<Vec<push::MatchLease>> {
-        push::active_match_leases(&self.pool, community).await
-    }
-
-    /// Complete matcher jobs from one claimed batch while the fence holds.
-    #[datastore_span(name = "complete_push_match_batch", system = "postgresql")]
-    pub async fn complete_push_match_batch(
-        &self,
-        community: CommunityId,
-        claim_id: uuid::Uuid,
-        event_ids: &[Vec<u8>],
-    ) -> Result<u64> {
-        push::complete_match_batch(&self.pool, community, claim_id, event_ids).await
-    }
-
-    /// Release fenced matcher claims from one batch for retry.
-    #[datastore_span(name = "retry_push_match_batch", system = "postgresql")]
-    pub async fn retry_push_match_batch(
-        &self,
-        community: CommunityId,
-        claim_id: uuid::Uuid,
-        event_ids: &[Vec<u8>],
-        next: DateTime<Utc>,
-    ) -> Result<u64> {
-        push::retry_match_batch(&self.pool, community, claim_id, event_ids, next).await
-    }
-
-    /// Delete exhausted matcher jobs (periodic sweep, off the claim path).
-    #[datastore_span(name = "reap_exhausted_push_matches", system = "postgresql")]
-    pub async fn reap_exhausted_push_matches(&self) -> Result<u64> {
-        push::reap_exhausted_matches(&self.pool).await
-    }
-
-    /// Idempotently enqueue a wake for a matched lease and event.
-    #[datastore_span(name = "enqueue_push_wake", system = "postgresql")]
-    pub async fn enqueue_push_wake(
-        &self,
-        community: CommunityId,
-        author: &[u8],
-        installation_id: &str,
-        wake: push::NewWake<'_>,
-    ) -> Result<push::EnqueueWakeOutcome> {
-        push::enqueue_wake(&self.pool, community, author, installation_id, wake).await
-    }
-
-    /// Set-wise [`Self::enqueue_push_wake`]: one transaction per batch.
-    #[datastore_span(name = "enqueue_push_wakes", system = "postgresql")]
-    pub async fn enqueue_push_wakes(
-        &self,
-        community: CommunityId,
-        requests: &[push::WakeRequest],
-    ) -> Result<Vec<push::EnqueueWakeOutcome>> {
-        push::enqueue_wakes(&self.pool, community, requests).await
-    }
-
-    /// Exclusively claim due wake jobs for one community.
-    #[datastore_span(name = "claim_due_push_wakes", system = "postgresql")]
-    pub async fn claim_due_push_wakes(
-        &self,
-        community: CommunityId,
-        limit: i64,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<push::ClaimedWake>> {
-        push::claim_due_wakes(&self.pool, community, limit, lease_until).await
-    }
-
-    /// Revalidate a wake's claim, source event, and current lease before send.
-    #[datastore_span(name = "revalidate_push_wake", system = "postgresql")]
-    pub async fn revalidate_push_wake(
-        &self,
-        community: CommunityId,
-        id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<push::RevalidateWakeOutcome> {
-        push::revalidate_wake_for_send(&self.pool, community, id, claim_id).await
-    }
-
-    /// Mark a fenced wake claim delivered.
-    #[datastore_span(name = "complete_push_wake", system = "postgresql")]
-    pub async fn complete_push_wake(
-        &self,
-        community: CommunityId,
-        id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<bool> {
-        push::complete_wake(&self.pool, community, id, claim_id).await
-    }
-
-    /// Release a fenced wake claim for retry at the supplied time.
-    #[datastore_span(name = "retry_push_wake", system = "postgresql")]
-    pub async fn retry_push_wake(
-        &self,
-        community: CommunityId,
-        id: Uuid,
-        claim_id: Uuid,
-        next: DateTime<Utc>,
-    ) -> Result<bool> {
-        push::retry_wake(&self.pool, community, id, claim_id, next).await
-    }
-
-    /// Mark a fenced wake claim terminally failed.
-    #[datastore_span(name = "fail_push_wake", system = "postgresql")]
-    pub async fn fail_push_wake(
-        &self,
-        community: CommunityId,
-        id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<bool> {
-        push::fail_wake(&self.pool, community, id, claim_id).await
-    }
-
-    /// Disable an endpoint only if the specified lease generation is current.
-    #[datastore_span(name = "disable_push_endpoint", system = "postgresql")]
-    pub async fn disable_push_endpoint(
-        &self,
-        community: CommunityId,
-        author: &[u8],
-        installation_id: &str,
-        generation: i64,
-    ) -> Result<bool> {
-        push::disable_endpoint_generation(
-            &self.pool,
-            community,
-            author,
-            installation_id,
-            generation,
-        )
-        .await
-    }
-
-    /// Atomically persist a validated kind:30350 event and its effective lease.
-    #[allow(clippy::too_many_arguments)]
-    #[datastore_span(name = "accept_push_lease_event", system = "postgresql")]
-    pub async fn accept_push_lease_event(
-        &self,
-        community: CommunityId,
-        event: &nostr::Event,
-        installation_id: &str,
-        version: push::LeaseVersion<'_>,
-        active: Option<push::ActiveLease<'_>>,
-        max_active_leases: i64,
-    ) -> Result<push::AcceptLeaseOutcome> {
-        push::accept_lease_event(
-            &self.pool,
-            community,
-            event,
-            installation_id,
-            version,
-            active,
-            max_active_leases,
-        )
-        .await
     }
 }

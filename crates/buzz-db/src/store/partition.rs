@@ -2,11 +2,13 @@
 //!
 //! Call `ensure_future_partitions` on startup and monthly via cron.
 
+use buzz_datastore_tracing::datastore_span;
 use chrono::{Datelike, TimeZone, Utc};
 use sqlx::{PgPool, Row};
 use tracing::info;
 
 use crate::error::{DbError, Result};
+use crate::Db;
 
 /// Tables that may be partition-managed. Allowlist prevents DDL injection.
 const PARTITIONED_TABLES: &[&str] = &["events", "delivery_log"];
@@ -53,6 +55,14 @@ pub async fn ensure_future_partitions(pool: &PgPool, months_ahead: u32) -> Resul
     }
 
     Ok(())
+}
+
+impl Db {
+    /// Ensures monthly partitions exist for the next N months.
+    #[datastore_span(name = "ensure_future_partitions", system = "postgresql")]
+    pub async fn ensure_future_partitions(&self, months_ahead: u32) -> Result<()> {
+        ensure_future_partitions(&self.pool, months_ahead).await
+    }
 }
 
 /// Validate that a partition suffix is digits and underscores only.
@@ -178,38 +188,5 @@ mod tests {
         assert!(PARTITIONED_TABLES.contains(&"delivery_log"));
         assert!(!PARTITIONED_TABLES.contains(&"api_tokens"));
         assert!(!PARTITIONED_TABLES.contains(&"users"));
-    }
-}
-
-// Db facade methods moved from the runtime module.
-use crate::{partition, Db};
-use buzz_datastore_tracing::datastore_span;
-
-impl Db {
-    /// Ensures monthly partitions exist for the next N months.
-    #[datastore_span(name = "ensure_future_partitions", system = "postgresql")]
-    pub async fn ensure_future_partitions(&self, months_ahead: u32) -> Result<()> {
-        partition::ensure_future_partitions(&self.pool, months_ahead).await
-    }
-
-    /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
-    ///
-    /// Idempotent — safe to call on every startup. No-ops when all rows are already populated.
-    /// Runs a single UPDATE touching only NIP-33 rows with NULL d_tag.
-    #[datastore_span(name = "backfill_d_tags", system = "postgresql")]
-    pub async fn backfill_d_tags(&self) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE events \
-             SET d_tag = COALESCE( \
-                 (SELECT elem->>1 FROM jsonb_array_elements(tags) AS elem \
-                  WHERE elem->>0 = 'd' LIMIT 1), \
-                 '' \
-             ) \
-             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL \
-               AND community_write_allowed(community_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
     }
 }

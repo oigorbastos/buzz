@@ -121,9 +121,32 @@ test("readiness wait cancels when Welcome loses focus", async () => {
 });
 
 test("kickoff beat waits for the configured pacing interval", async () => {
-  const startedAt = Date.now();
-  assert.equal(await waitForWelcomeKickoffBeat({ waitMs: 10 }), true);
-  assert.ok(Date.now() - startedAt >= 8);
+  const originalSetTimeout = globalThis.setTimeout;
+  let scheduledCallback;
+  let scheduledDelay;
+  globalThis.setTimeout = (callback, delay) => {
+    scheduledCallback = callback;
+    scheduledDelay = delay;
+    return 1;
+  };
+
+  try {
+    const beat = waitForWelcomeKickoffBeat({ waitMs: 10 });
+    let settled = false;
+    void beat.then(() => {
+      settled = true;
+    });
+
+    assert.equal(scheduledDelay, 10);
+    await Promise.resolve();
+    assert.equal(settled, false);
+
+    assert.equal(typeof scheduledCallback, "function");
+    scheduledCallback();
+    assert.equal(await beat, true);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
 
 test("kickoff beat cancels when Welcome loses focus", async () => {

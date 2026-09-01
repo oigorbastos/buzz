@@ -1,12 +1,12 @@
-//! Community lifecycle persistence.
+//! Community lifecycle and host-map persistence.
 
-use crate::relay_members;
-use crate::{Db, DbError, Result};
 use buzz_core::CommunityId;
 use buzz_datastore_tracing::datastore_span;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use uuid::Uuid;
+
+use crate::{relay_members, Db, DbError, Result};
 
 /// Community host-map row returned by [`Db::lookup_community_by_host`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,10 +325,13 @@ impl Db {
 
         // Serialize on the owner pubkey so concurrent creates to the same
         // owner cannot both pass the ownership count check.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(relay_members::owner_count_advisory_lock_key(&owner_pubkey))
-            .execute(&mut *tx)
-            .await?;
+        crate::observability::observe_advisory_lock(
+            crate::observability::LockType::Membership,
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(relay_members::owner_count_advisory_lock_key(&owner_pubkey))
+                .execute(&mut *tx),
+        )
+        .await?;
 
         let row = sqlx::query(
             r#"
@@ -539,5 +542,451 @@ impl Db {
             out.insert(ch, CommunityId::from_uuid(cm));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pin the load-bearing contract for `Db::communities_of_channels`:
+    //! a channel id that does NOT exist MUST be absent from the result
+    //! map, never mapped to a default. The relay-side read-row emitter
+    //! relies on this — a missing entry triggers `MissingLookup →
+    //! ImplBug{row_community_lookup_missing} → CoverageBreach`. If this
+    //! helper ever started returning a default/zero entry for unknown
+    //! channels, that fail-closed chain would go blind.
+    use super::*;
+    use sqlx::PgPool;
+
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+
+    async fn setup_db() -> Db {
+        let database_url =
+            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect to test DB");
+        Db::from_pool(pool)
+    }
+
+    async fn make_community(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let host = format!("communities-of-channels-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(host)
+            .execute(pool)
+            .await
+            .expect("insert community");
+        id
+    }
+
+    async fn insert_channel(pool: &PgPool, community_id: Uuid, channel_id: Uuid) {
+        let creator: Vec<u8> = vec![0u8; 32];
+        sqlx::query(
+            r#"
+            INSERT INTO channels
+                (id, community_id, name, channel_type, visibility, created_by)
+            VALUES
+                ($1, $2, $3, 'stream'::channel_type, 'open'::channel_visibility, $4)
+            "#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(format!("ch-{}", channel_id.simple()))
+        .bind(&creator)
+        .execute(pool)
+        .await
+        .expect("insert channel");
+    }
+
+    #[test]
+    fn community_implementation_tests_and_spans_have_single_owners() {
+        let community_source = include_str!("community.rs");
+        let lib_source = include_str!("../lib.rs");
+        let operations = [
+            "lookup_community_by_host",
+            "is_community_active",
+            "lookup_community_by_host_for_management",
+            "list_communities_owned_by",
+            "lookup_community_host",
+            "get_community_icon",
+            "set_community_icon",
+            "ensure_configured_community",
+            "create_community_with_owner",
+            "archive_community_owned_by",
+            "unarchive_community_owned_by",
+            "community_of_channel",
+            "communities_of_channels",
+        ];
+        for operation in operations {
+            let method = format!("pub async fn {operation}(");
+            assert_eq!(
+                community_source.matches(&method).count(),
+                1,
+                "{operation} implementation must live exactly once in community.rs",
+            );
+            assert!(
+                !lib_source.contains(&method),
+                "{operation} implementation must not remain in lib.rs",
+            );
+
+            let span = format!("name = \"{operation}\"");
+            assert_eq!(
+                community_source.matches(&span).count(),
+                1,
+                "{operation} must have exactly one datastore span",
+            );
+            assert!(
+                !lib_source.contains(&span),
+                "{operation} datastore span must not remain in lib.rs",
+            );
+        }
+
+        let records = [
+            "CommunityRecord",
+            "EnsuredCommunityRecord",
+            "CreatedCommunityRecord",
+            "OwnedCommunityRecord",
+            "ArchivedCommunityRecord",
+            "UnarchivedCommunityRecord",
+        ];
+        for record in records {
+            let declaration = format!("pub struct {record}");
+            assert_eq!(community_source.matches(&declaration).count(), 1);
+            assert!(!lib_source.contains(&declaration));
+        }
+        let result_declaration = format!("pub {} {}", "enum", "CreateCommunityWithOwnerResult");
+        assert_eq!(community_source.matches(&result_declaration).count(), 1);
+        assert!(!lib_source.contains(&result_declaration));
+
+        let moved_tests = [
+            "lookup_community_by_host_matches_case_insensitive_host_index",
+            "create_community_with_owner_is_atomic_and_create_only",
+            "unarchive_community_owned_by_restores_admission_idempotently",
+            "create_community_with_owner_enforces_per_owner_limit",
+            "concurrent_same_owner_create_returns_the_winning_row_to_both_callers",
+            "ensure_configured_community_reports_insert_winner",
+            "list_communities_owned_by_returns_only_owner_rows",
+            "communities_of_channels_present_for_existing_absent_for_missing",
+        ];
+        for test in moved_tests {
+            let declaration = format!("async fn {test}");
+            assert_eq!(community_source.matches(&declaration).count(), 1);
+            assert!(!lib_source.contains(&declaration));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn lookup_community_by_host_matches_case_insensitive_host_index() {
+        let db = setup_db().await;
+        let id = Uuid::new_v4();
+        let lower_host = format!("lookup-community-{}.example", id.simple());
+        let stored_host = lower_host.to_uppercase();
+
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&stored_host)
+            .execute(&db.pool)
+            .await
+            .expect("insert mixed-case community host");
+
+        let found = db
+            .lookup_community_by_host(&lower_host)
+            .await
+            .expect("lookup lower-case host")
+            .expect("community found by lower-case host");
+        assert_eq!(found.id, CommunityId::from_uuid(id));
+        assert_eq!(found.host, stored_host);
+
+        let found = db
+            .lookup_community_by_host(&stored_host)
+            .await
+            .expect("lookup stored-case host")
+            .expect("community found by stored-case host");
+        assert_eq!(found.id, CommunityId::from_uuid(id));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn create_community_with_owner_is_atomic_and_create_only() {
+        let db = setup_db().await;
+        let host = format!("create-only-{}.example", Uuid::new_v4().simple());
+        let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let created = db
+            .create_community_with_owner(&host, owner)
+            .await
+            .expect("create community");
+        let CreateCommunityWithOwnerResult::Created(created) = created else {
+            panic!("expected new community");
+        };
+        assert_eq!(created.host, host);
+        let owner_role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(created.id.as_uuid())
+        .bind(owner)
+        .fetch_optional(&db.pool)
+        .await
+        .expect("owner role");
+        assert_eq!(owner_role.as_deref(), Some("owner"));
+
+        let retry = db
+            .create_community_with_owner(&host.to_ascii_uppercase(), owner)
+            .await
+            .expect("same-owner retry");
+        assert_eq!(
+            retry,
+            CreateCommunityWithOwnerResult::Created(created.clone()),
+            "retry returns the original row"
+        );
+
+        let collision = db
+            .create_community_with_owner(&host, other)
+            .await
+            .expect("collision result");
+        assert_eq!(collision, CreateCommunityWithOwnerResult::HostExists);
+        let roles: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pubkey, role FROM relay_members WHERE community_id = $1 ORDER BY pubkey",
+        )
+        .bind(created.id.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("community roles");
+        assert_eq!(roles, vec![(owner.to_string(), "owner".to_string())]);
+
+        db.bootstrap_owner(created.id, other)
+            .await
+            .expect("rotate owner");
+        let post_rotation_retry = db
+            .create_community_with_owner(&host, owner)
+            .await
+            .expect("post-rotation retry");
+        assert_eq!(
+            post_rotation_retry,
+            CreateCommunityWithOwnerResult::HostExists
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn unarchive_community_owned_by_restores_admission_idempotently() {
+        let db = setup_db().await;
+        let host = format!("unarchive-{}.example", Uuid::new_v4().simple());
+        let owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let outsider = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let created = db
+            .create_community_with_owner(&host, &owner)
+            .await
+            .expect("create community");
+        let CreateCommunityWithOwnerResult::Created(created) = created else {
+            panic!("expected new community");
+        };
+
+        let archived = db
+            .archive_community_owned_by(&host, &owner, "protected.example")
+            .await
+            .expect("archive community")
+            .expect("owned community");
+        assert_eq!(archived.id, created.id);
+        assert!(
+            db.lookup_community_by_host(&host)
+                .await
+                .expect("active lookup")
+                .is_none(),
+            "archived communities must fail admission"
+        );
+        assert!(db
+            .unarchive_community_owned_by(&host, &outsider)
+            .await
+            .expect("wrong-owner unarchive")
+            .is_none());
+        assert!(db
+            .unarchive_community_owned_by("missing.example", &owner)
+            .await
+            .expect("unknown-host unarchive")
+            .is_none());
+
+        let restored = db
+            .unarchive_community_owned_by(&host.to_ascii_uppercase(), &owner)
+            .await
+            .expect("unarchive community")
+            .expect("owned community");
+        assert_eq!(restored.id, created.id);
+        assert_eq!(restored.host, host);
+        assert_eq!(
+            db.lookup_community_by_host(&host)
+                .await
+                .expect("restored lookup")
+                .expect("active community")
+                .id,
+            created.id
+        );
+        assert_eq!(
+            db.get_relay_member(created.id, &owner)
+                .await
+                .expect("owner lookup")
+                .expect("owner remains")
+                .role,
+            "owner"
+        );
+
+        let retry = db
+            .unarchive_community_owned_by(&host, &owner)
+            .await
+            .expect("idempotent retry")
+            .expect("owned community");
+        assert_eq!(retry, restored);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn create_community_with_owner_enforces_per_owner_limit() {
+        let db = setup_db().await;
+        let owner = format!("{:064x}", Uuid::new_v4().as_u128());
+
+        // Create 3 communities for this owner (the max).
+        for i in 0..3 {
+            let host = format!("limit-test-{}-{}.example", i, Uuid::new_v4().simple());
+            assert!(matches!(
+                db.create_community_with_owner(&host, &owner)
+                    .await
+                    .expect("create community"),
+                CreateCommunityWithOwnerResult::Created(_)
+            ));
+        }
+
+        let host = format!("limit-test-3-{}.example", Uuid::new_v4().simple());
+        assert_eq!(
+            db.create_community_with_owner(&host, &owner)
+                .await
+                .expect("create community call"),
+            CreateCommunityWithOwnerResult::LimitReached
+        );
+        assert!(
+            db.lookup_community_by_host(&host)
+                .await
+                .expect("look up rolled-back fresh host")
+                .is_none(),
+            "limit rejection must roll back the fresh community row"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_same_owner_create_returns_the_winning_row_to_both_callers() {
+        let db = setup_db().await;
+        let host = format!("concurrent-create-{}.example", Uuid::new_v4().simple());
+        let owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let (first, second) = tokio::join!(
+            db.create_community_with_owner(&host, owner),
+            db.create_community_with_owner(&host, owner),
+        );
+        let first = first.expect("first concurrent create");
+        let second = second.expect("second concurrent create");
+
+        assert!(matches!(first, CreateCommunityWithOwnerResult::Created(_)));
+        assert_eq!(first, second, "conflict loser re-reads the winning row");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn ensure_configured_community_reports_insert_winner() {
+        let db = setup_db().await;
+        let host = format!("ensure-community-{}.example", Uuid::new_v4().simple());
+
+        let first = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("first ensure");
+        assert!(first.created, "first ensure should report created");
+        assert_eq!(first.host, host);
+
+        let second = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("second ensure");
+        assert!(!second.created, "second ensure should report existed");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.host, host);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn list_communities_owned_by_returns_only_owner_rows() {
+        let db = setup_db().await;
+        let community_a = CommunityId::from_uuid(make_community(&db.pool).await);
+        let community_b = CommunityId::from_uuid(make_community(&db.pool).await);
+        let community_c = CommunityId::from_uuid(make_community(&db.pool).await);
+        // Unique per run: `list_communities_owned_by` is keyed only by pubkey,
+        // so a shared fixed pubkey picks up communities leaked by sibling
+        // ignored tests running against the same database.
+        let owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let owner = owner.as_str();
+        let other = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let other = other.as_str();
+
+        db.bootstrap_owner(community_a, owner)
+            .await
+            .expect("owner A");
+        db.bootstrap_owner(community_b, other)
+            .await
+            .expect("other owner B");
+        db.add_relay_member(community_c, owner, "admin", None)
+            .await
+            .expect("admin C");
+
+        let owned = db
+            .list_communities_owned_by(owner)
+            .await
+            .expect("list owned communities");
+
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].id, community_a);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn communities_of_channels_present_for_existing_absent_for_missing() {
+        let db = setup_db().await;
+        let community = make_community(&db.pool).await;
+        let existing = Uuid::new_v4();
+        insert_channel(&db.pool, community, existing).await;
+
+        // Channel that is NOT inserted — the load-bearing case.
+        let missing = Uuid::new_v4();
+
+        let result = db
+            .communities_of_channels(&[existing, missing])
+            .await
+            .expect("communities_of_channels");
+
+        // (1) Existing channel → present with its true community.
+        assert_eq!(
+            result.get(&existing).copied(),
+            Some(CommunityId::from_uuid(community)),
+            "existing channel must map to its true community",
+        );
+
+        // (2) Missing channel → ABSENT from the map (never defaulted).
+        // This is the contract the relay-side `MissingLookup → ImplBug`
+        // fail-closed guard-rail depends on. If this assertion ever
+        // weakens to `result.get(&missing) != Some(community)`, the
+        // mutate-bite below stops biting.
+        assert!(
+            !result.contains_key(&missing),
+            "missing channel must be absent from the result map, got {:?}",
+            result.get(&missing),
+        );
+
+        // (3) Map size matches: exactly one entry, the existing one.
+        assert_eq!(
+            result.len(),
+            1,
+            "result map must contain only existing channels"
+        );
     }
 }

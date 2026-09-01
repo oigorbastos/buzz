@@ -2,7 +2,7 @@
 
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
-/// Community allowlist persistence.
+/// Community-scoped authentication allowlist persistence.
 pub mod allowlist;
 /// API token storage and lookup.
 pub mod api_token;
@@ -10,9 +10,9 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel lifecycle and metadata persistence.
 pub mod channel;
-/// Channel-member persistence.
+/// Channel membership and roster persistence.
 pub mod channel_members;
-/// Community lifecycle persistence.
+/// Community lifecycle and host-map persistence.
 pub mod community;
 /// Durable whole-community deletion lifecycle and PostgreSQL adapter.
 pub mod deletion;
@@ -36,13 +36,17 @@ pub mod product_feedback;
 pub mod push;
 /// Reaction persistence.
 pub mod reaction;
+/// HTTP report-resolution enforcement state machine persistence.
+pub mod relay_admin_actions;
 /// Use-limited relay invite persistence (v2 opaque tokens).
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
-/// Scheduled event-reminder persistence.
+/// Deployment-global relay operator/moderator roster persistence.
+pub mod relay_operators;
+/// Event-reminder delivery query, claim, and release persistence.
 pub mod reminder;
-/// Replaceable-event persistence.
+/// Replaceable-event persistence and coordinate locking.
 pub mod replaceable;
 /// Thread metadata persistence.
 pub mod thread;

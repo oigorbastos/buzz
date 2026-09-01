@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::agent_env::{build_buzz_agent_provider_defaults, idle_pool_sleep_env};
 
@@ -23,8 +23,8 @@ pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondT
 
 mod metadata;
 pub(crate) use metadata::{
-    apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
-    DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
+    apply_agent_display_env, child_rust_log_filter, resolve_session_title,
+    runtime_metadata_env_vars, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
 
 mod stop;
@@ -68,6 +68,8 @@ mod lifecycle;
 #[cfg(test)]
 use lifecycle::kill_stale_tracked_processes_with;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
+mod spawn_key; // production spawn-key derivation + its regressions
+pub(crate) use spawn_key::bound_runtime_key;
 
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
@@ -107,7 +109,6 @@ pub(crate) fn workspace_pair_key(
     app: &AppHandle,
     record: &ManagedAgentRecord,
 ) -> Option<ManagedAgentRuntimeKey> {
-    use tauri::Manager;
     let state = app.state::<crate::app_state::AppState>();
     resolve_workspace_pair_key(
         &record.pubkey,
@@ -252,6 +253,7 @@ pub fn build_managed_agent_summary(
             &key.relay_url,
             global_config,
             super::owner_only_access_build(),
+            super::acp_session_policy(app.state::<crate::app_state::AppState>().inner()),
         );
         (runtime, current)
     });
@@ -499,7 +501,6 @@ pub fn spawn_agent_child(
     // The caller supplies the explicit canonical pair relay. This is the only
     // relay this child may connect to, regardless of the record/workspace default.
     let effective_relay_url = runtime_key.relay_url.clone();
-
     // Augment PATH for DMG launches so child processes can find:
     //   - bundled CLI via ~/.local/bin symlink
     //   - nvm-managed node/npm (nvm initializes only in interactive shells)
@@ -807,7 +808,10 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    // Resolve once and stamp the same value onto the snapshot below.
+    let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 
+    crate::build_identity::apply_demo_config_home(&mut command)?;
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
     // Written AFTER descriptor.env so the canonical persisted value wins over any
     // user-supplied BUZZ_ACP_EFFORT_LEVEL entry, mirroring the A1 model-authority pattern
@@ -859,6 +863,7 @@ pub fn spawn_agent_child(
             model: effective_model.as_deref(),
             provider: effective_provider.as_deref(),
             enforced_owner_only: super::owner_only_access_build(),
+            session_policy: acp_session_policy,
         },
     );
 
@@ -926,29 +931,20 @@ pub fn spawn_agent_child(
     })
 }
 
-fn child_rust_log_filter() -> String {
-    match std::env::var("RUST_LOG") {
-        Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
-    }
-}
-
+/// Spawn (or adopt) the runtime pair for `record` on the caller's bound
+/// workspace relay. `workspace_relay` can only be produced by
+/// `bind_expected_relay_scope`, so this spawn consumes — by construction — the
+/// exact workspace-relay read the caller's scope assertion passed on; it never
+/// re-reads the mutable override (see `relay::scope`). The key comes from
+/// [`bound_runtime_key`] — the seam the spawn-key regressions exercise.
 pub fn start_managed_agent_process(
     app: &AppHandle,
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     owner_hex: Option<&str>,
+    workspace_relay: &crate::relay::ScopedWorkspaceRelay,
 ) -> Result<(), String> {
-    let relay_url = {
-        use tauri::Manager;
-        let state = app.state::<crate::app_state::AppState>();
-        crate::relay::effective_agent_relay_url(
-            &record.relay_url,
-            &crate::relay::relay_ws_url_with_override(&state),
-        )
-    };
-    let key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)?;
+    let key = bound_runtime_key(record, workspace_relay)?;
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime
             .child
