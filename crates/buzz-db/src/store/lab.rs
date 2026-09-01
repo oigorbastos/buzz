@@ -1036,3 +1036,49 @@ mod postgres_tests {
         assert_eq!(head.revision, 1);
     }
 }
+
+// Db facade methods moved from the runtime module.
+use crate::{lab, Db};
+
+impl Db {
+    /// Lists a community's Lab Board heads, most recently updated first.
+    /// `status_filter` narrows to one status; `None` returns all.
+    pub async fn list_lab_board_heads(
+        &self,
+        community_id: CommunityId,
+        status_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<lab::BoardHead>> {
+        lab::list_board_heads(&self.pool, community_id, status_filter, limit).await
+    }
+
+    /// Returns one Lab Board's current head row, if it exists.
+    pub async fn get_lab_board_head(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+    ) -> Result<Option<lab::BoardHead>> {
+        lab::get_board_head(&self.pool, community_id, board_id).await
+    }
+
+    /// Returns whether a reader principal set may read a Lab Board.
+    pub async fn lab_board_can_read(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+        principals: &[Vec<u8>],
+    ) -> Result<bool> {
+        lab::board_can_read(&self.pool, community_id, board_id, principals).await
+    }
+
+    /// Lists a Lab Board's revision history, newest first.
+    pub async fn list_lab_board_revisions(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+        before_revision: Option<i32>,
+        limit: i64,
+    ) -> Result<Vec<lab::BoardRevision>> {
+        lab::list_board_revisions(&self.pool, community_id, board_id, before_revision, limit).await
+    }
+}

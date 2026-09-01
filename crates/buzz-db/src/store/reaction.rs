@@ -416,3 +416,226 @@ pub async fn get_reactions_bulk(
 
     Ok(entries)
 }
+
+// Db facade methods moved from the runtime module.
+use crate::{reaction, Db};
+use buzz_datastore_tracing::datastore_span;
+
+impl Db {
+    /// Add (or re-activate) a reaction.
+    #[datastore_span(name = "add_reaction", system = "postgresql")]
+    pub async fn add_reaction(
+        &self,
+        community: CommunityId,
+        event_id: &[u8],
+        event_created_at: DateTime<Utc>,
+        pubkey: &[u8],
+        emoji: &str,
+        reaction_event_id: Option<&[u8]>,
+    ) -> Result<bool> {
+        reaction::add_reaction(
+            &self.pool,
+            community,
+            event_id,
+            event_created_at,
+            pubkey,
+            emoji,
+            reaction_event_id,
+        )
+        .await
+    }
+
+    /// Soft-delete a reaction.
+    #[datastore_span(name = "remove_reaction", system = "postgresql")]
+    pub async fn remove_reaction(
+        &self,
+        community: CommunityId,
+        event_id: &[u8],
+        event_created_at: DateTime<Utc>,
+        pubkey: &[u8],
+        emoji: &str,
+    ) -> Result<bool> {
+        reaction::remove_reaction(
+            &self.pool,
+            community,
+            event_id,
+            event_created_at,
+            pubkey,
+            emoji,
+        )
+        .await
+    }
+
+    /// Soft-delete a reaction by its source event ID.
+    #[datastore_span(name = "remove_reaction_by_source_event_id", system = "postgresql")]
+    pub async fn remove_reaction_by_source_event_id(
+        &self,
+        community: CommunityId,
+        reaction_event_id: &[u8],
+    ) -> Result<bool> {
+        reaction::remove_reaction_by_source_event_id(&self.pool, community, reaction_event_id).await
+    }
+
+    /// Look up the active reaction row for one actor + emoji + target tuple.
+    #[datastore_span(name = "get_active_reaction_record", system = "postgresql")]
+    pub async fn get_active_reaction_record(
+        &self,
+        community: CommunityId,
+        event_id: &[u8],
+        event_created_at: DateTime<Utc>,
+        pubkey: &[u8],
+        emoji: &str,
+    ) -> Result<Option<reaction::ActiveReactionRecord>> {
+        reaction::get_active_reaction_record(
+            &self.pool,
+            community,
+            event_id,
+            event_created_at,
+            pubkey,
+            emoji,
+        )
+        .await
+    }
+
+    /// Backfill the source event ID on an active reaction row.
+    #[datastore_span(name = "set_reaction_event_id", system = "postgresql")]
+    pub async fn set_reaction_event_id(
+        &self,
+        community: CommunityId,
+        event_id: &[u8],
+        event_created_at: DateTime<Utc>,
+        pubkey: &[u8],
+        emoji: &str,
+        reaction_event_id: &[u8],
+    ) -> Result<bool> {
+        reaction::set_reaction_event_id(
+            &self.pool,
+            community,
+            event_id,
+            event_created_at,
+            pubkey,
+            emoji,
+            reaction_event_id,
+        )
+        .await
+    }
+
+    /// Get all active reactions for an event, grouped by emoji.
+    #[datastore_span(name = "get_reactions", system = "postgresql")]
+    pub async fn get_reactions(
+        &self,
+        community: CommunityId,
+        event_id: &[u8],
+        event_created_at: DateTime<Utc>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Vec<reaction::ReactionGroup>> {
+        reaction::get_reactions(
+            &self.pool,
+            community,
+            event_id,
+            event_created_at,
+            limit,
+            cursor,
+        )
+        .await
+    }
+
+    /// Batch-fetch emoji counts for a set of (event_id, event_created_at) pairs.
+    #[datastore_span(name = "get_reactions_bulk", system = "postgresql")]
+    pub async fn get_reactions_bulk(
+        &self,
+        community: CommunityId,
+        event_ids: &[(&[u8], DateTime<Utc>)],
+    ) -> Result<Vec<reaction::BulkReactionEntry>> {
+        reaction::get_reactions_bulk(&self.pool, community, event_ids).await
+    }
+}
+
+use crate::event::{insert_event_with_thread_metadata_tx, ThreadMetadataParams};
+use buzz_core::StoredEvent;
+use nostr::Event;
+use uuid::Uuid;
+
+/// Result of atomically inserting a kind:7 reaction event and its reaction row.
+#[derive(Debug)]
+pub enum ReactionEventInsertOutcome {
+    /// Target event was absent in this community, or was soft-deleted. No writes committed.
+    TargetMissing,
+    /// The active `(target, actor, emoji)` reaction already exists. No event was stored.
+    Duplicate,
+    /// Reaction row and event transaction committed.
+    Inserted {
+        /// Stored reaction event.
+        stored_event: Box<StoredEvent>,
+        /// Whether the event row itself was newly inserted.
+        was_inserted: bool,
+    },
+}
+/// Atomically insert a kind:7 reaction event and its reaction row.
+///
+/// Ordering is load-bearing: resolve target, upsert/reactivate the reaction row,
+/// check `rows_affected`, then insert the kind:7 event. Active duplicates return
+/// before event insertion so duplicate reactions never store a duplicate kind:7.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_reaction_event_with_thread_metadata(
+    pool: &PgPool,
+    community_id: CommunityId,
+    reaction_event: &Event,
+    channel_id: Option<Uuid>,
+    thread_meta: Option<ThreadMetadataParams<'_>>,
+    target_event_id: &[u8],
+    actor_pubkey: &[u8],
+    emoji: &str,
+) -> Result<ReactionEventInsertOutcome> {
+    let mut tx = pool.begin().await?;
+
+    let target_row = sqlx::query(
+        "SELECT created_at FROM events \
+         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(target_event_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(target_row) = target_row else {
+        tx.rollback().await?;
+        return Ok(ReactionEventInsertOutcome::TargetMissing);
+    };
+    let target_created_at: DateTime<Utc> = target_row.get("created_at");
+
+    // Preserve add_reaction's exact new / re-activate / active-duplicate semantics.
+    let reaction_inserted = crate::reaction::add_reaction_tx(
+        &mut tx,
+        community_id,
+        target_event_id,
+        target_created_at,
+        actor_pubkey,
+        emoji,
+        Some(reaction_event.id.as_bytes()),
+    )
+    .await?;
+
+    if !reaction_inserted {
+        tx.rollback().await?;
+        return Ok(ReactionEventInsertOutcome::Duplicate);
+    }
+
+    let (stored_event, was_inserted) = insert_event_with_thread_metadata_tx(
+        &mut tx,
+        community_id,
+        reaction_event,
+        channel_id,
+        thread_meta,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(ReactionEventInsertOutcome::Inserted {
+        stored_event: Box::new(stored_event),
+        was_inserted,
+    })
+}

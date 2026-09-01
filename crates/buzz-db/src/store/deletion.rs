@@ -4862,3 +4862,23 @@ mod postgres_tests {
         assert_eq!(terminal.stage, DeletionStage::RetentionPending);
     }
 }
+
+// Db facade methods moved from the runtime module.
+use crate::{deletion, Db};
+
+impl Db {
+    /// Validate the minimum deletion fence catalog required by serving paths.
+    pub async fn validate_deletion_serving_catalog(&self) -> Result<()> {
+        self.deletion_store().validate_serving_catalog().await
+    }
+
+    /// Validate the exact live community-deletion tenant catalog for destruction.
+    pub async fn validate_deletion_catalog(&self) -> Result<()> {
+        self.deletion_store().validate_catalog().await
+    }
+
+    /// Return the shared durable whole-community deletion adapter.
+    pub fn deletion_store(&self) -> deletion::DeletionStore {
+        deletion::DeletionStore::new(self.pool.clone())
+    }
+}

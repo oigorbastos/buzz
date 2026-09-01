@@ -186,3 +186,28 @@ mod tests {
             .expect("delete communities");
     }
 }
+
+// Db facade methods moved from the runtime module.
+use crate::{product_feedback, Db};
+use buzz_datastore_tracing::datastore_span;
+
+impl Db {
+    /// Sidecar an accepted product-feedback event, idempotent by event id.
+    #[datastore_span(name = "insert_product_feedback", system = "postgresql")]
+    pub async fn insert_product_feedback(
+        &self,
+        community: CommunityId,
+        feedback: product_feedback::NewProductFeedback<'_>,
+    ) -> Result<Uuid> {
+        product_feedback::insert(&self.pool, community, feedback).await
+    }
+
+    /// List product feedback across the deployment, newest first.
+    #[datastore_span(name = "list_product_feedback", system = "postgresql")]
+    pub async fn list_product_feedback(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<product_feedback::ProductFeedbackRecord>> {
+        product_feedback::list(&self.pool, limit).await
+    }
+}

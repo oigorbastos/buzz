@@ -141,22 +141,6 @@ impl EventQuery {
     }
 }
 
-/// Result of atomically inserting a kind:7 reaction event and its reaction row.
-#[derive(Debug)]
-pub enum ReactionEventInsertOutcome {
-    /// Target event was absent in this community, or was soft-deleted. No writes committed.
-    TargetMissing,
-    /// The active `(target, actor, emoji)` reaction already exists. No event was stored.
-    Duplicate,
-    /// Reaction row and event transaction committed.
-    Inserted {
-        /// Stored reaction event.
-        stored_event: Box<StoredEvent>,
-        /// Whether the event row itself was newly inserted.
-        was_inserted: bool,
-    },
-}
-
 /// Maximum length for a `d_tag` value (bytes). NIP-33 d-tags are short identifiers;
 /// anything beyond this is either a bug or abuse.
 pub const D_TAG_MAX_LEN: usize = 1024;
@@ -1375,240 +1359,6 @@ pub async fn insert_event_with_thread_metadata(
     Ok(result)
 }
 
-/// Atomically insert a kind:7 reaction event and its reaction row.
-///
-/// Ordering is load-bearing: resolve target, upsert/reactivate the reaction row,
-/// check `rows_affected`, then insert the kind:7 event. Active duplicates return
-/// before event insertion so duplicate reactions never store a duplicate kind:7.
-#[allow(clippy::too_many_arguments)]
-pub async fn insert_reaction_event_with_thread_metadata(
-    pool: &PgPool,
-    community_id: CommunityId,
-    reaction_event: &Event,
-    channel_id: Option<Uuid>,
-    thread_meta: Option<ThreadMetadataParams<'_>>,
-    target_event_id: &[u8],
-    actor_pubkey: &[u8],
-    emoji: &str,
-) -> Result<ReactionEventInsertOutcome> {
-    let mut tx = pool.begin().await?;
-
-    let target_row = sqlx::query(
-        "SELECT created_at FROM events \
-         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(community_id.as_uuid())
-    .bind(target_event_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(target_row) = target_row else {
-        tx.rollback().await?;
-        return Ok(ReactionEventInsertOutcome::TargetMissing);
-    };
-    let target_created_at: DateTime<Utc> = target_row.get("created_at");
-
-    // Preserve add_reaction's exact new / re-activate / active-duplicate semantics.
-    let reaction_inserted = crate::reaction::add_reaction_tx(
-        &mut tx,
-        community_id,
-        target_event_id,
-        target_created_at,
-        actor_pubkey,
-        emoji,
-        Some(reaction_event.id.as_bytes()),
-    )
-    .await?;
-
-    if !reaction_inserted {
-        tx.rollback().await?;
-        return Ok(ReactionEventInsertOutcome::Duplicate);
-    }
-
-    let (stored_event, was_inserted) = insert_event_with_thread_metadata_tx(
-        &mut tx,
-        community_id,
-        reaction_event,
-        channel_id,
-        thread_meta,
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    Ok(ReactionEventInsertOutcome::Inserted {
-        stored_event: Box::new(stored_event),
-        was_inserted,
-    })
-}
-
-/// A due reminder row returned by [`query_due_reminders`].
-#[derive(Debug)]
-pub struct DueReminder {
-    /// Server-resolved community this reminder row belongs to.
-    pub community_id: CommunityId,
-    /// Normalized host mapped to that community.
-    pub host: String,
-    /// The event's raw ID bytes.
-    pub id: Vec<u8>,
-    /// The event's pubkey bytes.
-    pub pubkey: Vec<u8>,
-    /// The event's `created_at` timestamp.
-    pub created_at: DateTime<Utc>,
-    /// The event's kind (always 30300).
-    pub kind: i32,
-    /// The event's JSONB tags.
-    pub tags: serde_json::Value,
-    /// The event's encrypted content.
-    pub content: String,
-    /// The event's signature bytes.
-    pub sig: Vec<u8>,
-    /// The channel ID (always None for reminders — global events).
-    pub channel_id: Option<Uuid>,
-}
-
-/// Query due reminders: latest-per-address `kind:30300` rows where
-/// `not_before <= now`, `deleted_at IS NULL`, `delivered_at IS NULL`.
-///
-/// Returns the latest head per `(pubkey, d_tag)` using canonical NIP-16
-/// ordering (`created_at DESC, id ASC`).
-pub async fn query_due_reminders(
-    pool: &PgPool,
-    now_secs: i64,
-    batch_limit: i64,
-) -> Result<Vec<DueReminder>> {
-    let kind_i32 = KIND_EVENT_REMINDER as i32;
-    let rows = sqlx::query(
-        r#"
-        SELECT DISTINCT ON (e.community_id, e.pubkey, e.d_tag)
-            e.community_id, c.host, e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, e.channel_id
-        FROM events AS e
-        JOIN communities AS c ON c.id = e.community_id
-        WHERE e.kind = $1
-          AND e.not_before IS NOT NULL
-          AND e.not_before <= $2
-          AND e.deleted_at IS NULL
-          AND e.delivered_at IS NULL
-          AND c.archived_at IS NULL
-        ORDER BY e.community_id, e.pubkey, e.d_tag, e.created_at DESC, e.id ASC
-        LIMIT $3
-        "#,
-    )
-    .bind(kind_i32)
-    .bind(now_secs)
-    .bind(batch_limit)
-    .fetch_all(pool)
-    .await?;
-
-    let results = rows
-        .into_iter()
-        .map(|row| DueReminder {
-            community_id: CommunityId::from_uuid(row.get("community_id")),
-            host: row.get("host"),
-            id: row.get("id"),
-            pubkey: row.get("pubkey"),
-            created_at: row.get("created_at"),
-            kind: row.get("kind"),
-            tags: row.get("tags"),
-            content: row.get("content"),
-            sig: row.get("sig"),
-            channel_id: row.get("channel_id"),
-        })
-        .collect();
-
-    Ok(results)
-}
-
-/// Atomically claim a due reminder for delivery. Returns `Some(id)` if this
-/// caller won the claim (set `delivered_at`), or `None` if another pod already
-/// claimed it. Mirrors the reaper's `archived_at IS NULL` guard for cross-pod
-/// idempotency.
-pub async fn claim_due_reminder(
-    pool: &PgPool,
-    community_id: CommunityId,
-    event_id: &[u8],
-    event_created_at: DateTime<Utc>,
-) -> Result<bool> {
-    claim_due_reminder_with_stamp(
-        pool,
-        community_id,
-        event_id,
-        event_created_at,
-        Utc::now().timestamp(),
-    )
-    .await
-}
-
-/// Atomically claim a due reminder using a caller-supplied delivery stamp.
-///
-/// The same stamp should be passed to [`release_due_reminder`] if the publish
-/// side effect fails, so rollback can compare-and-clear only this pod's claim.
-///
-/// Scoped by `community_id`: `events` is keyed `(community_id, created_at, id)`,
-/// and the same Nostr event id (hence the same `id`/`created_at` pair) is
-/// allowed across communities. Without the community predicate a claim for
-/// `A/X` would also mark `B/X` delivered. The caller already holds the owning
-/// community on the `DueReminder` row.
-pub async fn claim_due_reminder_with_stamp(
-    pool: &PgPool,
-    community_id: CommunityId,
-    event_id: &[u8],
-    event_created_at: DateTime<Utc>,
-    delivery_stamp: i64,
-) -> Result<bool> {
-    let result = sqlx::query(
-        r#"
-        UPDATE events
-        SET delivered_at = $1
-        WHERE community_id = $2 AND created_at = $3 AND id = $4 AND delivered_at IS NULL
-        "#,
-    )
-    .bind(delivery_stamp)
-    .bind(community_id.as_uuid())
-    .bind(event_created_at)
-    .bind(event_id)
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected() > 0)
-}
-
-/// Release a previously claimed reminder when publish fails.
-///
-/// The `delivery_stamp` must be the exact value written by the claiming pod;
-/// that compare-and-clear prevents one pod from rolling back another pod's
-/// later claim after a retry/race.
-///
-/// Scoped by `community_id` for the same reason as the claim: a release for
-/// `A/X` must not clear `B/X` even when their `id`/`created_at`/stamp coincide.
-pub async fn release_due_reminder(
-    pool: &PgPool,
-    community_id: CommunityId,
-    event_id: &[u8],
-    event_created_at: DateTime<Utc>,
-    delivery_stamp: i64,
-) -> Result<bool> {
-    let result = sqlx::query(
-        r#"
-        UPDATE events
-        SET delivered_at = NULL
-        WHERE community_id = $1
-          AND created_at = $2
-          AND id = $3
-          AND delivered_at = $4
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(event_created_at)
-    .bind(event_id)
-    .bind(delivery_stamp)
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected() == 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2745,3 +2495,351 @@ mod tests {
         assert!(!huddle_started_content_links("not-json", channel_id));
     }
 }
+
+// Db facade methods moved from the runtime module.
+use crate::runtime::{RouteDecision, RoutePredicate};
+use crate::{event, insert_mentions, Db};
+use buzz_datastore_tracing::datastore_span;
+
+impl Db {
+    /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
+    #[datastore_span(name = "insert_event", system = "postgresql")]
+    pub async fn insert_event(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) -> Result<(StoredEvent, bool)> {
+        let result = event::insert_event(&self.pool, community_id, event, channel_id).await?;
+        if result.1 {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
+                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+            }
+        }
+        Ok(result)
+    }
+
+    /// Queries events matching the given filter parameters.
+    ///
+    /// Always reads from the WRITER pool. If the result influences a write
+    /// or a permission decision, this is the method to call. Display-path
+    /// callers that tolerate bounded staleness should use
+    /// [`Db::query_events_routed`] instead — converting a caller is an
+    /// explicit, per-callsite decision, never a change to this method.
+    #[datastore_span(name = "query_events", system = "postgresql")]
+    pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
+        event::query_events(&self.pool, q).await
+    }
+
+    /// [`Db::query_events`] with replica routing — the opt-in fast path for
+    /// display reads.
+    ///
+    /// Rule of thumb: **if the result influences a write or a permission,
+    /// it reads from the writer** — do not convert such a caller to this
+    /// method. Every new caller must be added to the caller-classification
+    /// table in `PLANS/REPLICA_FULL_READ_ROUTING_DESIGN.md`.
+    ///
+    /// Routing derives the strongest sound predicate from the query shape
+    /// ([`RoutePredicate::for_query`]): a channel-pinned query with an
+    /// `until` upper bound may be served covered (provably complete below
+    /// the fence wall); anything else is bounded-staleness only. The whole
+    /// seam is gated on `BUZZ_REPLICA_READ_MAX_AGE_MS` (default off): when
+    /// unset, even covered-eligible queries stay on the writer, so merging
+    /// this seam is a true no-op until the budget is configured. Every
+    /// failure fails closed to the writer.
+    #[datastore_span(name = "query_events_routed", system = "postgresql")]
+    pub async fn query_events_routed(
+        &self,
+        path: &'static str,
+        q: &EventQuery,
+    ) -> Result<Vec<StoredEvent>> {
+        let predicate = RoutePredicate::for_query(q, self.replica_read_max_age.is_some());
+        match self.route_read(path, predicate).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match event::query_events_on(&mut tx, q).await {
+                    Ok(events) => {
+                        Self::record_route(path, "replica", reason);
+                        Ok(events)
+                    }
+                    Err(e) => {
+                        // Mid-query replica failure: fail closed to the
+                        // writer rather than surfacing a routed error.
+                        tracing::warn!(path, "replica read failed; re-running on writer: {e}");
+                        Self::record_route(path, "writer", "replica_error");
+                        event::query_events(&self.pool, q).await
+                    }
+                }
+            }
+            RouteDecision::Writer => event::query_events(&self.pool, q).await,
+        }
+    }
+
+    /// [`Db::query_events_routed`] restricted to the BOUNDED arm — for
+    /// reads whose result feeds a COUNT rather than a displayed page.
+    ///
+    /// The covered arm bounds insert-completeness only; stale deletions can
+    /// briefly inflate the result set (see [`RoutePredicate::Covered`]). A
+    /// display page absorbs that per-row; a number derived from the rows
+    /// does not. Same classification-table requirement as
+    /// [`Db::query_events_routed`].
+    #[datastore_span(name = "query_events_routed_bounded", system = "postgresql")]
+    pub async fn query_events_routed_bounded(
+        &self,
+        path: &'static str,
+        q: &EventQuery,
+    ) -> Result<Vec<StoredEvent>> {
+        match self.route_read(path, RoutePredicate::Bounded).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match event::query_events_on(&mut tx, q).await {
+                    Ok(events) => {
+                        Self::record_route(path, "replica", reason);
+                        Ok(events)
+                    }
+                    Err(e) => {
+                        tracing::warn!(path, "replica read failed; re-running on writer: {e}");
+                        Self::record_route(path, "writer", "replica_error");
+                        event::query_events(&self.pool, q).await
+                    }
+                }
+            }
+            RouteDecision::Writer => event::query_events(&self.pool, q).await,
+        }
+    }
+
+    /// Count events matching the given query (NIP-45 COUNT support).
+    ///
+    /// Always reads from the WRITER pool — see [`Db::query_events`] for the
+    /// writer-vs-routed rule.
+    #[datastore_span(name = "count_events", system = "postgresql")]
+    pub async fn count_events(&self, q: &EventQuery) -> Result<i64> {
+        event::count_events(&self.pool, q).await
+    }
+
+    /// [`Db::count_events`] with replica routing — same contract, rules,
+    /// and classification-table requirement as [`Db::query_events_routed`].
+    ///
+    /// Counts route on the BOUNDED arm only, never covered: the covered
+    /// arm bounds insert-completeness but not deletion visibility (soft
+    /// deletes are UPDATEs outside the floor guard), and a count has no
+    /// downstream per-row re-filter to absorb extra rows — a silently
+    /// inflated number for up to `FENCE_STALENESS` is a different product
+    /// statement than a page briefly showing a deleted row. `Bounded` ties
+    /// the error to the accepted budget `B`.
+    #[datastore_span(name = "count_events_routed", system = "postgresql")]
+    pub async fn count_events_routed(&self, path: &'static str, q: &EventQuery) -> Result<i64> {
+        match self.route_read(path, RoutePredicate::Bounded).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match event::count_events_on(&mut tx, q).await {
+                    Ok(count) => {
+                        Self::record_route(path, "replica", reason);
+                        Ok(count)
+                    }
+                    Err(e) => {
+                        tracing::warn!(path, "replica count failed; re-running on writer: {e}");
+                        Self::record_route(path, "writer", "replica_error");
+                        event::count_events(&self.pool, q).await
+                    }
+                }
+            }
+            RouteDecision::Writer => event::count_events(&self.pool, q).await,
+        }
+    }
+
+    /// Return whether a creator-signed huddle-start event links a parent
+    /// channel to an ephemeral huddle channel.
+    #[datastore_span(name = "huddle_started_link_exists", system = "postgresql")]
+    pub async fn huddle_started_link_exists(
+        &self,
+        community_id: CommunityId,
+        parent_channel_id: Uuid,
+        ephemeral_channel_id: Uuid,
+        creator_pubkey: &[u8],
+    ) -> Result<bool> {
+        event::huddle_started_link_exists(
+            &self.pool,
+            community_id,
+            parent_channel_id,
+            ephemeral_channel_id,
+            creator_pubkey,
+        )
+        .await
+    }
+
+    /// Fetch the latest replaceable event for a (kind, pubkey) pair.
+    ///
+    /// Uses canonical NIP-16 ordering: `created_at DESC, id ASC`.
+    /// This matches the write path in [`replace_addressable_event`] and handles
+    /// historical duplicate survivors correctly.
+    #[datastore_span(name = "get_latest_global_replaceable", system = "postgresql")]
+    pub async fn get_latest_global_replaceable(
+        &self,
+        community_id: CommunityId,
+        kind: i32,
+        pubkey_bytes: &[u8],
+    ) -> Result<Option<StoredEvent>> {
+        event::get_latest_global_replaceable(&self.pool, community_id, kind, pubkey_bytes).await
+    }
+
+    /// Fetches a single non-deleted event by its raw ID bytes.
+    ///
+    /// Returns `None` if the event does not exist or has been soft-deleted.
+    #[datastore_span(name = "get_event_by_id", system = "postgresql")]
+    pub async fn get_event_by_id(
+        &self,
+        community_id: CommunityId,
+        id_bytes: &[u8],
+    ) -> Result<Option<StoredEvent>> {
+        event::get_event_by_id(&self.pool, community_id, id_bytes).await
+    }
+
+    /// Fetches a single event by its raw ID bytes, **including soft-deleted rows**.
+    #[datastore_span(name = "get_event_by_id_including_deleted", system = "postgresql")]
+    pub async fn get_event_by_id_including_deleted(
+        &self,
+        community_id: CommunityId,
+        id_bytes: &[u8],
+    ) -> Result<Option<StoredEvent>> {
+        event::get_event_by_id_including_deleted(&self.pool, community_id, id_bytes).await
+    }
+
+    /// Soft-deletes an event. Returns `Ok(true)` if deleted, `Ok(false)` if already deleted.
+    #[datastore_span(name = "soft_delete_event", system = "postgresql")]
+    pub async fn soft_delete_event(
+        &self,
+        community_id: CommunityId,
+        event_id: &[u8],
+    ) -> Result<bool> {
+        event::soft_delete_event(&self.pool, community_id, event_id).await
+    }
+
+    /// Soft-delete the live row for an addressable coordinate `(kind, pubkey, d_tag)`
+    /// when it is not newer than the deletion request.
+    /// Used by NIP-09 a-tag deletion for parameterized-replaceable kinds;
+    /// `deletion_created_at_secs` is the deletion event's `created_at`.
+    #[datastore_span(name = "soft_delete_by_coordinate", system = "postgresql")]
+    pub async fn soft_delete_by_coordinate(
+        &self,
+        community_id: CommunityId,
+        kind: i32,
+        pubkey: &[u8],
+        d_tag: &str,
+        deletion_created_at_secs: i64,
+    ) -> Result<bool> {
+        event::soft_delete_by_coordinate(
+            &self.pool,
+            community_id,
+            kind,
+            pubkey,
+            d_tag,
+            deletion_created_at_secs,
+        )
+        .await
+    }
+
+    /// Atomically soft-delete an event and decrement thread reply counters.
+    #[datastore_span(name = "soft_delete_event_and_update_thread", system = "postgresql")]
+    pub async fn soft_delete_event_and_update_thread(
+        &self,
+        community_id: CommunityId,
+        event_id: &[u8],
+        parent_event_id: Option<&[u8]>,
+        root_event_id: Option<&[u8]>,
+    ) -> Result<bool> {
+        event::soft_delete_event_and_update_thread(
+            &self.pool,
+            community_id,
+            event_id,
+            parent_event_id,
+            root_event_id,
+        )
+        .await
+    }
+
+    /// Returns the most recent `created_at` for a channel.
+    #[datastore_span(name = "get_last_message_at", system = "postgresql")]
+    pub async fn get_last_message_at(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>> {
+        event::get_last_message_at(&self.pool, community_id, channel_id).await
+    }
+
+    /// Bulk-fetch the most recent `created_at` for a set of channel IDs.
+    #[datastore_span(name = "get_last_message_at_bulk", system = "postgresql")]
+    pub async fn get_last_message_at_bulk(
+        &self,
+        community_id: CommunityId,
+        channel_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, DateTime<Utc>>> {
+        event::get_last_message_at_bulk(&self.pool, community_id, channel_ids).await
+    }
+
+    /// Batch-fetch non-deleted events by their raw IDs.
+    #[datastore_span(name = "get_events_by_ids", system = "postgresql")]
+    pub async fn get_events_by_ids(
+        &self,
+        community_id: CommunityId,
+        ids: &[&[u8]],
+    ) -> Result<Vec<StoredEvent>> {
+        event::get_events_by_ids(&self.pool, community_id, ids).await
+    }
+
+    /// [`Db::get_events_by_ids`] with replica routing — same contract and
+    /// classification-table requirement as [`Db::query_events_routed`].
+    ///
+    /// By-id fetches route on the BOUNDED arm only: an id list carries no
+    /// channel pin, so no fence floor can prove insert-completeness — the
+    /// covered arm is structurally unavailable. Used for FTS hit hydration,
+    /// where a missing row degrades to a skipped search hit downstream.
+    #[datastore_span(name = "get_events_by_ids_routed", system = "postgresql")]
+    pub async fn get_events_by_ids_routed(
+        &self,
+        path: &'static str,
+        community_id: CommunityId,
+        ids: &[&[u8]],
+    ) -> Result<Vec<StoredEvent>> {
+        match self.route_read(path, RoutePredicate::Bounded).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match event::get_events_by_ids_on(&mut tx, community_id, ids).await {
+                    Ok(events) => {
+                        Self::record_route(path, "replica", reason);
+                        Ok(events)
+                    }
+                    Err(e) => {
+                        tracing::warn!(path, "replica read failed; re-running on writer: {e}");
+                        Self::record_route(path, "writer", "replica_error");
+                        event::get_events_by_ids(&self.pool, community_id, ids).await
+                    }
+                }
+            }
+            RouteDecision::Writer => event::get_events_by_ids(&self.pool, community_id, ids).await,
+        }
+    }
+
+    /// Soft-delete NIP-29 discovery events for a channel created by a specific relay pubkey.
+    #[datastore_span(name = "soft_delete_discovery_events", system = "postgresql")]
+    pub async fn soft_delete_discovery_events(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        relay_pubkey: &[u8],
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3 AND deleted_at IS NULL AND kind IN (39000, 39001, 39002)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(relay_pubkey)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+pub use crate::reaction::{insert_reaction_event_with_thread_metadata, ReactionEventInsertOutcome};
+pub use crate::reminder::{
+    claim_due_reminder, claim_due_reminder_with_stamp, query_due_reminders, release_due_reminder,
+    DueReminder,
+};

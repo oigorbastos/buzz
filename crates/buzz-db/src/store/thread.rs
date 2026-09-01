@@ -1776,3 +1776,354 @@ mod tests {
         );
     }
 }
+
+// Db facade methods moved from the runtime module.
+use crate::runtime::{ChannelScoped, ReadSessionInner, RouteDecision, RoutePredicate};
+use crate::{event, insert_mentions, thread, Db, ReadSession};
+use buzz_datastore_tracing::datastore_span;
+
+impl Db {
+    /// Atomically insert an event AND its thread metadata in a single transaction.
+    #[datastore_span(name = "insert_event_with_thread_metadata", system = "postgresql")]
+    pub async fn insert_event_with_thread_metadata(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        thread_meta: Option<event::ThreadMetadataParams<'_>>,
+    ) -> Result<(StoredEvent, bool)> {
+        let result = event::insert_event_with_thread_metadata(
+            &self.pool,
+            community_id,
+            event,
+            channel_id,
+            thread_meta,
+        )
+        .await?;
+        if result.1 {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
+                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+            }
+        }
+        Ok(result)
+    }
+
+    /// Atomically insert a kind:7 reaction event and its reaction row.
+    #[allow(clippy::too_many_arguments)]
+    #[datastore_span(
+        name = "insert_reaction_event_with_thread_metadata",
+        system = "postgresql"
+    )]
+    pub async fn insert_reaction_event_with_thread_metadata(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        thread_meta: Option<event::ThreadMetadataParams<'_>>,
+        target_event_id: &[u8],
+        actor_pubkey: &[u8],
+        emoji: &str,
+    ) -> Result<event::ReactionEventInsertOutcome> {
+        let outcome = event::insert_reaction_event_with_thread_metadata(
+            &self.pool,
+            community_id,
+            event,
+            channel_id,
+            thread_meta,
+            target_event_id,
+            actor_pubkey,
+            emoji,
+        )
+        .await?;
+        if let event::ReactionEventInsertOutcome::Inserted {
+            was_inserted: true, ..
+        } = &outcome
+        {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
+                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Insert thread metadata.
+    #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "insert_thread_metadata", system = "postgresql")]
+    pub async fn insert_thread_metadata(
+        &self,
+        community_id: CommunityId,
+        event_id: &[u8],
+        event_created_at: DateTime<Utc>,
+        channel_id: Uuid,
+        parent_event_id: Option<&[u8]>,
+        parent_event_created_at: Option<DateTime<Utc>>,
+        root_event_id: Option<&[u8]>,
+        root_event_created_at: Option<DateTime<Utc>>,
+        depth: i32,
+        broadcast: bool,
+    ) -> Result<()> {
+        thread::insert_thread_metadata(
+            &self.pool,
+            community_id,
+            event_id,
+            event_created_at,
+            channel_id,
+            parent_event_id,
+            parent_event_created_at,
+            root_event_id,
+            root_event_created_at,
+            depth,
+            broadcast,
+        )
+        .await
+    }
+
+    /// Fetch replies under a root event.
+    ///
+    /// Routing mirrors [`Db::get_channel_window_with_session`]: a head
+    /// fetch (`cursor: None`) is Predicate A (bounded staleness, gated by
+    /// the default-off head budget); cursor pages are Predicate B
+    /// (completeness). Thread pagination walks **forward** from oldest to
+    /// newest, so a cursor carries no upper bound — instead the served page
+    /// is post-verified against the wall the serving session proved:
+    ///
+    /// - an under-`limit` page is a candidate terminal page — the client
+    ///   treats it as EOF, so it is re-run on the writer to keep the EOF
+    ///   decision authoritative (a lagged replica could truncate the tail);
+    /// - a full page whose newest row exceeds the proved fence wall could
+    ///   straddle a row the session has not replayed (commit order is not
+    ///   `created_at` order), so it is also re-run on the writer. Only a
+    ///   full page that sits entirely at or below the proved wall is served
+    ///   from the replica.
+    ///
+    /// A head fetch routed under Predicate A skips the re-run: bounded
+    /// staleness (missing at most the freshest budget-window of replies) is
+    /// exactly the semantic the head gate accepts.
+    #[datastore_span(name = "get_thread_replies", system = "postgresql")]
+    pub async fn get_thread_replies(
+        &self,
+        community_id: CommunityId,
+        root_event_id: &[u8],
+        depth_limit: Option<u32>,
+        limit: u32,
+        cursor: Option<&[u8]>,
+    ) -> Result<Vec<thread::ThreadReply>> {
+        let (path, predicate): (&'static str, RoutePredicate) = match cursor {
+            Some(_) => (
+                "thread_cursor",
+                RoutePredicate::CoveredPostVerified {
+                    proof: ChannelScoped::from_thread_metadata_join(),
+                },
+            ),
+            None => ("thread_head", RoutePredicate::Bounded),
+        };
+        if let RouteDecision::Replica(mut tx, entry, reason) =
+            self.route_read(path, predicate).await
+        {
+            match thread::get_thread_replies_on(
+                &mut tx,
+                community_id,
+                root_event_id,
+                depth_limit,
+                limit,
+                cursor,
+            )
+            .await
+            {
+                Ok(replies) => {
+                    if cursor.is_none() {
+                        // Predicate A: bounded-stale head page, served as proved.
+                        Self::record_route(path, "replica", reason);
+                        return Ok(replies);
+                    }
+                    let full = replies.len() >= limit as usize;
+                    let below_fence = replies
+                        .last()
+                        .is_some_and(|tail| tail.created_at <= entry.fence_wall);
+                    if full && below_fence {
+                        Self::record_route(path, "replica", reason);
+                        return Ok(replies);
+                    }
+                    // Candidate terminal page, or page reaching above the
+                    // proved wall — verify against the writer. Recorded as
+                    // the request's ONLY route event: the replica leg was
+                    // discarded, so counting it would overstate offload.
+                    Self::record_route("thread_eof", "writer", "stale");
+                }
+                Err(e) => {
+                    // Mid-request replica failure (e.g. a hot-standby
+                    // recovery conflict) fails closed to the writer.
+                    tracing::warn!(
+                        error = %e,
+                        path,
+                        "replica thread query failed; re-running on writer"
+                    );
+                    Self::record_route(path, "writer", "replica_error");
+                }
+            }
+        }
+        thread::get_thread_replies(
+            &self.pool,
+            community_id,
+            root_event_id,
+            depth_limit,
+            limit,
+            cursor,
+        )
+        .await
+    }
+
+    /// Fetch aggregated thread stats.
+    #[datastore_span(name = "get_thread_summary", system = "postgresql")]
+    pub async fn get_thread_summary(
+        &self,
+        community_id: CommunityId,
+        event_id: &[u8],
+    ) -> Result<Option<thread::ThreadSummary>> {
+        thread::get_thread_summary(&self.pool, community_id, event_id).await
+    }
+
+    /// One channel window: top-level rows + summaries + server `has_more`.
+    ///
+    /// Convenience wrapper over [`Db::get_channel_window_with_session`] for
+    /// callers with no follow-up queries; the serving session is released.
+    pub async fn get_channel_window(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        limit: u32,
+        cursor: Option<(DateTime<Utc>, Vec<u8>)>,
+        kind_filter: Option<&[u32]>,
+    ) -> Result<thread::ChannelWindow> {
+        self.get_channel_window_with_session(community_id, channel_id, limit, cursor, kind_filter)
+            .await
+            .map(|(window, _session)| window)
+    }
+
+    /// [`Db::get_channel_window`], additionally returning the session that
+    /// served the page so request-scoped follow-ups (the aux closure) run on
+    /// the same proved connection.
+    ///
+    /// Routing:
+    ///
+    /// - **Cursor page** (Predicate B — completeness): scrolls *backward*
+    ///   into history bounded above by the cursor timestamp (`created_at <
+    ///   ts`, or `= ts` with the id tiebreak), so it may be served by a
+    ///   replica session when one is configured AND that session **proves**
+    ///   coverage of the cursor timestamp: the heartbeat token/epoch is
+    ///   observed on the exact connection that will serve the page and
+    ///   resolved against the fence's retained ring ([`replica_fence`]).
+    /// - **Head fetch** (Predicate A — bounded staleness): served by a
+    ///   proved replica session only when the head gate is configured
+    ///   ([`DbConfig::replica_read_max_age_ms`], default off) and the
+    ///   proved entry is within the budget. This trades a bounded staleness
+    ///   window (budget plus probe cadence) on the GET leg for writer
+    ///   offload. NOTE: enabling the budget also breaks read-your-own-writes
+    ///   on the GET leg; the client-side WS `since`-overlap union intended
+    ///   to cover fresh events has NOT shipped yet — do not enable
+    ///   `BUZZ_REPLICA_HEAD_MAX_AGE_SECS` until it has, proven by a
+    ///   post-then-immediately-refetch test.
+    ///
+    /// Every failure fails closed to the writer and is recorded in
+    /// `buzz_db_route_decision`.
+    #[datastore_span(name = "get_channel_window", system = "postgresql")]
+    pub async fn get_channel_window_with_session(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        limit: u32,
+        cursor: Option<(DateTime<Utc>, Vec<u8>)>,
+        kind_filter: Option<&[u32]>,
+    ) -> Result<(thread::ChannelWindow, ReadSession)> {
+        let path: &'static str = if cursor.is_some() {
+            "channel_cursor"
+        } else {
+            "channel_head"
+        };
+        match self
+            .route_read(
+                path,
+                RoutePredicate::from_channel_cursor(channel_id, &cursor),
+            )
+            .await
+        {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match thread::get_channel_window_on(
+                    &mut tx,
+                    community_id,
+                    channel_id,
+                    limit,
+                    cursor.clone(),
+                    kind_filter,
+                )
+                .await
+                {
+                    Ok(window) => {
+                        Self::record_route(path, "replica", reason);
+                        return Ok((
+                            window,
+                            ReadSession {
+                                inner: ReadSessionInner::Replica {
+                                    tx,
+                                    writer: self.pool.clone(),
+                                },
+                            },
+                        ));
+                    }
+                    Err(e) => {
+                        // A mid-request replica failure (e.g. a hot-standby
+                        // recovery conflict cancelling the held snapshot)
+                        // fails closed to the writer: a stale-but-served
+                        // page, never an error the writer could have
+                        // answered. Dropping `tx` rolls the reader
+                        // transaction back.
+                        tracing::warn!(
+                            error = %e,
+                            path,
+                            "replica window query failed; re-running on writer"
+                        );
+                        Self::record_route(path, "writer", "replica_error");
+                    }
+                }
+            }
+            RouteDecision::Writer => {}
+        }
+        let window = thread::get_channel_window(
+            &self.pool,
+            community_id,
+            channel_id,
+            limit,
+            cursor,
+            kind_filter,
+        )
+        .await?;
+        Ok((
+            window,
+            ReadSession {
+                inner: ReadSessionInner::Writer(self.pool.clone()),
+            },
+        ))
+    }
+
+    /// Look up a single thread_metadata row by event_id.
+    #[datastore_span(name = "get_thread_metadata_by_event", system = "postgresql")]
+    pub async fn get_thread_metadata_by_event(
+        &self,
+        community_id: CommunityId,
+        event_id: &[u8],
+    ) -> Result<Option<thread::ThreadMetadataRecord>> {
+        thread::get_thread_metadata_by_event(&self.pool, community_id, event_id).await
+    }
+
+    /// Decrement reply counts.
+    #[datastore_span(name = "decrement_reply_count", system = "postgresql")]
+    pub async fn decrement_reply_count(
+        &self,
+        community_id: CommunityId,
+        parent_event_id: &[u8],
+        root_event_id: Option<&[u8]>,
+    ) -> Result<()> {
+        thread::decrement_reply_count(&self.pool, community_id, parent_event_id, root_event_id)
+            .await
+    }
+}
