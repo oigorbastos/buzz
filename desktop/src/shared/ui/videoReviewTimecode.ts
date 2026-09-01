@@ -1,5 +1,7 @@
 export type VideoReviewTimecode = {
   seconds: number;
+  /** Number of source lines removed before the Markdown comment body. */
+  sourceLineOffset: number;
   text: string;
   timecode: string;
 };
@@ -32,10 +34,17 @@ export function parseVideoReviewTimecode(
 
   const seconds = parseTimecode(match[1]);
   if (seconds === null) return null;
+  const afterTimecode = content.slice(match[0].length);
+  const leadingWhitespaceLength =
+    afterTimecode.length - afterTimecode.trimStart().length;
+  const sourceLineOffset =
+    content.slice(0, match[0].length + leadingWhitespaceLength).split("\n")
+      .length - 1;
 
   return {
     seconds,
-    text: content.slice(match[0].length).trim(),
+    sourceLineOffset,
+    text: afterTimecode.trim(),
     timecode: match[1],
   };
 }

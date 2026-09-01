@@ -92,6 +92,8 @@ type MockCommandAvailability = {
 export type MockManagedAgentSeed = {
   pubkey: string;
   name: string;
+  /** Defaults to the mock identity; override to test another agent owner. */
+  ownerPubkey?: string | null;
   avatarUrl?: string | null;
   personaId?: string | null;
   /** Harness/runtime id pin; `null` = inherit from persona (native default). */
@@ -2383,7 +2385,7 @@ function resetMockManagedAgents(config?: E2eConfig) {
       avatar_url: null,
       about: null,
       nip05_handle: null,
-      owner_pubkey: MOCK_IDENTITY_PUBKEY,
+      owner_pubkey: seed.ownerPubkey ?? MOCK_IDENTITY_PUBKEY,
       is_agent: true,
       has_profile_event: true,
     });

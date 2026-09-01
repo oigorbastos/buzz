@@ -20,6 +20,7 @@ type VideoReviewCommentMarkdownProps = Omit<
 export function VideoReviewCommentMarkdown({
   content,
   interactive = true,
+  onToggleTask,
   videoReviewCommentRootId,
   ...markdownProps
 }: VideoReviewCommentMarkdownProps) {
@@ -36,6 +37,15 @@ export function VideoReviewCommentMarkdown({
       }
     },
     [openVideoReviewAt, reviewTimecode, videoReviewCommentRootId],
+  );
+  const handleToggleTask = React.useCallback(
+    (line: number, nextChecked: boolean) => {
+      onToggleTask?.(
+        line + (reviewTimecode?.sourceLineOffset ?? 0),
+        nextChecked,
+      );
+    },
+    [onToggleTask, reviewTimecode?.sourceLineOffset],
   );
   const leadingInlineContent = React.useMemo(() => {
     if (!reviewTimecode) return undefined;
@@ -62,6 +72,7 @@ export function VideoReviewCommentMarkdown({
         {...markdownProps}
         content={content}
         interactive={interactive}
+        onToggleTask={onToggleTask}
       />
     );
   }
@@ -72,6 +83,7 @@ export function VideoReviewCommentMarkdown({
       content={reviewTimecode.text || "\u200B"}
       interactive={interactive}
       leadingInlineContent={leadingInlineContent}
+      onToggleTask={onToggleTask ? handleToggleTask : undefined}
     />
   );
 }

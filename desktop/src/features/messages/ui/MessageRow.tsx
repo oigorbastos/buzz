@@ -11,6 +11,8 @@ import {
   assertCanSendMessageToChannel,
   canSendMessageToChannel,
 } from "@/features/messages/lib/canSendToChannel";
+import { canManageMessageForCurrentUser } from "@/features/messages/lib/canManageMessage";
+import { useMessageTaskToggleBatch } from "@/features/messages/lib/useMessageTaskToggleBatch";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
@@ -169,6 +171,14 @@ export const MessageRow = React.memo(
     const [expandedDiffId, setExpandedDiffId] = React.useState<string | null>(
       null,
     );
+    const taskToggles = useMessageTaskToggleBatch({
+      enabled:
+        channelId !== null &&
+        !message.pending &&
+        onEdit !== undefined &&
+        canManageMessageForCurrentUser(message, currentPubkey, profiles),
+      message,
+    });
     const linkPreviewsSuppressed = hasLinkPreviewSuppression(message.tags);
     const removeLinkPreviewsForEveryone =
       channelId && onEdit && !message.pending && !linkPreviewsSuppressed
@@ -395,7 +405,9 @@ export const MessageRow = React.memo(
             />
           );
         default: {
-          const waveMessage = parseWaveMessageContent(message.body);
+          const waveMessage = parseWaveMessageContent(
+            taskToggles.optimisticContent,
+          );
           if (waveMessage) {
             return (
               <WaveMessageAttachment
@@ -423,7 +435,7 @@ export const MessageRow = React.memo(
                 message,
                 isKnownAgentPubkey,
               )}
-              content={message.body}
+              content={taskToggles.optimisticContent}
               messageId={message.id}
               linkPreviewsSuppressed={linkPreviewsSuppressed}
               linkPreviewTags={message.tags}
@@ -433,6 +445,11 @@ export const MessageRow = React.memo(
               agentMentionPubkeysByName={agentMentionPubkeysByName}
               mentionNames={mentionNames}
               mentionPubkeysByName={mentionPubkeysByName}
+              onToggleTask={
+                taskToggles.canToggle && !taskToggles.isFlushing
+                  ? taskToggles.onToggleTask
+                  : undefined
+              }
               searchQuery={searchQuery}
               snapshotSharedBy={snapshotSharedBy}
               videoReviewCommentRootId={videoReviewCommentRootId}
@@ -915,6 +932,7 @@ export const MessageRow = React.memo(
   },
   (prev, next) =>
     prev.message.id === next.message.id &&
+    prev.channelId === next.channelId &&
     prev.message.pubkey === next.message.pubkey &&
     prev.message.body === next.message.body &&
     prev.message.author === next.message.author &&
@@ -968,6 +986,7 @@ export const MessageRow = React.memo(
     prev.onCollapseDescendantsHoverChange ===
       next.onCollapseDescendantsHoverChange &&
     prev.onEntranceComplete === next.onEntranceComplete &&
+    prev.onEdit === next.onEdit &&
     prev.playEntrance === next.playEntrance &&
     prev.onSendToChannel === next.onSendToChannel &&
     prev.profiles === next.profiles &&

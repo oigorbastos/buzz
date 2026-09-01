@@ -6,6 +6,7 @@ import { installMockBridge } from "../helpers/bridge";
 // Must not collide with any existing e2eBridge constant.
 const OWNED_AGENT_PUBKEY =
   "a0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f6071829304a5b6c7d8e";
+const UNOWNED_AGENT_PUBKEY = "e".repeat(64);
 
 // #random is owned by alice; the mock identity is a plain member.
 // This is the isolation fixture for the canManageOwnedAgentChannel path —
@@ -70,6 +71,14 @@ test.beforeEach(async ({ page }) => {
         personaId: "builtin:fizz",
         status: "running",
         // Seed into #agents so the bridge seeds a message from this agent.
+        channelNames: ["agents"],
+      },
+      {
+        pubkey: UNOWNED_AGENT_PUBKEY,
+        name: "OtherOwnerBot",
+        ownerPubkey: "f".repeat(64),
+        personaId: "builtin:fizz",
+        status: "running",
         channelNames: ["agents"],
       },
     ],
@@ -169,6 +178,103 @@ test("owner does NOT see Edit or Delete for an unowned agent's message", async (
   await expect(
     page.getByTestId(`delete-message-${charlieMessageId}`),
   ).toHaveCount(0);
+});
+
+test("message task checkboxes edit only owned authors without re-notifying mentions", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const channels = (await invoke(page, "get_channels")) as {
+    channels: Array<{ id: string; name: string }>;
+  };
+  const agentsChannel = channels.channels.find(
+    (channel) => channel.name === "agents",
+  );
+  if (!agentsChannel) throw new Error("Expected the agents channel.");
+
+  const own = (await invoke(page, "send_channel_message", {
+    channelId: agentsChannel.id,
+    content: "- [ ] personal checklist task",
+  })) as { event_id: string };
+  const ownedAgent = (await invoke(page, "send_managed_agent_channel_message", {
+    agentPubkey: OWNED_AGENT_PUBKEY,
+    channelId: agentsChannel.id,
+    content: "- [ ] agent checklist task",
+    mentionPubkeys: ["d".repeat(64)],
+  })) as { event_id: string };
+  const thirdParty = (await invoke(page, "send_managed_agent_channel_message", {
+    agentPubkey: UNOWNED_AGENT_PUBKEY,
+    channelId: agentsChannel.id,
+    content: "- [ ] third-party checklist task",
+  })) as { event_id: string };
+
+  await page.getByTestId("channel-agents").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("agents");
+
+  const ownRow = page.locator(`[data-message-id="${own.event_id}"]`);
+  const ownedAgentRow = page.locator(
+    `[data-message-id="${ownedAgent.event_id}"]`,
+  );
+  const thirdPartyRow = page.locator(
+    `[data-message-id="${thirdParty.event_id}"]`,
+  );
+  await expect(ownRow.getByLabel("Incomplete task")).toBeEnabled();
+  await expect(ownedAgentRow.getByLabel("Incomplete task")).toBeEnabled();
+  await expect(thirdPartyRow.getByLabel("Incomplete task")).toBeDisabled();
+
+  const editCountBefore = await page.evaluate(
+    () =>
+      (
+        (
+          window as Window & {
+            __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{ command: string }>;
+          }
+        ).__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []
+      ).filter((entry) => entry.command === "edit_message").length,
+  );
+  await ownedAgentRow.getByLabel("Incomplete task").click();
+  await expect(ownedAgentRow.getByLabel("Completed task")).toBeVisible();
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () =>
+            (
+              (
+                window as Window & {
+                  __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{ command: string }>;
+                }
+              ).__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []
+            ).filter((entry) => entry.command === "edit_message").length,
+        ),
+      { timeout: 7_000 },
+    )
+    .toBe(editCountBefore + 1);
+
+  const lastEdit = await page.evaluate(() => {
+    const payloads =
+      (
+        window as Window & {
+          __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
+            command: string;
+            payload: { input?: { mentionPubkeys?: string[] } };
+          }>;
+        }
+      ).__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [];
+    return payloads.filter((entry) => entry.command === "edit_message").at(-1);
+  });
+  expect(lastEdit?.payload.input?.mentionPubkeys).toEqual([]);
+  const editCountAfter = await page.evaluate(
+    () =>
+      (
+        (
+          window as Window & {
+            __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{ command: string }>;
+          }
+        ).__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []
+      ).filter((entry) => entry.command === "edit_message").length,
+  );
+  expect(editCountAfter).toBe(editCountBefore + 1);
 });
 
 // ─── Thread-panel gate ────────────────────────────────────────────────────────
