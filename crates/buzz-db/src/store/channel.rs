@@ -695,7 +695,11 @@ pub async fn soft_delete_channel(
     Ok(result.rows_affected() > 0)
 }
 
-/// Returns the count of active (non-removed) members in a channel.
+/// Archive ephemeral channels whose TTL deadline has passed.
+///
+/// Returns the `(community_id, host, channel_id)` list that was archived. Idempotent — the
+/// `archived_at IS NULL` guard prevents double-archiving even if called
+/// concurrently from multiple relay pods.
 pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<ReapedEphemeralChannel>> {
     let rows = sqlx::query(
         "UPDATE channels AS ch SET archived_at = NOW() \

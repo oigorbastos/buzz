@@ -805,11 +805,6 @@ pub async fn get_member_role(
     Ok(row.map(|r| r.try_get("role")).transpose()?)
 }
 
-/// Archive ephemeral channels whose TTL deadline has passed.
-///
-/// Returns the `(community_id, host, channel_id)` list that was archived. Idempotent — the
-/// `archived_at IS NULL` guard prevents double-archiving even if called
-/// concurrently from multiple relay pods.
 use crate::Db;
 use buzz_datastore_tracing::datastore_span;
 

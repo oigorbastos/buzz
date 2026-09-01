@@ -890,8 +890,6 @@ impl Db {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
 
-    /// Validate the minimum deletion fence catalog required by serving paths.
-
     /// Returns pool utilisation stats for metrics emission.
     ///
     /// `size`  — total connections (idle + active)
