@@ -1,8 +1,9 @@
-name: Windows Portable Build (buzz-alis-1.3)
+name: Windows Portable Build (buzz-alis)
 
 # Builds an unsigned, portable Windows distribution of the six Buzz
-# executables from codex/buzz-alis-1.3-integration (Lab boards desktop UI +
-# community-deletion backend port). This is a genuinely new workflow file
+# executables from whatever ref it is dispatched on. The `label` input names
+# the ZIP and the artifact (buzz-alis-1.3 for the Lab-boards line, buzz-alis-1.4
+# for the post-upstream-sync line, and so on). This is a genuinely new workflow file
 # (never existed on any branch tip before this commit), which is what makes
 # GitHub auto-register it on push without a manual "I understand my
 # workflows" click in this fork's Actions settings.
@@ -18,19 +19,24 @@ name: Windows Portable Build (buzz-alis-1.3)
 # backend port) rather than a replay of prior, already-proven work.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/buzz-alis-1.3-integration
+    inputs:
+      label:
+        description: "Release label used for the ZIP and artifact name (e.g. buzz-alis-1.4)"
+        required: false
+        default: buzz-alis-1.4
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: buzz-alis-1.3-windows-portable-${{ github.ref }}
+  group: buzz-alis-windows-portable-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   TARGET: x86_64-pc-windows-msvc
+  # Falls back for any non-dispatch trigger, where `inputs` is empty.
+  LABEL: ${{ inputs.label || 'buzz-alis-1.4' }}
 
 jobs:
   linux-preflight:
@@ -326,9 +332,9 @@ jobs:
             exit 1
           fi
 
-          PORTABLE_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-root"
-          EXTRACT_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-reextract"
-          RELEASE_ROOT="$RUNNER_TEMP/buzz-alis-1.3-portable-release"
+          PORTABLE_ROOT="$RUNNER_TEMP/$LABEL-portable-root"
+          EXTRACT_ROOT="$RUNNER_TEMP/$LABEL-portable-reextract"
+          RELEASE_ROOT="$RUNNER_TEMP/$LABEL-portable-release"
           rm -rf "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
           mkdir -p "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
           cp "$APP_EXE" "$PORTABLE_ROOT/buzz-desktop.exe"
@@ -352,6 +358,7 @@ jobs:
           GITHUB_RUN_ID=$GITHUB_RUN_ID
           GITHUB_RUN_URL=$RUN_URL
           VERSION=$VERSION
+          LABEL=$LABEL
           TARGET=$TARGET
           RUNNER=windows-latest
           RUNNER_OS=$RUNNER_OS
@@ -404,7 +411,7 @@ jobs:
             sha256sum -c SHA256SUMS.txt
           )
 
-          ZIP_NAME="buzz-alis-1.3-windows-portable-x64.zip"
+          ZIP_NAME="$LABEL-windows-portable-x64.zip"
           ZIP_PATH="$RELEASE_ROOT/$ZIP_NAME"
           (
             cd "$PORTABLE_ROOT"
@@ -499,7 +506,7 @@ jobs:
       - name: Upload the only build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-alis-1.3-windows-portable-x64
+          name: ${{ env.LABEL }}-windows-portable-x64
           path: |
             ${{ steps.package.outputs.portable_zip }}
             ${{ steps.package.outputs.release_root }}/ZIP-SHA256.txt
