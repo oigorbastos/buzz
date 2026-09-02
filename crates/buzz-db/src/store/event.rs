@@ -369,6 +369,33 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
     query_events_on(&mut conn, q).await
 }
 
+/// Lab Board ACL pushdown shared by `query_events_on` and `count_events_on`.
+///
+/// Appended before ORDER/LIMIT (and before COUNT's aggregate) so a private
+/// board can neither consume a page slot nor reveal its existence through an
+/// authorized-looking filter. Both callers go through this one function on
+/// purpose: the predicate text is what keeps COUNT and the page query in
+/// agreement.
+fn push_lab_reader_acl(qb: &mut QueryBuilder<Postgres>, col_prefix: &str, principals: &[Vec<u8>]) {
+    qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
+    qb.push_bind(KIND_LAB_BOARD_REVISION as i32);
+    qb.push(", ");
+    qb.push_bind(KIND_LAB_BOARD_HEAD as i32);
+    qb.push(format!(
+        ") OR EXISTS (SELECT 1 FROM lab_board_heads h WHERE h.community_id = {col_prefix}community_id \
+         AND h.board_id::text = {col_prefix}d_tag AND (h.access_scope IN ('community', 'community_readonly') OR h.owner_pubkey IN ("
+    ));
+    if principals.is_empty() {
+        qb.push("NULL");
+    } else {
+        let mut sep = qb.separated(", ");
+        for principal in principals {
+            sep.push_bind(principal.clone());
+        }
+    }
+    qb.push("))))");
+}
+
 /// [`query_events`] on a specific session — the replica-routing path runs
 /// follow-up (aux) queries on the exact reader connection whose heartbeat
 /// observation proved coverage for the page they annotate.
@@ -602,23 +629,7 @@ pub(crate) async fn query_events_on(
     // Lab Board ACL pushdown. This is intentionally before ORDER/LIMIT, so a
     // private board cannot consume a page slot before the ACL removes it.
     if let Some(ref principals) = q.lab_reader_pubkeys {
-        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
-        qb.push_bind(KIND_LAB_BOARD_REVISION as i32);
-        qb.push(", ");
-        qb.push_bind(KIND_LAB_BOARD_HEAD as i32);
-        qb.push(format!(
-            ") OR EXISTS (SELECT 1 FROM lab_board_heads h WHERE h.community_id = {col_prefix}community_id \\
-             AND h.board_id::text = {col_prefix}d_tag AND (h.access_scope IN ('community', 'community_readonly') OR h.owner_pubkey IN ("
-        ));
-        if principals.is_empty() {
-            qb.push("NULL");
-        } else {
-            let mut sep = qb.separated(", ");
-            for principal in principals {
-                sep.push_bind(principal.clone());
-            }
-        }
-        qb.push("))))");
+        push_lab_reader_acl(&mut qb, col_prefix, principals);
     }
 
     // Composite ordering for deterministic pagination across ALL callers of
@@ -843,23 +854,7 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     // applied in SQL, before the aggregate, so COUNT cannot reveal private
     // board existence through an authorized-looking filter.
     if let Some(ref principals) = q.lab_reader_pubkeys {
-        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
-        qb.push_bind(KIND_LAB_BOARD_REVISION as i32);
-        qb.push(", ");
-        qb.push_bind(KIND_LAB_BOARD_HEAD as i32);
-        qb.push(format!(
-            ") OR EXISTS (SELECT 1 FROM lab_board_heads h WHERE h.community_id = {col_prefix}community_id \\
-             AND h.board_id::text = {col_prefix}d_tag AND (h.access_scope IN ('community', 'community_readonly') OR h.owner_pubkey IN ("
-        ));
-        if principals.is_empty() {
-            qb.push("NULL");
-        } else {
-            let mut sep = qb.separated(", ");
-            for principal in principals {
-                sep.push_bind(principal.clone());
-            }
-        }
-        qb.push("))))");
+        push_lab_reader_acl(&mut qb, col_prefix, principals);
     }
 
     let row = qb.build().fetch_one(&mut *conn).await?;
@@ -2491,5 +2486,46 @@ mod tests {
         .to_string();
         assert!(!huddle_started_content_links(&wrong_field, channel_id));
         assert!(!huddle_started_content_links("not-json", channel_id));
+    }
+}
+
+#[cfg(test)]
+mod lab_reader_acl_tests {
+    use super::*;
+
+    // A doubled line-continuation backslash once slipped into this literal
+    // during an upstream merge. Rust then emitted a literal backslash plus the
+    // newline and indentation into the SQL, and Postgres answered every
+    // authenticated REQ without `kinds` with a syntax error. No test touched
+    // the rendered text, so nothing failed until a relay ran it. Guard the
+    // text, not the source.
+    #[test]
+    fn lab_reader_acl_renders_on_one_line_without_stray_escapes() {
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT 1 FROM events e WHERE 1=1");
+        push_lab_reader_acl(&mut qb, "e.", &[vec![1u8; 32], vec![2u8; 32]]);
+        let sql = qb.sql();
+        let sql = sql.as_str();
+        assert!(!sql.contains('\\'), "stray backslash in SQL: {sql}");
+        assert!(!sql.contains('\n'), "newline in SQL: {sql}");
+        assert_eq!(
+            sql,
+            "SELECT 1 FROM events e WHERE 1=1 AND (e.kind NOT IN ($1, $2) OR EXISTS (SELECT 1 FROM lab_board_heads h \
+             WHERE h.community_id = e.community_id AND h.board_id::text = e.d_tag AND (h.access_scope IN ('community', \
+             'community_readonly') OR h.owner_pubkey IN ($3, $4))))"
+        );
+    }
+
+    #[test]
+    fn lab_reader_acl_with_no_principals_admits_only_public_boards() {
+        let mut qb: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT COUNT(*) AS cnt FROM events WHERE 1=1");
+        push_lab_reader_acl(&mut qb, "", &[]);
+        let sql = qb.sql();
+        let sql = sql.as_str();
+        assert!(
+            sql.contains(" AND (kind NOT IN ($1, $2) OR EXISTS ("),
+            "{sql}"
+        );
+        assert!(sql.ends_with("OR h.owner_pubkey IN (NULL))))"), "{sql}");
     }
 }
