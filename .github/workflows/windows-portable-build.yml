@@ -299,7 +299,16 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf "desktop/src-tauri/target/$TARGET/release/bundle"
-          pnpm -C desktop tauri build \
+          # `pnpm exec tauri`, NOT `pnpm tauri`: since upstream #6902 the
+          # `tauri` script goes through scripts/tauri-command.mjs, which
+          # overrides frontendDist with an absolute temp path. On Windows that
+          # path (C:\Users\...\Temp\...\dist) deserialises as tauri-utils'
+          # FrontendDist::Url (untagged enum, Url variant first, "c" is a valid
+          # scheme), so nothing is embedded and the app navigates to a folder
+          # the wrapper deletes right after the build: ERR_FILE_NOT_FOUND on
+          # launch. Calling the CLI directly keeps frontendDist at ../dist,
+          # where beforeBuildCommand (`pnpm build`) leaves the OSS variant.
+          pnpm -C desktop exec tauri build \
             --target x86_64-pc-windows-msvc \
             --no-bundle \
             --no-sign \
@@ -315,6 +324,13 @@ jobs:
           APP_EXE="$TARGET_ROOT/buzz-desktop.exe"
           [[ -f "$APP_EXE" ]] || {
             echo "::error::Desktop executable not found at $APP_EXE" >&2
+            exit 1
+          }
+          # The frontend must be embedded in the executable. Asset keys such as
+          # /assets/index-<hash>.js are stored as plain strings; the 1.4 build
+          # that shipped without them (see the tauri step comment) had zero.
+          grep -a -q -F '/assets/index-' "$APP_EXE" || {
+            echo "::error::buzz-desktop.exe embeds no frontend assets (frontendDist was not a directory)" >&2
             exit 1
           }
           for sidecar in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
@@ -380,7 +396,7 @@ jobs:
           SIDECAR_BUILD=cargo build --release --target x86_64-pc-windows-msvc -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh x86_64-pc-windows-msvc
           NEST_TEST=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
-          TAURI_COMMAND=pnpm -C desktop tauri build --target x86_64-pc-windows-msvc --no-bundle --no-sign --ci --config src-tauri/tauri.canary.conf.json
+          TAURI_COMMAND=pnpm -C desktop exec tauri build --target x86_64-pc-windows-msvc --no-bundle --no-sign --ci --config src-tauri/tauri.canary.conf.json
           TAURI_BUNDLE=none
           TAURI_SIGNING=disabled
           CREATE_UPDATER_ARTIFACTS=false
