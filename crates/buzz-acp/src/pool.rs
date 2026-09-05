@@ -1247,6 +1247,79 @@ const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// an identifying name must treat it as absent.
 const UNKNOWN_CHANNEL_NAME: &str = "unknown";
 
+/// Maximum length accepted by the monitor's `#buzz-agent` parser.
+const BUZZ_AGENT_SENTINEL_MAX_CHARS: usize = 32;
+/// Maximum length accepted by the monitor's `#buzz-channel` parser.
+const BUZZ_CHANNEL_SENTINEL_MAX_CHARS: usize = 64;
+
+/// Turn the stable display name forwarded by the desktop into the slug used by
+/// the session monitor. The monitor deliberately accepts only a small ASCII
+/// allowlist, so punctuation and non-ASCII runs become a single separator.
+fn buzz_agent_sentinel_slug(raw: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch.to_ascii_lowercase());
+            separator_pending = false;
+        } else if !slug.is_empty() {
+            separator_pending = true;
+        }
+    }
+
+    let slug: String = slug.chars().take(BUZZ_AGENT_SENTINEL_MAX_CHARS).collect();
+    let slug = slug.trim_end_matches('-').to_string();
+    (!slug.is_empty()).then_some(slug)
+}
+
+/// Keep channel metadata on the sentinel single-line and within the monitor's
+/// parser limit. An absent/unnamed channel is represented by `unknown`, while
+/// the UUID below still keeps sessions distinguishable.
+fn buzz_channel_sentinel_name(raw: Option<&str>) -> String {
+    let channel: String = raw
+        .unwrap_or(UNKNOWN_CHANNEL_NAME)
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(BUZZ_CHANNEL_SENTINEL_MAX_CHARS)
+        .collect();
+    let channel = channel.trim().to_string();
+    if channel.is_empty() {
+        UNKNOWN_CHANNEL_NAME.to_string()
+    } else {
+        channel
+    }
+}
+
+/// Build the three-line header understood by the Buzz session monitor.
+///
+/// This is prompt metadata rather than an instruction: it is emitted only on
+/// the first user message of a newly-created channel session. The desktop
+/// already supplies `session_title` for every managed agent, so no separate
+/// per-agent launcher configuration is needed.
+fn buzz_agent_sentinel(
+    agent_name: Option<&str>,
+    channel_name: Option<&str>,
+    channel_id: Uuid,
+) -> Option<String> {
+    let agent_slug = buzz_agent_sentinel_slug(agent_name?)?;
+    Some(format!(
+        "#buzz-agent: {agent_slug}\n#buzz-channel: {}\n#buzz-channel-id: {channel_id}",
+        buzz_channel_sentinel_name(channel_name),
+    ))
+}
+
+/// Put the monitor header before every other line in a first user message.
+fn prepend_buzz_agent_sentinel(sentinel: &str, body: &str) -> String {
+    if body.is_empty() {
+        sentinel.to_string()
+    } else {
+        format!("{sentinel}\n\n{body}")
+    }
+}
+
 /// Channel-derived inputs for a new session — `(is_dm, title_channel)` — from
 /// **one** metadata resolve.
 ///
@@ -2479,6 +2552,20 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
     };
 
+    // The monitor groups Buzz sessions by the first-line declaration below.
+    // Derive it from the same stable agent title used for session metadata and
+    // only emit it for a newly-created channel session. Heartbeats and resumed
+    // sessions must not receive a duplicate declaration.
+    let buzz_sentinel = match (&source, is_new_session) {
+        (PromptSource::Channel(scope), true) => buzz_agent_sentinel(
+            ctx.session_title.as_deref(),
+            title_channel.as_deref(),
+            scope.channel_id(),
+        ),
+        _ => None,
+    };
+    let mut first_prompt_needs_buzz_sentinel = buzz_sentinel.is_some();
+
     if is_new_session {
         if let (PromptSource::Channel(scope), Some(ref initial_msg)) =
             (&source, &ctx.initial_message)
@@ -2497,6 +2584,10 @@ pub async fn run_prompt_task(
                 &standing,
                 initial_msg,
             );
+            let init_msg = buzz_sentinel
+                .as_deref()
+                .map(|sentinel| prepend_buzz_agent_sentinel(sentinel, &init_msg))
+                .unwrap_or(init_msg);
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -2509,6 +2600,7 @@ pub async fn run_prompt_task(
 
             match init_result {
                 Ok(stop_reason) => {
+                    first_prompt_needs_buzz_sentinel = false;
                     tracing::info!(
                         target: "pool::session",
                         "initial_message complete for channel {cid}: {stop_reason:?}"
@@ -2645,7 +2737,7 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let mut prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
@@ -2754,6 +2846,19 @@ pub async fn run_prompt_task(
         );
         return;
     };
+
+    if first_prompt_needs_buzz_sentinel {
+        if let (Some(sentinel), Some(first_section)) =
+            (buzz_sentinel.as_deref(), prompt_sections.first_mut())
+        {
+            // A slash command must remain a separate first block beginning
+            // with `/` for ACP connectors to recognize it. In that one
+            // protocol-specific shape, the header is attached to the wrapped
+            // context block; ordinary Buzz prompts get the strict first-line
+            // placement above.
+            *first_section = prepend_buzz_agent_sentinel(sentinel, first_section);
+        }
+    }
 
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
@@ -5333,6 +5438,40 @@ mod tests {
         // shared helper does not start handing heartbeats [Agent Instructions].
         let composed = prepend_standing_for_legacy(1, &base_only(Some("be helpful")), "tick");
         assert_eq!(composed, "<base>\nbe helpful\n</base>\n\ntick");
+    }
+
+    #[test]
+    fn buzz_agent_sentinel_uses_monitor_compatible_header() {
+        let channel_id = Uuid::parse_str("00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae").unwrap();
+        let sentinel =
+            buzz_agent_sentinel(Some(" Barbosa "), Some("ADV-Igor-Babi-Geral"), channel_id)
+                .expect("a usable agent name produces a sentinel");
+
+        assert_eq!(
+            sentinel,
+            "#buzz-agent: barbosa\n#buzz-channel: ADV-Igor-Babi-Geral\n#buzz-channel-id: 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae"
+        );
+        assert_eq!(
+            prepend_buzz_agent_sentinel(&sentinel, "[Context]\nScope: thread"),
+            "#buzz-agent: barbosa\n#buzz-channel: ADV-Igor-Babi-Geral\n#buzz-channel-id: 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae\n\n[Context]\nScope: thread"
+        );
+    }
+
+    #[test]
+    fn buzz_agent_sentinel_slug_collapses_unsafe_name_runs() {
+        assert_eq!(
+            buzz_agent_sentinel_slug("Alis / Dev + Windows"),
+            Some("alis-dev-windows".to_string())
+        );
+        assert_eq!(buzz_agent_sentinel_slug("---"), None);
+    }
+
+    #[test]
+    fn buzz_agent_sentinel_falls_back_to_unknown_channel_with_uuid() {
+        let channel_id = Uuid::nil();
+        let sentinel = buzz_agent_sentinel(Some("Barbosa"), None, channel_id).unwrap();
+        assert!(sentinel.starts_with("#buzz-agent: barbosa\n#buzz-channel: unknown\n"));
+        assert!(sentinel.ends_with("#buzz-channel-id: 00000000-0000-0000-0000-000000000000"));
     }
 
     #[test]
