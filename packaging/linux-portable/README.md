@@ -23,25 +23,43 @@ extracted directory, as long as the sidecars stay next to it.
 
 ## Requirements
 
-Arch / Omarchy:
+Arch / Omarchy — a stock Omarchy 4 install already has the GTK/WebKit stack, so
+in practice this line is about GStreamer:
 
 ```bash
-sudo pacman -S --needed webkit2gtk-4.1 gtk3 libsoup3 libayatana-appindicator xdotool librsvg alsa-lib
+sudo pacman -S --needed gst-plugins-good gst-libav
 ```
 
-Debian / Ubuntu: `libwebkit2gtk-4.1-0 libgtk-3-0 libsoup-3.0-0
-libayatana-appindicator3-1 libxdo3 librsvg2-2 libasound2`.
+`gst-plugins-good` is **not optional**. WebKit looks up the `autoaudiosink`
+element by name at startup; without it WebKit gets a null element, connects a
+signal to it, and the web process aborts — the window opens empty and dies,
+with one line of stderr as the only clue. `ldd` cannot see this coming, which
+is why `check-deps.sh` checks the elements separately. `gst-libav` is the AAC
+and general media decoder: without it the app runs fine but audio and video
+messages will not play. `gst-plugins-bad` is not needed.
 
-`./check-deps.sh` reports anything still missing and prints the pacman line.
+Debian / Ubuntu: `gstreamer1.0-plugins-good gstreamer1.0-libav`, plus
+`libwebkit2gtk-4.1-0 libgtk-3-0 libsoup-3.0-0 librsvg2-2 libasound2` if the
+GTK/WebKit stack is not already there.
+
+Run `./check-deps.sh` — it reports both the shared libraries and the GStreamer
+elements, and prints the exact pacman line for whatever is missing.
 
 ## Blank or black window
 
-WebKitGTK's DMABUF renderer is the usual culprit under a Wayland compositor:
+First rule out GStreamer with `./check-deps.sh` — a missing `autoaudiosink`
+looks exactly like a rendering failure. If that is clean, the app has its own
+rendering escape hatch, which the launcher passes straight through:
 
 ```bash
-buzz-alis --compat   # WEBKIT_DISABLE_DMABUF_RENDERER=1 + no compositing
-buzz-alis --x11      # last resort: GDK_BACKEND=x11, via XWayland
+buzz-alis --safe-rendering   # WEBKIT_DMABUF_RENDERER_FORCE_SHM=1 + no compositing
+buzz-alis --x11              # last resort: GDK_BACKEND=x11, via XWayland
 ```
+
+Do **not** set `WEBKIT_DISABLE_DMABUF_RENDERER=1`, the switch older guides
+recommend. On current WebKitGTK it empties the buffer transport set and crashes
+the web process instead of fixing it; `--safe-rendering` uses the supported
+replacement.
 
 ## What is in the package
 
