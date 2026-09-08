@@ -1,0 +1,357 @@
+name: Linux Portable Build (buzz-alis)
+
+# Linux twin of windows-portable-build.yml: an unsigned, unbundled, portable
+# x86_64 Linux distribution of the seven buzz-alis executables, built from
+# whatever ref it is dispatched on. Same gates, same manifest discipline, same
+# `label` input naming the tarball and the artifact.
+#
+# Why a tarball and not the .deb/.AppImage that linux-canary.yml produces: the
+# target machine is Arch (Omarchy), where a .deb is useless and an AppImage
+# would ship a second copy of a WebKit stack the host already has. Extracting
+# next to the sidecars is also exactly how the Windows portable package works,
+# so both platforms behave the same way.
+#
+# Portability of the result: the job pins `ubuntu-24.04` (glibc 2.39) rather
+# than riding `ubuntu-latest`, because glibc is forward-compatible only —
+# binaries built on an older glibc run on a newer one, never the reverse.
+# Arch currently ships glibc 2.44, so this direction is the safe one and
+# pinning keeps it from silently flipping when the runner label moves.
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Release label used for the tarball and artifact name (e.g. buzz-alis-1.4)"
+        required: false
+        default: buzz-alis-1.4
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buzz-alis-linux-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+  # Falls back for any non-dispatch trigger, where `inputs` is empty.
+  LABEL: ${{ inputs.label || 'buzz-alis-1.4' }}
+
+jobs:
+  linux-portable:
+    name: Linux unsigned portable tarball
+    if: github.repository == 'oigorbastos/buzz'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # fetch-depth: 2, not the default of 1: `pnpm -C desktop check` runs
+      # desktop/scripts/check-file-sizes.mjs, whose resolveBaseRef() always
+      # diffs against HEAD^1 under GITHUB_ACTIONS and hard-fails when that
+      # parent commit is absent. Same reason the Windows job sets it.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # The GTK/WebKit development stack Tauri links against. Mirrors
+      # linux-canary.yml's list minus the AppImage-only tools (appimagetool,
+      # squashfs-tools, patchelf), which nothing here uses.
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=120 \
+            build-essential \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.14.1
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.4.0
+
+      - name: Verify pinned toolchains
+        run: |
+          set -euo pipefail
+          rustc --version
+          node --version
+          pnpm --version
+          [[ "$(rustc --version)" == rustc\ 1.95.0* ]] || exit 1
+          [[ "$(node --version)" == "v24.14.1" ]] || exit 1
+          [[ "$(pnpm --version)" == "11.4.0" ]] || exit 1
+          # Nothing below passes --target, so cargo writes to target/release
+          # and bundle-sidecars.sh names the sidecars after the host triple.
+          # Both only line up with $TARGET when the host really is that triple.
+          HOST=$(rustc -vV | sed -n 's|host: ||p')
+          [[ "$HOST" == "$TARGET" ]] || {
+            echo "::error::Runner host triple $HOST != expected $TARGET" >&2
+            exit 1
+          }
+
+      - name: Install frozen JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run targeted Rust tests
+        run: |
+          set -euo pipefail
+          cargo test -p buzz-acp
+          cargo test -p buzz-cli lab --lib
+
+      - name: Run desktop checks and unit tests
+        run: |
+          set -euo pipefail
+          pnpm -C desktop check
+          pnpm -C desktop typecheck
+          pnpm -C desktop test
+
+      - name: Build desktop E2E and production frontends
+        run: |
+          set -euo pipefail
+          pnpm -C desktop build:e2e
+          pnpm -C desktop build
+
+      - name: Build and bundle Linux sidecars
+        run: |
+          set -euo pipefail
+          # buzz-backend-kubernetes is in the list on Linux and absent on
+          # Windows: tauri.conf.json declares all six in bundle.externalBin,
+          # and bundle-sidecars.sh drops that one only for *windows* targets.
+          cargo build --release \
+            -p buzz-acp \
+            -p buzz-agent \
+            -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp \
+            -p git-credential-nostr \
+            -p buzz-cli
+          # No argument: the script then reads target/release and names the
+          # copies after the host triple, which the check above proved is
+          # $TARGET. Passing $TARGET instead would send it looking in
+          # target/$TARGET/release, where an un-targeted cargo wrote nothing.
+          ./scripts/bundle-sidecars.sh
+          for sidecar in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+            test -f "target/release/$sidecar"
+            test -f "desktop/src-tauri/binaries/$sidecar-$TARGET"
+          done
+
+      - name: Run managed-agent Nest test
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+
+      - name: Generate temporary non-updating Tauri config
+        run: |
+          set -euo pipefail
+          cat > desktop/src-tauri/tauri.canary.conf.json <<'JSON'
+          {
+            "bundle": { "createUpdaterArtifacts": false },
+            "plugins": { "updater": { "endpoints": [] } }
+          }
+          JSON
+
+      - name: Build Linux desktop executable without bundle
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          set -euo pipefail
+          rm -rf desktop/src-tauri/target/release/bundle
+          # `pnpm exec tauri`, NOT `pnpm tauri`: since upstream #6902 the
+          # `tauri` script goes through scripts/tauri-command.mjs, which
+          # overrides frontendDist with an absolute temp path the wrapper
+          # deletes right after the build. On Windows that path parses as
+          # FrontendDist::Url and nothing gets embedded; a POSIX path is not a
+          # URL so Linux escapes the trap, but calling the CLI directly keeps
+          # frontendDist at ../dist on both platforms instead of relying on
+          # that difference. The embed is verified for real below either way.
+          pnpm -C desktop exec tauri build \
+            --no-bundle \
+            --ci \
+            --config src-tauri/tauri.canary.conf.json
+
+      - name: Package, reextract, and audit one portable tarball
+        id: package
+        run: |
+          set -euo pipefail
+          TARGET_ROOT="desktop/src-tauri/target/release"
+          APP_BIN="$TARGET_ROOT/buzz-desktop"
+          [[ -f "$APP_BIN" ]] || {
+            echo "::error::Desktop executable not found at $APP_BIN" >&2
+            exit 1
+          }
+          # The frontend must be embedded in the executable. Asset keys such as
+          # /assets/index-<hash>.js are stored as plain strings; the 1.4 Windows
+          # build that shipped without them had zero.
+          grep -a -q -F '/assets/index-' "$APP_BIN" || {
+            echo "::error::buzz-desktop embeds no frontend assets (frontendDist was not a directory)" >&2
+            exit 1
+          }
+          [[ ! -d "$TARGET_ROOT/bundle" ]] || {
+            echo "::error::Tauri bundle directory exists after --no-bundle" >&2
+            exit 1
+          }
+          if find "$TARGET_ROOT" -type f \( -iname '*.deb' -o -iname '*.rpm' -o -iname '*.AppImage' -o -iname '*.sig' \) -print -quit | grep -q .; then
+            echo "::error::Installer, updater, or signature output found" >&2
+            exit 1
+          fi
+
+          PKG_NAME="$LABEL-linux-portable-x64"
+          PORTABLE_ROOT="$RUNNER_TEMP/$PKG_NAME"
+          EXTRACT_ROOT="$RUNNER_TEMP/$LABEL-portable-reextract"
+          RELEASE_ROOT="$RUNNER_TEMP/$LABEL-portable-release"
+          rm -rf "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
+          mkdir -p "$PORTABLE_ROOT" "$EXTRACT_ROOT" "$RELEASE_ROOT"
+
+          install -m 755 "$APP_BIN" "$PORTABLE_ROOT/buzz-desktop"
+          for sidecar in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+            install -m 755 "target/release/$sidecar" "$PORTABLE_ROOT/$sidecar"
+          done
+          install -m 755 packaging/linux-portable/install.sh "$PORTABLE_ROOT/install.sh"
+          install -m 755 packaging/linux-portable/check-deps.sh "$PORTABLE_ROOT/check-deps.sh"
+          install -m 644 packaging/linux-portable/README.md "$PORTABLE_ROOT/README.md"
+          install -m 644 desktop/src-tauri/icons/128x128.png "$PORTABLE_ROOT/icon.png"
+
+          # Record what the app actually links against, so a launch failure on
+          # the target machine can be diagnosed without rebuilding.
+          ldd "$APP_BIN" | sed 's/^[[:space:]]*//' | sort > "$PORTABLE_ROOT/LINKED-LIBRARIES.txt"
+
+          VERSION=$(node -p "require('./desktop/package.json').version")
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          RUST_VERSION=$(rustc --version)
+          NODE_VERSION=$(node --version)
+          PNPM_VERSION=$(pnpm --version)
+          GLIBC_VERSION=$(ldd --version | head -1)
+          cat > "$PORTABLE_ROOT/BUILD-MANIFEST.txt" <<EOF
+          SOURCE_SHA=$GITHUB_SHA
+          BUILD_WORKFLOW_FILE=.github/workflows/linux-portable-build.yml
+          GITHUB_REPOSITORY=$GITHUB_REPOSITORY
+          GITHUB_REF=$GITHUB_REF
+          GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME
+          GITHUB_RUN_ID=$GITHUB_RUN_ID
+          GITHUB_RUN_URL=$RUN_URL
+          VERSION=$VERSION
+          LABEL=$LABEL
+          TARGET=$TARGET
+          RUNNER=ubuntu-24.04
+          RUNNER_OS=$RUNNER_OS
+          RUNNER_ARCH=$RUNNER_ARCH
+          BUILD_GLIBC=$GLIBC_VERSION
+          RUST=$RUST_VERSION
+          NODE=$NODE_VERSION
+          PNPM=$PNPM_VERSION
+          GATE_01=cargo fmt --all -- --check
+          GATE_02=cargo test -p buzz-acp
+          GATE_03=cargo test -p buzz-cli lab --lib
+          GATE_04=pnpm -C desktop check
+          GATE_05=pnpm -C desktop typecheck
+          GATE_06=pnpm -C desktop test
+          GATE_07=pnpm -C desktop build:e2e
+          GATE_08=pnpm -C desktop build
+          GATE_09=cargo test --manifest-path desktop/src-tauri/Cargo.toml managed_agents::nest
+          GATE_10=frontend assets embedded in buzz-desktop (grep /assets/index-)
+          NOT_RUN=cargo clippy --workspace --all-targets
+          NOT_RUN=cargo test --workspace
+          NOT_RUN_NOTE=The full-workspace clippy and test preflight is not repeated here. It ran on ubuntu-latest for commit c7ddb1ae3aa1fcdfb5730f13c0bf5af1e556e7e8 in run 33592220462 (windows-portable-build.yml, buzz-alis-1.4); every commit on main after it touches deploy-lab/*.sql only. Re-run windows-portable-build.yml if you need that gate against newer code.
+          SIDECAR_BUILD=cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh
+          TAURI_COMMAND=pnpm -C desktop exec tauri build --no-bundle --ci --config src-tauri/tauri.canary.conf.json
+          TAURI_BUNDLE=none
+          SIGNING=none
+          UPDATER=disabled (createUpdaterArtifacts false, no endpoints)
+          EOF
+
+          TARBALL="$RELEASE_ROOT/$PKG_NAME.tar.gz"
+          tar -czf "$TARBALL" -C "$RUNNER_TEMP" "$PKG_NAME"
+
+          # Prove the tarball, not the build directory: extract it fresh and
+          # check the seven executables survived with their exec bit and run.
+          tar -xzf "$TARBALL" -C "$EXTRACT_ROOT"
+          EXTRACTED="$EXTRACT_ROOT/$PKG_NAME"
+          for bin in buzz-desktop buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+            [[ -x "$EXTRACTED/$bin" ]] || {
+              echo "::error::$bin missing or not executable after reextraction" >&2
+              exit 1
+            }
+          done
+          # Only buzz-acp and buzz (buzz-cli) parse arguments with clap and so
+          # have a --help to answer; buzz-agent, buzz-backend-kubernetes,
+          # buzz-dev-mcp and git-credential-nostr are stdio/argv0-dispatched
+          # servers and helpers with no such flag. Those are proven to be
+          # loadable executables by the linker check below instead, and
+          # buzz-desktop is a GUI binary checked by its embedded assets.
+          for bin in buzz-acp buzz; do
+            "$EXTRACTED/$bin" --help >/dev/null 2>&1 || {
+              echo "::error::$bin --help failed after reextraction" >&2
+              exit 1
+            }
+          done
+          grep -a -q -F '/assets/index-' "$EXTRACTED/buzz-desktop" || {
+            echo "::error::Reextracted buzz-desktop lost its embedded frontend" >&2
+            exit 1
+          }
+          # No 'not found' line means the build host resolved every shared
+          # library each binary asks for; the target machine gets the same
+          # check from check-deps.sh, against its own libraries.
+          for bin in buzz-desktop buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+            if ldd "$EXTRACTED/$bin" 2>&1 | grep -q 'not found'; then
+              echo "::error::$bin has unresolved shared libraries on the build host" >&2
+              ldd "$EXTRACTED/$bin" | grep 'not found' >&2
+              exit 1
+            fi
+          done
+
+          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$TARBALL")
+          {
+            echo "SHA256=$SHA256"
+            echo "SIZE_BYTES=$SIZE"
+            echo "TARBALL=$PKG_NAME.tar.gz"
+            echo "SOURCE_SHA=$GITHUB_SHA"
+            echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+            echo "GITHUB_RUN_URL=$RUN_URL"
+          } > "$RELEASE_ROOT/TARBALL-SHA256.txt"
+          echo "release_root=$RELEASE_ROOT" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $PKG_NAME"
+            echo
+            echo '```'
+            cat "$RELEASE_ROOT/TARBALL-SHA256.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload portable tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package.outputs.pkg_name }}
+          path: ${{ steps.package.outputs.release_root }}
+          if-no-files-found: error
+          retention-days: 14
