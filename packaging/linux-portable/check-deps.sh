@@ -22,6 +22,23 @@ if [[ ! -f "$BIN" ]]; then
     exit 1
 fi
 
+# --- 0. the binaries themselves -----------------------------------------
+# Sidecar discovery is strictly by execute bit: a sidecar that is present but
+# not +x is reported by the app as "<cmd> was not found ... Antivirus software
+# can quarantine bundled binaries", which names neither the file nor the real
+# reason. Cheaper to catch it here.
+BIN_HOME="$(cd "$(dirname "$BIN")" && pwd)"
+for b in buzz-desktop buzz buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr; do
+    if [[ ! -f "$BIN_HOME/$b" ]]; then
+        status=1
+        echo "Binaries: MISSING $b"
+    elif [[ ! -x "$BIN_HOME/$b" ]]; then
+        status=1
+        echo "Binaries: NOT EXECUTABLE $b  (fix: chmod +x $BIN_HOME/$b)"
+    fi
+done
+[[ $status -eq 0 ]] && echo "Binaries: OK — all seven present and executable."
+
 # --- 1. shared libraries ------------------------------------------------
 if command -v ldd >/dev/null 2>&1; then
     missing=$(ldd "$BIN" 2>/dev/null | awk '/not found/ {print $1}' | sort -u)
@@ -37,7 +54,6 @@ if command -v ldd >/dev/null 2>&1; then
                 libwebkit2gtk-4.1*|libjavascriptcoregtk-4.1*) pkgs="$pkgs webkit2gtk-4.1" ;;
                 libgtk-3*|libgdk-3*)                          pkgs="$pkgs gtk3" ;;
                 libsoup-3*)                                   pkgs="$pkgs libsoup3" ;;
-                libayatana-appindicator3*)                    pkgs="$pkgs libayatana-appindicator" ;;
                 libxdo*)                                      pkgs="$pkgs xdotool" ;;
                 librsvg-2*)                                   pkgs="$pkgs librsvg" ;;
                 libasound*)                                   pkgs="$pkgs alsa-lib" ;;
@@ -75,6 +91,21 @@ else
         echo "GStreamer AAC decoder: absent (not fatal) — audio/video messages will not play."
         echo "  Arch/Omarchy: sudo pacman -S --needed gst-libav"
     fi
+fi
+
+# --- 3. graphical terminal (not fatal) ----------------------------------
+# "Open Project Terminal" and the login flow for any non-Claude ACP runtime try
+# exactly these four commands and never read $TERMINAL, so a machine whose
+# terminal is foot/alacritty/kitty silently gets nothing.
+if ! command -v x-terminal-emulator >/dev/null 2>&1 \
+   && ! command -v gnome-terminal >/dev/null 2>&1 \
+   && ! command -v konsole >/dev/null 2>&1 \
+   && ! command -v xterm >/dev/null 2>&1; then
+    echo "Terminal emulator: none of x-terminal-emulator/gnome-terminal/konsole/xterm (not fatal)"
+    echo "  'Open Project Terminal' and non-Claude ACP logins will open nothing."
+    echo "  Arch/Omarchy: sudo pacman -S --needed xterm"
+else
+    echo "Terminal emulator: OK"
 fi
 
 exit $status

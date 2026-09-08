@@ -1,6 +1,7 @@
 # buzz-alis — portable Linux build
 
-Same six executables as the Windows portable package, built for
+Same seven executables as the Windows portable package (Linux adds the
+`buzz-backend-kubernetes` sidecar), built for
 `x86_64-unknown-linux-gnu` and unbundled: no installer, no auto-updater, no
 signature. The app links against the host's GTK 3 / WebKitGTK 4.1 stack rather
 than shipping its own, which is why the package is small and why
@@ -53,13 +54,65 @@ rendering escape hatch, which the launcher passes straight through:
 
 ```bash
 buzz-alis --safe-rendering   # WEBKIT_DMABUF_RENDERER_FORCE_SHM=1 + no compositing
-buzz-alis --x11              # last resort: GDK_BACKEND=x11, via XWayland
+buzz-alis --x11              # GDK_BACKEND=x11, via XWayland
 ```
+
+`--x11` is worth trying for a second reason: WebKitGTK media capture is noted
+in-code (`desktop/src-tauri/src/linux_media.rs`) as reliable on the X11 backend,
+which only the AppImage ever pinned. If the microphone stays silent in a Huddle
+under native Wayland, retry the app with `--x11`.
 
 Do **not** set `WEBKIT_DISABLE_DMABUF_RENDERER=1`, the switch older guides
 recommend. On current WebKitGTK it empties the buffer transport set and crashes
 the web process instead of fixing it; `--safe-rendering` uses the supported
 replacement.
+
+## First run
+
+The install is a blank slate — it shares nothing with a Buzz install on another
+machine.
+
+1. **Identity.** Onboarding offers *Create a new identity key* or *Use an
+   existing key*. A new key is a different pubkey, and relay membership is per
+   pubkey, so a fresh key is not a member of anything. To keep the identity from
+   another machine, bring its nsec over yourself (or the `ncryptsec` file from
+   Settings › Backup, plus its password) and pick *Use an existing key*. There is
+   no desktop-to-desktop QR pairing.
+2. **Relay.** After the identity, *Join a community* takes the relay address;
+   `https://host:3020` is fine, the app normalizes it. A relay saved through the
+   UI wins over the `BUZZ_RELAY_URL` environment variable.
+3. **Smoke test without the GUI**, if the app cannot reach the relay and you want
+   to know which half is broken:
+
+   ```bash
+   BUZZ_RELAY_URL=https://<host>:3020 BUZZ_PRIVATE_KEY=<nsec> \
+     ~/.local/share/buzz-alis/buzz channels list
+   ```
+
+## Known limits on Linux
+
+None of these are packaging bugs — they are places where this app has a macOS or
+X11 path and Linux/Wayland has none. Listed so they are not mistaken for a broken
+install:
+
+- **No tray icon.** `mod tray_menu` and hide-on-close are `#[cfg(target_os =
+  "macos")]`, so closing the main window quits the app.
+- **No auto-updater.** This build has the updater disabled by construction. To
+  upgrade, extract the new tarball and run `./install.sh` again.
+- **Push-to-talk (Ctrl+Space) does nothing on Wayland.** `global-hotkey` routes
+  Linux through X11 only, and a failed registration is an `eprintln!` that never
+  reaches the UI. Use voice activity detection instead.
+- **"Keep awake while agents are active" is a no-op.** The whole of
+  `prevent_sleep.rs` is macOS-gated; the toggle still renders.
+- **"Open Project Terminal" and non-Claude ACP logins find no terminal.** Both
+  call sites try exactly `x-terminal-emulator`, `gnome-terminal`, `konsole`,
+  `xterm` and do not read `$TERMINAL` — so a machine whose terminal is `foot`,
+  `alacritty` or `kitty` gets nothing. Stopgap: `sudo pacman -S --needed xterm`.
+- **`buzz://lab` links do nothing from outside the app.** The scheme handler
+  matches `connect`, `join`, `add-community`, `channel`, `message`,
+  `repo`/`project`/`pr`/`issue` and `nostr-bind`; there is no `lab` arm, so the
+  URL is logged and dropped. Lab links pasted *inside* the app still work — that
+  is separate, frontend-side handling. Not Linux-specific.
 
 ## What is in the package
 
