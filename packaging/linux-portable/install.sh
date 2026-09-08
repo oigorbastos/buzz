@@ -46,14 +46,14 @@ cat >> "$BIN_DIR/buzz-alis" <<'LAUNCHER'
 ARGS=()
 for arg in "$@"; do
     case "$arg" in
-        # WebKitGTK's DMABUF renderer is the usual cause of a blank or black
-        # window under a Wayland compositor; these two switches fall back to
-        # the software path without touching the rest of the session.
-        --compat)
-            export WEBKIT_DISABLE_DMABUF_RENDERER=1
-            export WEBKIT_DISABLE_COMPOSITING_MODE=1
-            ;;
-        # Last resort: run through XWayland instead of the Wayland backend.
+        # Last resort for a window that will not paint: run through XWayland
+        # instead of the Wayland backend. Everything WebKit-rendering related
+        # belongs to the app's own --safe-rendering flag, which falls through
+        # to buzz-desktop untouched -- do NOT set WEBKIT_* here. In particular
+        # WEBKIT_DISABLE_DMABUF_RENDERER=1, the switch every older guide
+        # recommends, empties WebKit's buffer transport set on current
+        # WebKitGTK and crashes the web process (see
+        # desktop/src-tauri/src/webkit_rendering.rs and upstream #3654).
         --x11)
             export GDK_BACKEND=x11
             ;;
@@ -89,6 +89,6 @@ case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) echo "NOTE: $BIN_DIR is not on your PATH — add it, or run $BIN_DIR/buzz-alis" ;;
 esac
-echo "If the window comes up blank:  buzz-alis --compat   (or --x11)"
+echo "If the window comes up blank:  buzz-alis --safe-rendering   (or --x11)"
 echo
 bash "$PKG_DIR/check-deps.sh" || true
