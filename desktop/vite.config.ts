@@ -56,6 +56,12 @@ export default defineConfig(async ({ mode }) => {
             ? "./src/protectedFeatures/internal.ts"
             : "./src/protectedFeatures/public.ts",
         ),
+        "@protected-feature-components": path.resolve(
+          __dirname,
+          protectedFeaturesEnabled
+            ? "./src/protectedFeatures/internalUi.ts"
+            : "./src/protectedFeatures/publicUi.ts",
+        ),
         "@model-capabilities-manifest": path.resolve(
           import.meta.dirname,
           "../scripts/model-capabilities.json",
