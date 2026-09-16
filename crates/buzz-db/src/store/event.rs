@@ -247,6 +247,14 @@ pub async fn huddle_started_links(
     if parent_channel_ids.is_empty() || ephemeral_channel_ids.is_empty() {
         return Ok(Vec::new());
     }
+    // Liveness snapshots are served to REQ subscribers, so attribute the
+    // acquisition like the other subscription reads instead of taking a
+    // bare pool connection (tests/observability_source.rs pins this).
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::SubscriptionHistory,
+    )
+    .await?;
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (backing.id)
@@ -277,7 +285,7 @@ pub async fn huddle_started_links(
     .bind(KIND_HUDDLE_STARTED as i32)
     .bind(ephemeral_channel_ids)
     .bind(HUDDLE_LINK_CONTENT_MAX_BYTES)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
     rows.into_iter()
