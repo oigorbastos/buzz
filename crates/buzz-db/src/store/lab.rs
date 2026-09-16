@@ -761,6 +761,52 @@ pub async fn list_board_revisions(
     rows.iter().map(row_to_board_revision).collect()
 }
 
+// Db facade methods moved from the runtime module.
+use crate::{lab, Db};
+
+impl Db {
+    /// Lists a community's Lab Board heads, most recently updated first.
+    /// `status_filter` narrows to one status; `None` returns all.
+    pub async fn list_lab_board_heads(
+        &self,
+        community_id: CommunityId,
+        status_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<lab::BoardHead>> {
+        lab::list_board_heads(&self.pool, community_id, status_filter, limit).await
+    }
+
+    /// Returns one Lab Board's current head row, if it exists.
+    pub async fn get_lab_board_head(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+    ) -> Result<Option<lab::BoardHead>> {
+        lab::get_board_head(&self.pool, community_id, board_id).await
+    }
+
+    /// Returns whether a reader principal set may read a Lab Board.
+    pub async fn lab_board_can_read(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+        principals: &[Vec<u8>],
+    ) -> Result<bool> {
+        lab::board_can_read(&self.pool, community_id, board_id, principals).await
+    }
+
+    /// Lists a Lab Board's revision history, newest first.
+    pub async fn list_lab_board_revisions(
+        &self,
+        community_id: CommunityId,
+        board_id: Uuid,
+        before_revision: Option<i32>,
+        limit: i64,
+    ) -> Result<Vec<lab::BoardRevision>> {
+        lab::list_board_revisions(&self.pool, community_id, board_id, before_revision, limit).await
+    }
+}
+
 // This module (and crates/buzz-relay/src/handlers/lab.rs) shipped with the
 // Lab Boards V1 foundation round with zero unit tests — a known, previously
 // flagged gap. These two tests are minimal coverage added alongside the
@@ -829,7 +875,10 @@ mod postgres_tests {
         let board_id = Uuid::new_v4();
         let actor = [7_u8; 32];
 
-        let mut tx = db.begin_transaction().await.expect("begin tx 1");
+        let mut tx = db
+            .begin_event_write_transaction()
+            .await
+            .expect("begin tx 1");
         create_board_head_tx(
             &mut tx,
             community,
@@ -847,7 +896,10 @@ mod postgres_tests {
         .expect("first create commits");
         tx.commit().await.expect("commit first create");
 
-        let mut tx2 = db.begin_transaction().await.expect("begin tx 2");
+        let mut tx2 = db
+            .begin_event_write_transaction()
+            .await
+            .expect("begin tx 2");
         let second = create_board_head_tx(
             &mut tx2,
             community,
@@ -896,7 +948,10 @@ mod postgres_tests {
         let actor = [9_u8; 32];
 
         let board_id = Uuid::new_v4();
-        let mut create_tx = db.begin_transaction().await.expect("begin create tx");
+        let mut create_tx = db
+            .begin_event_write_transaction()
+            .await
+            .expect("begin create tx");
         create_board_head_tx(
             &mut create_tx,
             community,
@@ -974,7 +1029,10 @@ mod postgres_tests {
         // shape of a Lab Board write reaching the CAS transaction after the
         // community has been fenced but before the deletion pipeline's own
         // purge has run.
-        let mut update_tx = db.begin_transaction().await.expect("begin update tx");
+        let mut update_tx = db
+            .begin_event_write_transaction()
+            .await
+            .expect("begin update tx");
         let update_result = update_board_content_head_tx(
             &mut update_tx,
             community,
@@ -999,7 +1057,7 @@ mod postgres_tests {
         let _ = update_tx.rollback().await;
 
         let mut create2_tx = db
-            .begin_transaction()
+            .begin_event_write_transaction()
             .await
             .expect("begin second create tx");
         let create_result = create_board_head_tx(
@@ -1034,51 +1092,5 @@ mod postgres_tests {
             .expect("head still exists");
         assert_eq!(head.title, "Board created before fencing");
         assert_eq!(head.revision, 1);
-    }
-}
-
-// Db facade methods moved from the runtime module.
-use crate::{lab, Db};
-
-impl Db {
-    /// Lists a community's Lab Board heads, most recently updated first.
-    /// `status_filter` narrows to one status; `None` returns all.
-    pub async fn list_lab_board_heads(
-        &self,
-        community_id: CommunityId,
-        status_filter: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<lab::BoardHead>> {
-        lab::list_board_heads(&self.pool, community_id, status_filter, limit).await
-    }
-
-    /// Returns one Lab Board's current head row, if it exists.
-    pub async fn get_lab_board_head(
-        &self,
-        community_id: CommunityId,
-        board_id: Uuid,
-    ) -> Result<Option<lab::BoardHead>> {
-        lab::get_board_head(&self.pool, community_id, board_id).await
-    }
-
-    /// Returns whether a reader principal set may read a Lab Board.
-    pub async fn lab_board_can_read(
-        &self,
-        community_id: CommunityId,
-        board_id: Uuid,
-        principals: &[Vec<u8>],
-    ) -> Result<bool> {
-        lab::board_can_read(&self.pool, community_id, board_id, principals).await
-    }
-
-    /// Lists a Lab Board's revision history, newest first.
-    pub async fn list_lab_board_revisions(
-        &self,
-        community_id: CommunityId,
-        board_id: Uuid,
-        before_revision: Option<i32>,
-        limit: i64,
-    ) -> Result<Vec<lab::BoardRevision>> {
-        lab::list_board_revisions(&self.pool, community_id, board_id, before_revision, limit).await
     }
 }
