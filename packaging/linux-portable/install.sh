@@ -35,6 +35,25 @@ done
 install -m 644 "$PKG_DIR/BUILD-MANIFEST.txt" "$APP_DIR/BUILD-MANIFEST.txt"
 [[ -f "$PKG_DIR/icon.png" ]] && install -m 644 "$PKG_DIR/icon.png" "$ICON_DIR/buzz-alis.png"
 
+# A relay pinned at install time survives reinstalls. Without a relay the app
+# falls back to http://localhost:3000, finds nothing, and every pairing code
+# is born "expired or lost its connection". Pass BUZZ_RELAY_URL (and
+# optionally BUZZ_RELAY_HTTP) when running this script, or the launcher of
+# the previous install is consulted so a plain re-run keeps what it had.
+OLD_LAUNCHER="$BIN_DIR/buzz-alis"
+if [[ -z "${BUZZ_RELAY_URL:-}" && -f "$OLD_LAUNCHER" ]]; then
+    BUZZ_RELAY_URL="$(sed -n 's/^: "${BUZZ_RELAY_URL:=\(.*\)}"$/\1/p' "$OLD_LAUNCHER" | head -1)"
+fi
+if [[ -z "${BUZZ_RELAY_HTTP:-}" && -f "$OLD_LAUNCHER" ]]; then
+    BUZZ_RELAY_HTTP="$(sed -n 's/^: "${BUZZ_RELAY_HTTP:=\(.*\)}"$/\1/p' "$OLD_LAUNCHER" | head -1)"
+fi
+if [[ -n "${BUZZ_RELAY_URL:-}" && -z "${BUZZ_RELAY_HTTP:-}" ]]; then
+    case "$BUZZ_RELAY_URL" in
+        wss://*) BUZZ_RELAY_HTTP="https://${BUZZ_RELAY_URL#wss://}" ;;
+        ws://*) BUZZ_RELAY_HTTP="http://${BUZZ_RELAY_URL#ws://}" ;;
+    esac
+fi
+
 echo "==> Writing launcher $BIN_DIR/buzz-alis"
 cat > "$BIN_DIR/buzz-alis" <<LAUNCHER
 #!/usr/bin/env bash
@@ -42,6 +61,20 @@ cat > "$BIN_DIR/buzz-alis" <<LAUNCHER
 set -euo pipefail
 APP_DIR="$APP_DIR"
 LAUNCHER
+if [[ -n "${BUZZ_RELAY_URL:-}" ]]; then
+    echo "==> Pinning relay $BUZZ_RELAY_URL in the launcher"
+    cat >> "$BIN_DIR/buzz-alis" <<LAUNCHER
+# Relay pinned by install.sh. A BUZZ_RELAY_URL already in the environment wins.
+: "\${BUZZ_RELAY_URL:=$BUZZ_RELAY_URL}"
+case "\$BUZZ_RELAY_URL" in
+    https://*) BUZZ_RELAY_URL="wss://\${BUZZ_RELAY_URL#https://}" ;;
+    http://*) BUZZ_RELAY_URL="ws://\${BUZZ_RELAY_URL#http://}" ;;
+esac
+export BUZZ_RELAY_URL
+: "\${BUZZ_RELAY_HTTP:=${BUZZ_RELAY_HTTP:-}}"
+export BUZZ_RELAY_HTTP
+LAUNCHER
+fi
 cat >> "$BIN_DIR/buzz-alis" <<'LAUNCHER'
 ARGS=()
 for arg in "$@"; do
