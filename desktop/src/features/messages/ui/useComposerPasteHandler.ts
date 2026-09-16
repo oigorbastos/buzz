@@ -6,6 +6,7 @@ import { hasMentionClipboardHtml } from "@/features/messages/lib/normalizeMentio
 import { handleMentionClipboardPaste } from "@/features/messages/lib/mentionClipboardPaste";
 import type { BindPastedMentionIdentities } from "@/features/messages/lib/mentionPasteBinding";
 import { getBuzzCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
+import { readImageFromSystemClipboard } from "@/shared/api/tauriMedia";
 
 export function useComposerPasteHandler(options: {
   editor: Editor | null;
@@ -37,6 +38,22 @@ export function useComposerPasteHandler(options: {
           if (mediaItem) {
             const file = mediaItem.getAsFile();
             if (file) void uploadFileRef.current(file);
+            return true;
+          }
+          // WebKitGTK (Linux) fires `paste` with an empty DataTransfer when
+          // the clipboard holds only an image: no items, no files, no text.
+          // WebView2 and WKWebView expose such images as a file item above,
+          // so reaching here with a fully empty event is the Linux signature.
+          // Read the image natively and feed it through the same upload path.
+          if (isEmptyClipboardEvent(event)) {
+            void readImageFromSystemClipboard()
+              .then((file) => {
+                if (file) void uploadFileRef.current(file);
+              })
+              .catch(() => {
+                // Nothing on the clipboard the webview could show us either;
+                // a failed native read leaves the paste as the no-op it was.
+              });
             return true;
           }
           const codeBlockText = getBuzzCodeBlockClipboardText(
@@ -83,4 +100,15 @@ export function useComposerPasteHandler(options: {
       },
     });
   }, [options.editor, options.scrollToBottom, options.setPendingImeta]);
+}
+
+function isEmptyClipboardEvent(event: ClipboardEvent): boolean {
+  const data = event.clipboardData;
+  if (!data) return true;
+  if (data.items.length > 0 || data.files.length > 0) return false;
+  return (
+    data.types.length === 0 &&
+    data.getData("text/plain") === "" &&
+    data.getData("text/html") === ""
+  );
 }

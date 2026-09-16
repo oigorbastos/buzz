@@ -142,6 +142,22 @@ export async function readTextFromSystemClipboard(): Promise<string> {
   return clipboard.readText();
 }
 
+/**
+ * Read an image from the system clipboard through the native shell.
+ *
+ * WebKitGTK fires the DOM `paste` event with an empty `clipboardData` when
+ * the clipboard holds only an image, so the composer cannot see it. Rust
+ * reads the same clipboard via arboard and replies with PNG bytes as a raw
+ * IPC buffer (empty when there is no image). Resolves to `null` outside the
+ * packaged app and when the clipboard has no image.
+ */
+export async function readImageFromSystemClipboard(): Promise<File | null> {
+  if (!isTauri() && import.meta.env.MODE !== "e2e") return null;
+  const bytes = await invokeTauri<ArrayBuffer>("read_clipboard_image");
+  if (!bytes || bytes.byteLength === 0) return null;
+  return new File([bytes], "clipboard.png", { type: "image/png" });
+}
+
 /** Write text through the native clipboard after an asynchronous workflow. */
 export async function copyTextToSystemClipboard(
   text: string,

@@ -14620,6 +14620,10 @@ export function maybeInstallE2eTauriMocks() {
         return;
       case "read_clipboard_text":
         return navigator.clipboard.readText();
+      case "read_clipboard_image":
+        // Browser pages surface clipboard images through the paste event
+        // itself; the native fallback only matters in WebKitGTK.
+        return new ArrayBuffer(0);
       case "get_event":
         return handleGetEvent(
           payload as Parameters<typeof handleGetEvent>[0],
