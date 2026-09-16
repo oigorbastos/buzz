@@ -279,7 +279,7 @@ jobs:
           GATE_10=frontend assets embedded in buzz-desktop (grep /assets/index-)
           NOT_RUN=cargo clippy --workspace --all-targets
           NOT_RUN=cargo test --workspace
-          NOT_RUN_NOTE=The full-workspace clippy and test preflight is not repeated here. It ran on ubuntu-latest for commit c7ddb1ae3aa1fcdfb5730f13c0bf5af1e556e7e8 in run 33592220462 (windows-portable-build.yml, buzz-alis-1.4); every commit on main after it touches deploy-lab/*.sql only. Re-run windows-portable-build.yml if you need that gate against newer code.
+          NOT_RUN_NOTE=The full-workspace clippy and test preflight is not repeated here. It ran on ubuntu-latest in the last full CI run on the fork's main (windows-portable-build.yml, buzz-alis-1.4); commits since then that only touch deploy-lab/*.sql skip it. Re-run windows-portable-build.yml if you need that gate against newer code.
           SIDECAR_BUILD=cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           SIDECAR_BUNDLE=./scripts/bundle-sidecars.sh
           TAURI_COMMAND=pnpm -C desktop exec tauri build --no-bundle --ci --config src-tauri/tauri.canary.conf.json

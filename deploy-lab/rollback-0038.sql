@@ -15,7 +15,7 @@ BEGIN;
 -- relay_admin_actions in that file returns no hits). 0038 does not change
 -- this: it creates no table and adds no community_id column.
 --
--- Dependents: no later migration (0039..0045) adds an index, constraint, or
+-- Dependents: no later migration (0039..0048) adds an index, constraint, or
 -- trigger on outbox_claim_token -- the only references to the column outside
 -- this migration are application code in crates/buzz-db/src/store/
 -- relay_admin_actions.rs and crates/buzz-relay/src/api/admin/mod.rs (the

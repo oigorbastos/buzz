@@ -63,7 +63,7 @@ BEGIN;
 -- exact body, byte-for-byte, read via
 -- `sed -n '908,921p' migrations/0041_nip_fi_identity_foundation.sql` in the
 -- working tree at commit c7ddb1ae3 (0041 has not shipped to production yet
--- either -- it is 0035..0045 applying together in this same deploy -- so
+-- either -- it is 0035..0048 applying together in this same deploy -- so
 -- there is no separately-tagged "prod" copy of it to diff against; the
 -- working-tree text is what production will have immediately after 0041
 -- runs and before 0042 runs).

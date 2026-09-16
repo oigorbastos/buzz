@@ -53,7 +53,7 @@ BEGIN;
 -- functions. rollback-0042.sql already drops those two triggers and never
 -- touches those two shared functions, precisely so this script is safe to
 -- run afterward. This script must therefore only ever run after
--- rollback-0042.sql (and after 0043..0045's, per the 11-file playbook's
+-- rollback-0042.sql (and after 0043..0048's, per the 14-file playbook's
 -- strict descending-version order) -- if it is ever run first, the final
 -- DROP FUNCTION IF EXISTS nip_fi_reject_row_mutation_v1()/
 -- nip_fi_reject_truncate_v1() below will fail loudly with a "cannot drop

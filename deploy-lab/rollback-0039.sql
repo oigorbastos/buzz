@@ -25,7 +25,7 @@ BEGIN;
 -- does not add a community_id-scoped table, so those closed lists need no
 -- update and the fail-closed check is unaffected either way.
 --
--- Dependents: no later migration in this deploy (0040..0045) is known to add
+-- Dependents: no later migration in this deploy (0040..0048) is known to add
 -- a foreign key, view, or trigger onto relay_operator_audit -- the table has
 -- no outbound FKs either (actor_pubkey/target_pubkey are plain BYTEA, not
 -- REFERENCES relay_operators), so dropping it here does not require CASCADE

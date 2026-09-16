@@ -16,6 +16,19 @@ Apply in REVERSE order, each under `psql -v ON_ERROR_STOP=1`, then set `BUZZ_IMA
 | 0029-0031 | Lab boards | fork's own; rehearsed in `deploy-lab/rollback-0029/0030.sql` |
 | 0032-0034 | community deletion + workflow error codes | image `8ad61db90`, 19/ago/2026 |
 | 0035-0045 | upstream levy (relay operators, NIP-FI, push kinds, roster fence, FTS, heartbeat) | image `c7ddb1ae3`, 02/set/2026 |
+| 0046-0048 | push gateway dogfood profile, drop NIP-FI ledger, push revocation tombstones | merge upstream c507a4d48, 16/set/2026 (imagem a definir) |
+
+## 0047 recreates what 0041/0042 drop
+
+`rollback-0041.sql` and `rollback-0042.sql` only have tables to act on before migration 0047
+has run, or after `rollback-0047.sql` has already undone it — 0047 `DROP TABLE ... CASCADE`s
+every one of the 15 tables those two scripts touch. Applied out of the documented reverse
+order (e.g. targeting a version below 0041 while skipping 0047), `rollback-0041.sql` /
+`rollback-0042.sql` fail outright: the tables are already gone. To go below 0041, run
+`rollback-0047.sql` first — it recreates those 15 tables (and their functions/triggers) from
+scratch, empty, so 0042's and then 0041's own rollbacks have something to drop. This is not a
+concern when rolling back in the documented strict descending order (0048 → 0047 → ... → 0041),
+since 0047 always runs, and recreates them, before 0042/0041 do.
 
 ## Rehearse before trusting one
 
