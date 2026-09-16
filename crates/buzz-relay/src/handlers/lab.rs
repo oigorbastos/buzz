@@ -759,7 +759,7 @@ pub async fn handle_lab_board_revision_event(
 
     let mut tx = state
         .db
-        .begin_transaction()
+        .begin_event_write_transaction()
         .await
         .map_err(|e| IngestError::Internal(format!("error: begin transaction: {e}")))?;
 
