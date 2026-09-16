@@ -16,7 +16,7 @@ Apply in REVERSE order, each under `psql -v ON_ERROR_STOP=1`, then set `BUZZ_IMA
 | 0029-0031 | Lab boards | fork's own; rehearsed in `deploy-lab/rollback-0029/0030.sql` |
 | 0032-0034 | community deletion + workflow error codes | image `8ad61db90`, 19/ago/2026 |
 | 0035-0045 | upstream levy (relay operators, NIP-FI, push kinds, roster fence, FTS, heartbeat) | image `c7ddb1ae3`, 02/set/2026 |
-| 0046-0048 | push gateway dogfood profile, drop NIP-FI ledger, push revocation tombstones | merge upstream c507a4d48, 16/set/2026 (imagem a definir) |
+| 0046-0048 | push gateway dogfood profile, drop NIP-FI ledger, push revocation tombstones | image `a9cba0d4f`, 16/set/2026 (deployed 11:35 UTC, rehearsed the same night) |
 
 ## 0047 recreates what 0041/0042 drop
 
