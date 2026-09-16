@@ -62,6 +62,11 @@ RUN apt-get update \
 # Keep enough DWARF for native profilers to resolve optimized code to source
 # locations. The normal runtime strips it below; runtime-debug retains it.
 ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+# Parallelism knob for hosts that cannot afford one rustc per core (a 4-core
+# VPS that also runs production). `default` is cargo's own default, so CI is
+# unaffected; pass e.g. --build-arg CARGO_BUILD_JOBS=2 to throttle.
+ARG CARGO_BUILD_JOBS=default
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 COPY --from=planner /build/recipe.json recipe.json
 # Cook the full workspace recipe — relay deps include workspace siblings, so
 # scoping to -p buzz-relay misses transitive deps and re-builds them later.
